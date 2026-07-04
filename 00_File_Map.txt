@@ -1,0 +1,127 @@
+/**
+ * 00_File_Map.gs
+ * Productivity OS v1.0 — 文件地图
+ *
+ * 本文件只放两类内容：文件职责 / 模块关系。
+ * LAST_UPDATED: 2026-07-03 — 从 Personal AI Core 拆分而来，首次创建。
+ */
+
+// ============================================================
+// 一、文件详情
+// ============================================================
+
+/**
+ * 06_TaskIntentParser.gs — 逐字未改（从 Core 项目原样搬来）
+ *   parseTaskIntent / handleTaskIntent，识别 TASK_CREATE / LIST / HISTORY /
+ *   ARCHIVE / DONE / CANCEL。完整历史见 Core 项目 00_File_Map.gs 的旧记录
+ *   （拆分前的版本历史）。
+ *
+ * 20_ProductivityModule.gs — 逐字未改
+ *   _createTaskDirect_ / createTask / completeTask / cancelTask /
+ *   getPendingTasks（委托 QueryEngine）/ deriveFromEvent / deriveTaskState_ /
+ *   _materializeTaskRow_ / rebuildTasksSheet_。含 recurring 自动续期逻辑
+ *   （_spawnNextRecurrenceIfNeeded_）。
+ *
+ * 13_ActiveTasksEngine.gs — 逐字未改
+ *   runDailyArchive（每日冷归档，本项目自己的 createTriggers 挂载）/
+ *   getArchivedTasks。
+ *
+ * 09_IdempotencyManager.gs — 【2026-07-03 精简】只保留 Task 部分：
+ *   createTaskIfNotExists（ScriptLock 保护"读-校验-写"原子化）。
+ *   Inventory/Reminder 部分留在 Core 项目自己的副本里。
+ *
+ * 10_ProjectionEngine.gs — 【2026-07-03 精简】只保留 Task/Reminder 的
+ *   dispatch case：TASK_CREATED/TASK_COMPLETED/TASK_CANCELLED/
+ *   REMINDER_SENT。Inventory 的 case 在 Core 项目自己的副本里。
+ *
+ * 12_QueryEngine.gs — 【2026-07-03 精简】只保留 getPendingTasks/
+ *   getCompletedTasks/getTaskById。Inventory 查询在 Core 项目自己的
+ *   副本里。
+ *
+ * 11_ProjectionRebuilder.gs — 完整保留（含 migrateAddIdentityColumns /
+ *   rebuildTasksProjection / rebuildActiveTasksProjection /
+ *   verifyProjection / compareProjectionWithEvents，全部原始函数都在，
+ *   因为 deriveFromEvent 就在本项目里，不需要精简）。
+ *
+ * 07_IdentityEngine.gs — 本地副本，纯函数零依赖，逐字跟 Core 项目一致。
+ * 08_DeduplicationEngine.gs — 本地副本，逐字未改。
+ * 09_TemporalParser.gs — 本地副本，纯函数零依赖，逐字跟 Core 项目一致。
+ * 01_SecureConfig.gs — 本地副本，逐字未改。
+ * 03_Output.gs — 本地副本，逐字未改（本项目目前不直接调用，留着备用）。
+ *
+ * 02_EventBus.gs — 【2026-07-03 modified】_sheet_() 改用
+ *   SpreadsheetApp.openById(SecureConfig.getKey('SPREADSHEET_ID'))，其余
+ *   逻辑跟 Core 项目一致。
+ * 05_SheetUtils.gs — 【2026-07-03 modified】getSheet_() 同上改用 openById，
+ *   其余函数逐字未改。
+ *
+ * 15_Setup.gs — 新文件（本项目专属）：setupSheets（建 Tasks/ActiveTasks/
+ *   ArchiveTasks）/ createTriggers（挂 triggerDailyArchive）/
+ *   repairSheetHeaders / runDiagnostics。
+ */
+
+// ============================================================
+// 二、模块关系（依赖方向）
+// ============================================================
+
+/**
+ * 全部依赖都在本项目内部，没有一个函数需要跨项目调用（这是设计目标——
+ * 见 Core 项目 Constitution 的 D2 Blueprint 说明：Library 依赖必须单向，
+ * 本项目不能反过来调用 Core，所以本项目对外只暴露"入口函数"，内部所有
+ * 支撑都自带一份本地副本）。
+ *
+ * 06_TaskIntentParser.gs
+ *   → 09_IdempotencyManager.gs  (createTaskIfNotExists)
+ *   → 20_ProductivityModule.gs  (getPendingTasks, completeTask, cancelTask)
+ *   → 09_TemporalParser.gs  (extractDateTime)
+ *   → 05_SheetUtils.gs  (_cleanTitle_, getSheet_, getHeaderMap_)
+ *   → 13_ActiveTasksEngine.gs  (getArchivedTasks)
+ *
+ * 09_IdempotencyManager.gs
+ *   → 07_IdentityEngine.gs  (generateTaskIdentity)
+ *   → 08_DeduplicationEngine.gs  (findExistingTask)
+ *   → _createTaskDirect_  (20_ProductivityModule.gs 的全局函数)
+ *   → LockService（GAS内建）
+ *
+ * 08_DeduplicationEngine.gs → 05_SheetUtils.gs (getSheet_, getHeaderMap_)
+ * 07_IdentityEngine.gs ← 零外部依赖
+ *
+ * 10_ProjectionEngine.gs
+ *   → 05_SheetUtils.gs  (upsertRowByKey_, deleteRowByKey_, getSheet_, getHeaderMap_)
+ *
+ * 11_ProjectionRebuilder.gs
+ *   → 02_EventBus.gs (getAllEvents)
+ *   → 10_ProjectionEngine.gs (dispatch)
+ *   → 05_SheetUtils.gs (getSheet_, getHeaderMap_, upsertRowByKey_, batchUpsertRowsByKey_)
+ *   → 07_IdentityEngine.gs (generateTaskIdentity)
+ *   → 20_ProductivityModule.gs (deriveFromEvent)
+ *
+ * 12_QueryEngine.gs → 05_SheetUtils.gs (getSheet_, getHeaderMap_)
+ * 13_ActiveTasksEngine.gs → 05_SheetUtils.gs (getSheet_, getHeaderMap_)
+ *
+ * 02_EventBus.gs
+ *   → 01_SecureConfig.gs (getKey('SPREADSHEET_ID'), getKey('TELEGRAM_CHAT_ID'))
+ *   → 03_Output.gs (sendMessage，Projection 失败告警用)
+ *
+ * 20_ProductivityModule.gs
+ *   → 09_IdempotencyManager.gs (createTaskIfNotExists)
+ *   → 12_QueryEngine.gs (getPendingTasks, getTaskById)
+ *   → 09_TemporalParser.gs (computeNextDueDateFromLabel)
+ *   → 02_EventBus.gs (publish, getAllEvents)
+ *   → 05_SheetUtils.gs (upsertRowByKey_, deleteRowByKey_, shallowCopy_)
+ *
+ * 15_Setup.gs → 13_ActiveTasksEngine.gs (triggerDailyArchive，createTriggers挂载用)
+ *
+ * ── 架构铁律（跟 Core 项目一致，本项目范围内的版本）───────────────────
+ * 1. 箭头只能往更底层指，禁止循环依赖；本项目不依赖 Core / Reminder OS
+ *    的任何代码
+ * 2. Events 表（共享）里 TASK_ 开头和 REMINDER_SENT 类型的事件只有本项目的
+ *    02_EventBus.publish() 能写
+ * 3. Tasks/ActiveTasks（Read Model）只有本项目的 10_ProjectionEngine 能写
+ *    （_materializeTaskRow_ 是安全兜底，属例外）；ArchiveTasks 只有
+ *    13_ActiveTasksEngine.runDailyArchive() 能写
+ * 4. 所有查询必须经过 12_QueryEngine 或 13_ActiveTasksEngine，禁止直接
+ *    derive Events
+ * 5. 所有 Create 操作必须经过 09_IdempotencyManager，禁止直接
+ *    EventBus.publish CREATE 事件
+ */

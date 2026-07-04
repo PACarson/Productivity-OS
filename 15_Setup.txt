@@ -1,0 +1,202 @@
+/**
+ * 15_Setup.gs
+ * Productivity OS v1.0 — 一键初始化
+ *
+ * ⚠️ 2026-07-03 拆分说明：这是新文件，不是从 Core 搬过来的——Core 原来的
+ * 15_Setup.gs 里跟 Tasks/ActiveTasks/ArchiveTasks/triggerDailyArchive 相关
+ * 的部分被搬到这里，改成独立项目自己的初始化脚本。
+ *
+ * 使用顺序（重要，顺序不能反）：
+ *   1. 先确认本项目 Script Properties 里的 SPREADSHEET_ID 已经设置成跟
+ *      Personal AI Core 项目【同一张】Spreadsheet 的 ID：
+ *        SecureConfig.setKey('SPREADSHEET_ID', '跟Core一样的那个ID')
+ *   2. 跑一次 setupSheets() —— 建好 Tasks / ActiveTasks / ArchiveTasks 三张表
+ *      （如果这张 Spreadsheet 之前已经有这三张表了——比如你是从合并在一起的
+ *      旧版本迁移过来的——这个函数是幂等的，表已存在会跳过，不会破坏数据）
+ *   3. （仅旧数据迁移时需要）跑一次 migrateAddIdentityColumns()（在
+ *      11_ProjectionRebuilder.gs 里）
+ *   4. 本项目【不需要】单独 Deploy as Web App，也不需要 registerWebhook()——
+ *      它不直接接 Telegram，是被 Personal AI Core 当 Library 调用的（Core
+ *      那边的 04_Main.gs 会 import 本项目，调用方式见 Core 项目的 README）。
+ *      你只需要：Deploy → New deployment → Library，拿到 Script ID，
+ *      去 Core 项目的 Editor → Libraries 里加上这个 Script ID，Identifier
+ *      填 "ProductivityOS"。
+ *   5. 跑一次 createTriggers() —— 挂上本项目自己的定时任务
+ *      （triggerDailyArchive，每天凌晨2点冷归档）
+ *   6.（仅首次上线/迁移、Events 已有历史 Task 事件时需要）跑一次
+ *      rebuildAllProjections()（在 11_ProjectionRebuilder.gs 里）——
+ *      从共享 Events 表里 TASK_ 开头的事件和 REMINDER_SENT 事件重建 Tasks/ActiveTasks
+ *
+ * 全部跑完后，回 Core 项目确认 04_Main.gs 能正常调用
+ * ProductivityOS.handleTaskIntent(...)（比如在 Core 编辑器手动跑一次
+ * ProductivityOS.handleTaskIntent('测试任务', 'test_chat') 看看有没有报错）。
+ */
+
+// ============ 1. 建表 ============
+
+function setupSheets() {
+  var id = SecureConfig.getKey('SPREADSHEET_ID');
+  if (!id) {
+    Logger.log('❌ 先设置 SPREADSHEET_ID: SecureConfig.setKey("SPREADSHEET_ID", "跟Core项目一样的Spreadsheet ID")');
+    return;
+  }
+  var ss = SpreadsheetApp.openById(id);
+
+  _ensureSheet_(ss, 'Tasks', [
+    'task_id', 'timestamp', 'title', 'category', 'status', 'due_date',
+    'recurring', 'priority', 'context', 'budget', 'notes', 'chat_id',
+    'completed_at', 'reminder_count', 'identity', 'archived'
+  ]);
+
+  _ensureSheet_(ss, 'ActiveTasks', [
+    'task_id', 'timestamp', 'title', 'category', 'status', 'due_date',
+    'recurring', 'priority', 'context', 'budget', 'notes', 'chat_id',
+    'completed_at', 'reminder_count', 'identity'
+  ]);
+
+  _ensureSheet_(ss, 'ArchiveTasks', [
+    'task_id', 'timestamp', 'title', 'category', 'status', 'due_date',
+    'recurring', 'priority', 'context', 'budget', 'notes', 'chat_id',
+    'completed_at', 'reminder_count', 'identity', 'archived_at'
+  ]);
+
+  Logger.log('✅ Sheets 就位: Tasks, ActiveTasks, ArchiveTasks（Inventory/Events 由 Core 项目建）');
+  Logger.log('下一步: 如果 Tasks 已有旧数据 → migrateAddIdentityColumns()；然后 createTriggers()');
+}
+
+function _ensureSheet_(ss, name, headers) {
+  var sheet = ss.getSheetByName(name);
+  if (!sheet) {
+    sheet = ss.insertSheet(name);
+  }
+  if (sheet.getLastRow() === 0) {
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sheet.setFrozenRows(1);
+    sheet.getRange(2, 1, Math.max(sheet.getMaxRows() - 1, 1), headers.length).setNumberFormat('@');
+  }
+  return sheet;
+}
+
+// ============ 2. 定时触发器 ============
+
+/**
+ * 本项目只有一个定时任务：triggerDailyArchive（每天凌晨2点，见
+ * 13_ActiveTasksEngine.gs 的 runDailyArchive）。
+ * checkReminders 不在这里——那是 Reminder OS 项目自己的触发器。
+ */
+function createTriggers() {
+  var handlerNames = ['triggerDailyArchive'];
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (handlerNames.indexOf(t.getHandlerFunction()) !== -1) {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+
+  ScriptApp.newTrigger('triggerDailyArchive').timeBased().everyDays(1).atHour(2).create();
+
+  Logger.log('✅ Productivity OS 自己的触发器挂好了:');
+  Logger.log('  triggerDailyArchive — 每天 02:00 左右（冷归档）');
+}
+
+// ============ 修复：表头被污染 ============
+
+function repairSheetHeaders() {
+  _repairOneSheetHeader_('Tasks', [
+    'task_id', 'timestamp', 'title', 'category', 'status', 'due_date',
+    'recurring', 'priority', 'context', 'budget', 'notes', 'chat_id',
+    'completed_at', 'reminder_count', 'identity', 'archived'
+  ]);
+  _repairOneSheetHeader_('ActiveTasks', [
+    'task_id', 'timestamp', 'title', 'category', 'status', 'due_date',
+    'recurring', 'priority', 'context', 'budget', 'notes', 'chat_id',
+    'completed_at', 'reminder_count', 'identity'
+  ]);
+  _repairOneSheetHeader_('ArchiveTasks', [
+    'task_id', 'timestamp', 'title', 'category', 'status', 'due_date',
+    'recurring', 'priority', 'context', 'budget', 'notes', 'chat_id',
+    'completed_at', 'reminder_count', 'identity', 'archived_at'
+  ]);
+}
+
+function _repairOneSheetHeader_(name, headers) {
+  var id = SecureConfig.getKey('SPREADSHEET_ID');
+  var ss = SpreadsheetApp.openById(id);
+  var sheet = ss.getSheetByName(name);
+  if (!sheet) {
+    Logger.log('❌ ' + name + ' 不存在，先跑 setupSheets()');
+    return;
+  }
+
+  var firstCell = String(sheet.getRange(1, 1).getValue()).trim();
+  if (firstCell === headers[0]) {
+    Logger.log('✅ ' + name + ' 表头是对的（第一格="' + firstCell + '"），跳过');
+    return;
+  }
+
+  Logger.log('⚠️ ' + name + ' 第一行不是表头（第一格="' + firstCell + '"），插入正确表头行，原有数据往下挪一行');
+  sheet.insertRowBefore(1);
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  sheet.setFrozenRows(1);
+  sheet.getRange(2, 1, Math.max(sheet.getMaxRows() - 1, 1), headers.length).setNumberFormat('@');
+  Logger.log('✅ ' + name + ' 表头已修复');
+}
+
+// ============ 一键跑完第一步 ============
+
+function setupAll() {
+  setupSheets();
+  Logger.log('=== 第一步完成 ===');
+  Logger.log('接下来: 1) migrateAddIdentityColumns()（如有旧数据）  2) Deploy as Library  ' +
+    '3) 去 Core 项目 Editor→Libraries 加上本项目当 "ProductivityOS"  4) createTriggers()');
+}
+
+// ============ 诊断：不碰 Telegram，直接看本项目状态 ============
+
+function runDiagnostics() {
+  Logger.log('========== Productivity OS 诊断开始 ==========');
+
+  var id = SecureConfig.getKey('SPREADSHEET_ID');
+  if (!id) {
+    Logger.log('❌ SPREADSHEET_ID 没设置，下面的检查会全部失败');
+  }
+  var ss = id ? SpreadsheetApp.openById(id) : null;
+
+  ['Tasks', 'ActiveTasks', 'ArchiveTasks'].forEach(function (name) {
+    if (!ss) return;
+    var sheet = ss.getSheetByName(name);
+    if (!sheet) {
+      Logger.log('❌ Sheet "' + name + '" 不存在！先跑 setupSheets()');
+    } else {
+      Logger.log('✅ Sheet "' + name + '" 存在，表头: ' + JSON.stringify(sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0]));
+      Logger.log('   当前行数（含表头）: ' + sheet.getLastRow());
+    }
+  });
+
+  var testChatId = 'diagnostic_test_chat';
+  try {
+    var parsed = parseTaskIntent('提醒我明天3点交房租');
+    Logger.log('✅ parseTaskIntent 测试结果: ' + JSON.stringify(parsed));
+  } catch (e) {
+    Logger.log('❌ parseTaskIntent 本身就报错: ' + e.message + '\n' + e.stack);
+  }
+
+  try {
+    var task = createTask('诊断测试任务-可以删除', { category: 'GENERAL', notes: 'DIAGNOSTIC_TEST_TEMP' }, testChatId);
+    Logger.log('✅ createTask 测试结果: ' + JSON.stringify(task));
+    cancelTask(task.task_id, testChatId);
+    Logger.log('✅ 已自动取消诊断测试任务');
+  } catch (e) {
+    Logger.log('❌ createTask 报错: ' + e.message + '\n' + e.stack);
+  }
+
+  try {
+    var pending = getPendingTasks(testChatId);
+    Logger.log('✅ getPendingTasks 测试结果，共 ' + pending.length + ' 条');
+  } catch (e) {
+    Logger.log('❌ getPendingTasks 报错: ' + e.message + '\n' + e.stack);
+  }
+
+  Logger.log('⚠️ 这些是本项目内部测试，不代表 Core 项目能成功调用本项目（Library 引入是否');
+  Logger.log('   配置正确要去 Core 项目那边测：ProductivityOS.handleTaskIntent(...)）。');
+  Logger.log('========== 诊断结束 ==========');
+}

@@ -1,0 +1,71 @@
+/**
+ * 00_Project_Constitution.gs
+ * Productivity OS v1.0 — 项目宪法
+ *
+ * 本文件只放这个 OS 自己的东西。平台级原则（IMIOR、UDP、Domain OS
+ * Blueprint、Engine 命名规范等）的权威定义在 Personal AI Core 项目的
+ * 00_Project_Constitution.gs，这里只做「这个 OS 具体怎么套用」的记录，
+ * 不重复定义，避免以后两边措辞不一致（drift）。
+ *
+ * 新窗口交接时，先贴这份文件 + Core 项目的 00_Project_Constitution.gs。
+ *
+ * LAST_UPDATED: 2026-07-03 — 从 Personal AI Core 物理拆分而来，首次创建。
+ */
+
+// ============================================================
+// 一、这个 OS 是什么
+// ============================================================
+
+/**
+ * P1. 定位
+ *     Productivity OS 管 Task 的完整生命周期：创建/查询/完成/取消/
+ *     recurring 续期/冷归档。范围比"任务"更广（Priority/Recurring/
+ *     Search/Archive/Statistics/Dashboard 等 Engine 最终都会挂在这里），
+ *     所以叫 Productivity OS，不是 Task OS（2026-07-03 Carson 确认）。
+ *
+ * P2. 部署形态
+ *     独立 Apps Script 项目，以 Library 形式被 Personal AI Core 引入
+ *     （Identifier: ProductivityOS）。不接 Telegram webhook，被 Core 的
+ *     04_Main.gs 调用（handleTaskIntent/completeTask 等）。
+ *     Library 依赖方向单向：Core → ProductivityOS。本项目不依赖、不调用
+ *     Core 的任何代码。
+ *
+ * P3. 数据边界
+ *     跟 Personal AI Core / Reminder OS 共享同一个 Google Spreadsheet
+ *     （SPREADSHEET_ID 三边一致）。本项目拥有 Tasks / ActiveTasks /
+ *     ArchiveTasks 三张表的写入权（通过本项目自己的
+ *     09_IdempotencyManager / 10_ProjectionEngine）。Events 表是共享的
+ *     追加日志，本项目只追加自己的 TASK_ 开头和 REMINDER_SENT 事件，不改
+ *     不删别的项目写的行。
+ *
+ * P4. Foundation / Runtime / Intelligence（D6 Blueprint 在本项目的落地）
+ *       Foundation.Governance → 这三份文件（Constitution/State/File_Map）
+ *       Foundation.Identity   → 07_IdentityEngine.gs（本地副本，纯函数，
+ *                                跟 Core 的那份代码完全一致，可以放心
+ *                                独立维护）
+ *       Runtime.Domain Pattern → P6.2 Level 2（Core 定义），本项目的
+ *                                Request=06_TaskIntentParser / Planner=
+ *                                同文件内解析 / Decision=同文件内优先级
+ *                                判断 / Confirmation=Telegram inline
+ *                                keyboard 或直接文字确认 / Execution=
+ *                                20_ProductivityModule / Event=本地
+ *                                02_EventBus / Projection=本地
+ *                                10_ProjectionEngine / Insights=（暂无，
+ *                                复用 Core 的 93-96）/ Bridge=（暂无，
+ *                                本项目目前不需要连外部系统）
+ *       Intelligence.Knowledge → （暂无，Task domain 目前没有需要维护的
+ *                                参考数据）
+ *       Intelligence.Insights  → 暂时复用 Core 的 93_MemoryEngine 等（本
+ *                                项目没有自己的副本，Core 的 93 直接读
+ *                                共享 Events 表里的 TASK_* 事件）
+ *       Intelligence.Bridge    → 暂无（本项目不连接外部系统）
+ *
+ * P5. 不变的东西（沿用 Core 宪法，这里重申，方便本项目单独开窗口时也能
+ *     看到）：
+ *       - AI 只建议，不自动执行（Core P4）——本项目的 Decision 阶段
+ *         （比如判断优先级）永远只是提案，真正创建/完成/取消任务要么是
+ *         用户明确发消息/点按钮触发，要么是已确认的 recurring 规则自动
+ *         续期（这个例外在拆分前就存在，没有改变）。
+ *       - Execution 层发指令，Event 是真正的写入事实，两者是先后关系，
+ *         不是同一件事的两种说法（Core P6.2，2026-07-03 修正过的措辞）。
+ */

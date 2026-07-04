@@ -1,0 +1,231 @@
+/**
+ * 13_ActiveTasksEngine.gs
+ * JARVIS CORE v3.1 — ActiveTasks 工作台引擎（冷归档 + 历史查询）
+ *
+ * 职责：管理 ActiveTasks 和 ArchiveTasks 两张派生视图的冷归档生命周期。
+ *
+ * 架构关系：
+ *   Tasks（全量 Read Model，含所有状态）
+ *     ↓ ProjectionEngine（实时同步）
+ *   ActiveTasks（工作台，只有 PENDING/IN_PROGRESS/WAITING）
+ *     ↓ runDailyArchive（每日定时触发器）
+ *   ArchiveTasks（归档库，DONE/CANCELLED 且超过 N 天的任务）
+ *
+ * 注意：
+ *  - ActiveTasks 的"实时维护"（新建/完成/取消同步）由 10_ProjectionEngine.gs 负责。
+ *  - 本文件只负责 Tasks → ArchiveTasks 的"冷归档"（低频，每天跑一次）。
+ *  - ArchiveTasks 只增不删（等同 append-only 视图），不允许手动编辑。
+ *  - 归档后 Tasks Sheet 里对应行加 archived=true 标记（不物理删除，保留全量 Read Model
+ *    完整性）。如果将来 Tasks Sheet 变得非常大，可以考虑把 archived=true 的行从 Tasks
+ *    物理移走，但目前不做——物理删除会让 rebuildAllProjections() 失去重建依据。
+ *
+ * Sheet 结构要求：
+ *   Tasks Sheet：需要有 'archived' 列（boolean，setupSheets()/migrateAddIdentityColumns()
+ *   会建，v3.2 之前 migrateAddIdentityColumns() 有 bug 从未真正建过这一列，
+ *   见 15_Setup.gs 文件头 v3.2 变更记录）
+ *   ArchiveTasks Sheet：需要有 'archived_at' 列（ISO 时间戳）
+ *
+ * 2026-06-29 新增（V3.1，ActiveTasks/ArchiveTasks 特性落地）。
+ *
+ * v3.2 变更（2026-07-01，外部审计 HIGH RISK 3，核实属实后采纳）：
+ * runDailyArchive() 标记 archived=true 之前是在 forEach 循环里对每一行单独
+ * setValue()——归档行数一多就是N次独立的Sheet单格写入请求，容易触发执行
+ * 超时/配额问题（跟 HIGH RISK 1 同一类问题）。改成：收集阶段就地把内存里
+ * 的 row 引用打上标记，最后对整个 archived 列做一次 setValues() 批量写回。
+ */
+
+var ActiveTasksEngine = (function () {
+
+  var TASKS_SHEET   = 'Tasks';
+  var ARCHIVE_SHEET = 'ArchiveTasks';
+  var DEFAULT_ARCHIVE_DAYS = 7; // DONE/CANCELLED 超过7天自动归档
+
+  // ============ 冷归档入口 ============
+
+  /**
+   * 每日定时触发器调用此函数。
+   * 把 Tasks Sheet 里 DONE/CANCELLED 且 completed_at 距今超过 archiveDays 天的行
+   * 复制到 ArchiveTasks，并在 Tasks 里标记 archived=true。
+   *
+   * @param {number} [archiveDays=7]
+   * @returns {number}  归档行数
+   */
+  function runDailyArchive(archiveDays) {
+    var days = (typeof archiveDays === 'number' && archiveDays > 0) ? archiveDays : DEFAULT_ARCHIVE_DAYS;
+    Logger.log('=== ActiveTasksEngine.runDailyArchive（阈值：' + days + ' 天）===');
+
+    var tasksSheet;
+    var archiveSheet;
+    try {
+      tasksSheet   = getSheet_(TASKS_SHEET);
+      archiveSheet = getSheet_(ARCHIVE_SHEET);
+    } catch (e) {
+      Logger.log('⚠️ Sheet 不存在，跳过归档: ' + e.message);
+      return 0;
+    }
+
+    var tasksHeaderMap   = getHeaderMap_(tasksSheet);
+    var archiveHeaderMap = getHeaderMap_(archiveSheet);
+    var tasksLastRow     = tasksSheet.getLastRow();
+
+    if (tasksLastRow < 2) {
+      Logger.log('Tasks Sheet 没有数据行，跳过');
+      return 0;
+    }
+
+    var tasksNumCols = tasksSheet.getLastColumn();
+    var allRows      = tasksSheet.getRange(2, 1, tasksLastRow - 1, tasksNumCols).getValues();
+
+    var statusIdx      = tasksHeaderMap['status'];
+    var completedAtIdx = tasksHeaderMap['completed_at'];
+    var archivedIdx    = tasksHeaderMap['archived'];
+    var taskIdIdx      = tasksHeaderMap['task_id'];
+
+    if (statusIdx === undefined || completedAtIdx === undefined || taskIdIdx === undefined) {
+      Logger.log('❌ Tasks Sheet 缺少必要列（status/completed_at/task_id）');
+      return 0;
+    }
+
+    var cutoff     = Date.now() - days * 24 * 60 * 60 * 1000;
+    var doneStatuses = { 'DONE': true, 'CANCELLED': true };
+    var archiveNowTimestamp = new Date().toISOString();
+
+    var rowsToArchive    = []; // { rowArray, rowIndex (2-based) }
+    var archiveRowArrays = []; // 要 setValues 到 ArchiveTasks 的行数组
+
+    allRows.forEach(function (row, idx) {
+      var status     = String(row[statusIdx] || '').toUpperCase();
+      var alreadyArchived = archivedIdx !== undefined ? row[archivedIdx] : false;
+
+      if (!doneStatuses[status]) return;
+      if (alreadyArchived === true || alreadyArchived === 'TRUE' || alreadyArchived === 'true') return;
+
+      var completedAt = row[completedAtIdx];
+      if (!completedAt) return; // 没有 completed_at 跳过
+
+      var completedTime = new Date(completedAt).getTime();
+      if (isNaN(completedTime) || completedTime > cutoff) return; // 还不够 N 天
+
+      rowsToArchive.push({ rowArray: row, rowIndex: idx + 2 });
+
+      // 构建 ArchiveTasks 行（在标记 archived 之前构建，archived 本身不是
+      // ArchiveTasks 的字段，顺序其实不影响正确性，但这样写更清楚：
+      // "先原样拷贝这一行的数据去archive，再改这一行在Tasks里的归档标记"）
+      var archiveRow = new Array(archiveSheet.getLastColumn()).fill('');
+      for (var h in tasksHeaderMap) {
+        if (archiveHeaderMap.hasOwnProperty(h)) {
+          archiveRow[archiveHeaderMap[h]] = row[tasksHeaderMap[h]];
+        }
+      }
+      if (archiveHeaderMap.hasOwnProperty('archived_at')) {
+        archiveRow[archiveHeaderMap['archived_at']] = archiveNowTimestamp;
+      }
+      archiveRowArrays.push(archiveRow);
+
+      // HIGH RISK 3 修复（外部审计，核实属实后采纳）：不在这里单独对 Sheet
+      // 发 setValue() 请求。row 是 allRows[idx] 的同一个数组引用（JS数组存的
+      // 是引用，getValues()返回的二维数组里每个子数组都是独立对象，这里的
+      // row 参数就是那个对象本身）——直接在内存里改这个引用，allRows 也会
+      // 跟着变。等下面全部行处理完，一次性把整列 archived 的值 setValues()
+      // 写回，无论归档多少行，物理I/O调用数固定为1次。
+      if (archivedIdx !== undefined) {
+        row[archivedIdx] = true;
+      }
+    });
+
+    if (rowsToArchive.length === 0) {
+      Logger.log('没有需要归档的任务');
+      return 0;
+    }
+
+    // 批量写入 ArchiveTasks
+    var archiveStartRow = archiveSheet.getLastRow() + 1;
+    archiveSheet.getRange(archiveStartRow, 1, archiveRowArrays.length, archiveSheet.getLastColumn())
+                .setValues(archiveRowArrays);
+
+    // 在 Tasks 里标记 archived=true（如果有 archived 列）
+    // HIGH RISK 3 修复：allRows 在上面收集阶段已经就地把被归档行的
+    // row[archivedIdx] 改成了 true（allRows 和 row 是同一份引用），这里只需要
+    // 把 archived 这一整列一次性 setValues() 写回 Sheet。不管这次归档了
+    // 多少行，物理 I/O 调用数固定为 1 次，不再是 N 次独立的单格写入请求。
+    // 安全性说明：archived 列全代码库只有这个函数会写（唯一写入方），
+    // 不存在与其他并发路径互相覆盖的风险，可以放心整列覆写；
+    // 也正因为只有这里写，才没有必要做"只写变化的行"这种更复杂的差量写入。
+    if (archivedIdx !== undefined) {
+      var archivedColumnValues = allRows.map(function (row) {
+        var v = row[archivedIdx];
+        return [v === true || v === 'TRUE' || v === 'true'];
+      });
+      tasksSheet.getRange(2, archivedIdx + 1, archivedColumnValues.length, 1).setValues(archivedColumnValues);
+    }
+
+    Logger.log('✅ 归档完成：' + rowsToArchive.length + ' 条任务移至 ArchiveTasks');
+    return rowsToArchive.length;
+  }
+
+  // ============ 历史查询 ============
+
+  /**
+   * 读 ArchiveTasks 里最新的 N 条记录（按 archived_at 降序）。
+   * 供 /archive 命令使用（区别于 /history 只看 Tasks 里近期完成的）。
+   *
+   * @param {string} chatId
+   * @param {number} [limit=20]
+   * @returns {object[]}
+   */
+  function getArchivedTasks(chatId, limit) {
+    var maxRows = (typeof limit === 'number' && limit > 0) ? limit : 20;
+    try {
+      var sheet   = getSheet_(ARCHIVE_SHEET);
+      var lastRow = sheet.getLastRow();
+      if (lastRow < 2) return [];
+
+      var headerMap    = getHeaderMap_(sheet);
+      var chatIdIdx    = headerMap['chat_id'];
+      var archivedAtIdx = headerMap['archived_at'];
+      var numCols      = sheet.getLastColumn();
+      var rows         = sheet.getRange(2, 1, lastRow - 1, numCols).getValues();
+
+      var tasks = [];
+      rows.forEach(function (row) {
+        if (chatIdIdx !== undefined && String(row[chatIdIdx]) !== String(chatId)) return;
+        var task = {};
+        for (var h in headerMap) task[h] = row[headerMap[h]];
+        tasks.push(task);
+      });
+
+      // 按 archived_at 降序
+      tasks.sort(function (a, b) {
+        var ta = a.archived_at ? new Date(a.archived_at).getTime() : 0;
+        var tb = b.archived_at ? new Date(b.archived_at).getTime() : 0;
+        return tb - ta;
+      });
+
+      return tasks.slice(0, maxRows);
+
+    } catch (e) {
+      Logger.log('[ActiveTasksEngine] getArchivedTasks 失败: ' + e.message);
+      return [];
+    }
+  }
+
+  // ============ 触发器 ============
+  //
+  // v3.1 设计决定：触发器的实际创建（ScriptApp.newTrigger().create()）统一放在
+  // 15_Setup.gs 的 createTriggers() 里管理，跟 checkReminders/
+  // runRiderConnectorSync/dailyInventoryCheck 用同一套"先清旧的、再建新的"
+  // 幂等模式，避免在两个文件里各维护一份触发器创建逻辑（犯C5）。
+  // 本文件只暴露 triggerDailyArchive 这个全局入口函数供触发器调用。
+
+  return {
+    runDailyArchive:   runDailyArchive,
+    getArchivedTasks:  getArchivedTasks
+  };
+})();
+
+/**
+ * GAS 触发器调用的全局函数入口（触发器不能指向 IIFE 成员方法，必须是全局函数）。
+ */
+function triggerDailyArchive() {
+  ActiveTasksEngine.runDailyArchive();
+}

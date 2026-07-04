@@ -1,0 +1,96 @@
+/**
+ * 12_QueryEngine.gs
+ * Productivity OS v3.0 — Query Engine（Read Model 查询层，Task 部分）
+ *
+ * 架构铁律：
+ *  - 所有 Telegram 查询必须经过本层
+ *  - 只读 Tasks Sheet（Read Model）
+ *  - 绝对禁止读 Events 表 / 调 EventBus / 调 deriveTaskState_
+ *  - O(n) on Read Model，不做 Event Replay
+ *
+ * ⚠️ 2026-07-03 拆分说明：这是 Personal AI Core 12_QueryEngine.gs 的 Task
+ * 部分。Inventory 部分（getInventory/findInventoryByName/getLowStockItems/
+ * getExpiringItems）留在 Core 项目自己的副本里，本项目不需要。
+ *
+ * 依赖：05_SheetUtils（getSheet_, getHeaderMap_）
+ */
+
+var QueryEngine = (function () {
+
+  var TASKS_SHEET = 'Tasks';
+
+  // ============ 内部：读整张 Sheet ============
+
+  function _readAllRows_(sheetName) {
+    try {
+      var sheet = getSheet_(sheetName);
+      var lastRow = sheet.getLastRow();
+      if (lastRow < 2) return [];
+
+      var headerMap = getHeaderMap_(sheet);
+      var numCols   = sheet.getLastColumn();
+      var rows      = sheet.getRange(2, 1, lastRow - 1, numCols).getValues();
+
+      return rows.map(function (row) {
+        var obj = {};
+        for (var h in headerMap) {
+          obj[h] = row[headerMap[h]];
+        }
+        return obj;
+      }).filter(function (obj) {
+        return Object.keys(obj).some(function (k) { return obj[k] !== ''; });
+      });
+    } catch (e) {
+      Logger.log('[QueryEngine] _readAllRows_ error (' + sheetName + '): ' + e.message);
+      return [];
+    }
+  }
+
+  // ============ Task 查询 ============
+
+  /**
+   * 获取 PENDING 任务列表。
+   * @param {string} [chatId]  不传则返回所有用户的任务
+   * @returns {object[]}
+   */
+  function getPendingTasks(chatId) {
+    return _readAllRows_(TASKS_SHEET).filter(function (task) {
+      if (!task.task_id) return false;
+      if (String(task.status || '').toUpperCase() !== 'PENDING') return false;
+      if (chatId && String(task.chat_id) !== String(chatId)) return false;
+      return true;
+    });
+  }
+
+  /**
+   * 获取已完成任务列表。
+   * @param {string} [chatId]
+   * @returns {object[]}
+   */
+  function getCompletedTasks(chatId) {
+    return _readAllRows_(TASKS_SHEET).filter(function (task) {
+      if (!task.task_id) return false;
+      if (String(task.status || '').toUpperCase() !== 'DONE') return false;
+      if (chatId && String(task.chat_id) !== String(chatId)) return false;
+      return true;
+    });
+  }
+
+  /**
+   * 按 task_id 查单个任务。
+   * @returns {object|null}
+   */
+  function getTaskById(taskId) {
+    var rows = _readAllRows_(TASKS_SHEET);
+    for (var i = 0; i < rows.length; i++) {
+      if (String(rows[i].task_id) === String(taskId)) return rows[i];
+    }
+    return null;
+  }
+
+  return {
+    getPendingTasks:   getPendingTasks,
+    getCompletedTasks: getCompletedTasks,
+    getTaskById:       getTaskById
+  };
+})();

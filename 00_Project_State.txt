@@ -1,0 +1,73 @@
+/**
+ * 00_Project_State.gs
+ * Productivity OS v1.0 — 项目状态快照
+ *
+ * ⚠️ 快照，不是日志。每次更新覆盖旧状态。
+ * LAST_UPDATED: 2026-07-03 — 从 Personal AI Core 拆分而来，首次创建。
+ */
+
+// ============================================================
+// 一、已完成
+// ============================================================
+
+/**
+ * - 2026-07-03：从 Personal AI Core 物理拆分为独立项目。06_TaskIntentParser.gs
+ *   / 20_ProductivityModule.gs / 13_ActiveTasksEngine.gs 逐字未改地搬过来。
+ *   09_IdempotencyManager.gs / 10_ProjectionEngine.gs / 12_QueryEngine.gs
+ *   精简成只含 Task 部分（原文件在 Core 项目还有完整版）。
+ *   02_EventBus.gs / 05_SheetUtils.gs 改用 SpreadsheetApp.openById 而不是
+ *   getActiveSpreadsheet（standalone 脚本没有"容器"概念）。
+ *   07_IdentityEngine.gs 顺手把物理文件名从 07_StateEngine_TaskMetrics.txt
+ *   改正确（2026-07-01 LOW RISK 2 遗留问题，趁着搬文件一起处理了）。
+ *
+ * - 拆分之前在 Personal AI Core 项目里的全部历史（bug 修复、recurring
+ *   自动续期、ActiveTasks/ArchiveTasks 落地等）完整历史见 Personal AI
+ *   Core 项目的 00_Project_State.gs（拆分之前的记录还留在那边，不重复
+ *   搬过来）。
+ */
+
+// ============================================================
+// 二、进行中
+// ============================================================
+
+/**
+ * （暂无）
+ */
+
+// ============================================================
+// 三、已知Bug
+// ============================================================
+
+/**
+ * 从 Personal AI Core 带过来、还没修的（拆分时特意不夹带修复）：
+ *
+ * - LOW RISK 2（2026-07-01 外部审计）：09_IdempotencyManager.gs 与
+ *   20_ProductivityModule.gs 之间是"裸全局函数"耦合，没有走 public API /
+ *   IIFE 封装。拆分后这个耦合的范围反而缩小了（现在只在本项目内部，
+ *   不会被别的项目摸到），但耦合本身还在，要不要做 IIFE 封装是本项目
+ *   自己的技术债，见下方"下一步"。
+ */
+
+// ============================================================
+// 四、下一步
+// ============================================================
+
+/**
+ * 优先级 P2：
+ *   1. 06/20/13 完整 IIFE 封装（需要先给 createTask/completeTask/
+ *      cancelTask/getPendingTasks 等跨文件调用的函数设计 public API，
+ *      再改全部调用方，是一次专门的重构，不要混进日常 bug 修复里）。
+ *      2026-07-03 更新：这个耦合现在完全在本项目内部（Core/Reminder OS
+ *      不会直接摸到这几个裸全局函数，只通过 Library 边界调用），优先级
+ *      可以往后放，不是拆分后新引入的紧急问题。
+ *
+ * 优先级 P3（架构演进）：
+ *   2. 给本项目补一套自己的 Foundation.Insights（现在暂时复用 Core 的
+ *      93-96，如果以后需要 Task-specific 的行为分析/建议，考虑在本项目
+ *      内建一份专属的）。
+ *   3. 如果未来真的有"Domain OS 之间要互相触发"的场景（比如 Property OS
+ *      完成某个操作要顺手建一个 Task），按 Core 项目 Constitution 的 D5
+ *      Domain OS↔Domain OS Bridge 模式接（参照 Reminder OS 现在的接入
+ *      方式：不建双向 Library 依赖，而是共享 Spreadsheet + 各自维护自己
+ *      的 Sheet 所有权）。
+ */

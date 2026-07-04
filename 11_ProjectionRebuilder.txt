@@ -1,0 +1,495 @@
+/**
+ * 11_ProjectionRebuilder.gs
+ * JARVIS CORE v3.0 — Projection Rebuilder（从 Events 全量重建 Read Model）
+ *
+ * 使用场景（仅以下情况才运行，正常用户路径绝不调用）：
+ *  - V3 首次上线迁移
+ *  - Read Model 损坏（手动改坏了 Sheet）
+ *  - 排查数据一致性问题
+ *  - 运行 verifyProjection() 发现 Read Model 与 Events 对不上
+ *
+ * 使用方法：
+ *  1. 先运行 migrateAddIdentityColumns()  — 只需执行一次，添加 identity/status 列
+ *  2. 再运行 rebuildAllProjections()      — 从 Events 全量重建 Tasks 和 Inventory Sheet
+ *  3. 用 verifyProjection() 校验结果
+ *
+ * 依赖：02_EventBus, 05_SheetUtils, 07_IdentityEngine
+ */
+
+// ============ Step 1：列迁移 ============
+
+/**
+ * 一次性迁移：在 Tasks 和 Inventory Sheet 添加 V3 所需的新列。
+ *
+ * 安全：幂等，列已存在时跳过，不修改任何现有数据。
+ * 运行时机：V3 上线前运行一次即可。
+ */
+function migrateAddIdentityColumns() {
+  Logger.log('=== migrateAddIdentityColumns ===');
+  // v3.2 bugfix：之前这里只加了 'identity'，但 13_ActiveTasksEngine.gs 的
+  // runDailyArchive() 从一开始就依赖 Tasks 有 'archived' 列（文件头注释也
+  // 一直这么写），这个函数却从来没真正加过——导致老部署永远没有 archived
+  // 列，冷归档每天把同一批 DONE/CANCELLED 超过7天的任务重复搬进
+  // ArchiveTasks。见 15_Setup.gs 文件头 v3.2 变更记录。
+  _addColumnsIfMissing_('Tasks',     ['identity', 'archived']);
+  _addColumnsIfMissing_('Inventory', ['identity', 'status']);
+  Logger.log('✅ 迁移完成');
+}
+
+/**
+ * 如果 Sheet 缺少指定列名，在最右侧追加。
+ */
+function _addColumnsIfMissing_(sheetName, columnNames) {
+  var sheet;
+  try {
+    sheet = getSheet_(sheetName);
+  } catch (e) {
+    Logger.log('⚠️ Sheet 不存在，跳过: ' + sheetName);
+    return;
+  }
+
+  var headerMap = getHeaderMap_(sheet);
+  var lastCol   = sheet.getLastColumn();
+
+  columnNames.forEach(function (col) {
+    if (col in headerMap) {
+      Logger.log('  [' + sheetName + '] 列 "' + col + '" 已存在，跳过');
+      return;
+    }
+    lastCol++;
+    sheet.getRange(1, lastCol).setValue(col);
+    Logger.log('  [' + sheetName + '] 添加列 "' + col + '" 在第 ' + lastCol + ' 列');
+  });
+}
+
+// ============ Step 2：全量重建 ============
+
+/**
+ * 重建 Tasks Read Model。
+ *
+ * 流程：
+ *  1. 从 EventBus 拿全部 Events
+ *  2. 按原有 deriveFromEvent 逻辑还原 stateMap（复用 20_ProductivityModule 的 reducer）
+ *  3. 为每个 Task 计算 identity（旧 Events payload 里没有 identity 字段时在线算）
+ *  4. 逐行 upsertRowByKey_ 写回 Tasks Sheet
+ *
+ * ⚠️ 不清空 Tasks Sheet 里的行：upsert 是幂等的，已有行覆写，不存在的行追加。
+ *    如需完全重置，先手动删除 Tasks Sheet 的数据行（保留表头），再运行此函数。
+ */
+function rebuildTasksProjection() {
+  Logger.log('=== rebuildTasksProjection ===');
+  var events = EventBus.getAllEvents();
+  var stateMap = {};
+
+  // 复用 20_ProductivityModule 里的纯函数 reducer
+  events.forEach(function (e) {
+    deriveFromEvent(e, stateMap); // 20_ProductivityModule.gs 的全局函数
+  });
+
+  // HIGH RISK 1 修复（外部审计，核实属实后采纳）：之前在这里循环调用单行
+  // upsertRowByKey_（每个task一次读+一次写，O(N)次Sheet I/O），Events历史
+  // 积累到几百上千条时容易触发6分钟执行超限。05_SheetUtils.gs的
+  // batchUpsertRowsByKey_本来就是为了修这个而新增的，但这里之前一直没有
+  // 真正切换调用——现在改成：先在内存里把所有task的identity算好、收集成
+  // 数组，最后一次性批量写回，物理I/O次数跟task数量无关。
+  var tasksToWrite = [];
+  for (var id in stateMap) {
+    var task = stateMap[id];
+
+    // 旧事件 payload 没有 identity —— 运行时计算并回写
+    if (!task.identity) {
+      task.identity = IdentityEngine.generateTaskIdentity(
+        task.chat_id   || '',
+        task.title     || '',
+        task.due_date  || '',
+        task.recurring || '',
+        task.priority  || 'MEDIUM',
+        task.category  || 'GENERAL'
+      );
+    }
+
+    tasksToWrite.push(task);
+  }
+
+  var result = batchUpsertRowsByKey_('Tasks', 'task_id', tasksToWrite); // 05_SheetUtils.gs
+  var count = tasksToWrite.length;
+
+  Logger.log('✅ 重建 Tasks 完成，共处理 ' + count + ' 个任务（更新 ' + result.updated + ' / 新增 ' + result.appended + '）');
+  return count;
+}
+
+/**
+ * 重建 Inventory Read Model。
+ *
+ * 同上逻辑：从 Events 推导状态 → 计算 identity → 写回 Inventory Sheet。
+ */
+function rebuildInventoryProjection() {
+  Logger.log('=== rebuildInventoryProjection ===');
+
+  // 复用 21_InventoryModule.gs 的 deriveInventory()
+  var state = deriveInventory();
+
+  // HIGH RISK 1 修复（外部审计，核实属实后采纳）：同 rebuildTasksProjection，
+  // 循环单行 upsertRowByKey_ 改成收集数组后一次性 batchUpsertRowsByKey_。
+  var itemsToWrite = [];
+  for (var id in state) {
+    var item = state[id];
+
+    if (!item.identity) {
+      item.identity = IdentityEngine.generateInventoryIdentity(
+        item.chat_id   || '',
+        item.item_name || '',
+        item.unit      || 'pcs'
+      );
+    }
+
+    // 确保 status 有默认值
+    if (!item.status) item.status = 'ACTIVE';
+
+    itemsToWrite.push(item);
+  }
+
+  var result = batchUpsertRowsByKey_('Inventory', 'item_id', itemsToWrite); // 05_SheetUtils.gs
+  var count = itemsToWrite.length;
+
+  // 处理 ITEM_REMOVED（deriveInventory 会从 state 里 delete 掉已删除的 item_id，
+  // 这意味着 Sheet 里还有那些行但内存 state 里没有它们，需要单独扫一遍把它们软删除）
+  _markRemovedItemsConsumed_();
+
+  Logger.log('✅ 重建 Inventory 完成，共处理 ' + count + ' 个物品（更新 ' + result.updated + ' / 新增 ' + result.appended + '）');
+  return count;
+}
+
+/**
+ * 扫描 Events 里所有 ITEM_REMOVED 事件，把 Inventory Sheet 对应行标记为 CONSUMED。
+ * 因为 deriveInventory() 会把已删除的物品从 stateMap 里 delete，
+ * rebuildInventoryProjection() 就没机会处理它们。
+ *
+ * HIGH RISK 1 关联修复（不在原始审计点名范围内，但是同一函数体紧接着调用的
+ * 同款循环单行写入反模式，只修调用方rebuildInventoryProjection的主循环、
+ * 放着这里不管没有意义——ITEM_REMOVED多起来一样会O(N)拖慢重建）：
+ * 改成批量写入。CONSUMED软删除只需要写status一列，不需要走
+ * batchUpsertRowsByKey_（那个函数是为"整行merge"设计的），这里用更轻量的
+ * 单列批量写：一次性读出item_id列定位行号，内存里改好整列status的值，
+ * 一次setValues()写回。
+ */
+function _markRemovedItemsConsumed_() {
+  var removedIds = {};
+  EventBus.getAllEvents().forEach(function (e) {
+    if (e.type === 'ITEM_REMOVED' && e.payload && e.payload.item_id) {
+      removedIds[e.payload.item_id] = true;
+    }
+  });
+
+  if (Object.keys(removedIds).length === 0) return;
+
+  var sheet = getSheet_('Inventory'); // 05_SheetUtils.gs
+  var headerMap = getHeaderMap_(sheet);
+  if (!('item_id' in headerMap) || !('status' in headerMap)) {
+    Logger.log('[ProjectionRebuilder] Inventory 缺少 item_id 或 status 列，跳过 ITEM_REMOVED 软删除标记');
+    return;
+  }
+
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return;
+
+  var itemIdCol = headerMap['item_id'] + 1;
+  var statusCol = headerMap['status'] + 1;
+  var itemIds = sheet.getRange(2, itemIdCol, lastRow - 1, 1).getValues();
+  var currentStatuses = sheet.getRange(2, statusCol, lastRow - 1, 1).getValues();
+
+  var marked = 0;
+  var newStatuses = currentStatuses.map(function (row, idx) {
+    var itemId = String(itemIds[idx][0]);
+    if (removedIds[itemId]) {
+      marked++;
+      return ['CONSUMED'];
+    }
+    return row; // 保持原值不变
+  });
+
+  sheet.getRange(2, statusCol, newStatuses.length, 1).setValues(newStatuses);
+  Logger.log('[ProjectionRebuilder] ITEM_REMOVED 软删除标记完成，共 ' + marked + ' 个物品（1次批量写入）');
+}
+
+/**
+ * 重建 ActiveTasks Read Model（工作台过滤视图）。
+ *
+ * HIGH RISK 2 修复（外部审计，核实属实后采纳）：rebuildAllProjections() 之前
+ * 只重建 Tasks 和 Inventory，完全遗漏 ActiveTasks；文档（13_ActiveTasksEngine.gs
+ * 文件头）也只说"实时维护由ProjectionEngine负责"，但从没提供离线重建路径——
+ * 一旦 ActiveTasks 视图本身损坏（比如被手动改坏），没有任何函数能修它。
+ *
+ * ⚠️ 跟 rebuildTasksProjection/rebuildInventoryProjection 的关键差异：
+ * 那两个是"全量历史" Read Model，upsert（不清空、只覆写/追加）是正确语义，
+ * 因为每个task/item曾经存在过就该一直有一行记录。ActiveTasks 是过滤视图
+ * （只放 PENDING/IN_PROGRESS/WAITING，10_ProjectionEngine.gs 的
+ * projectTaskCompleted_/projectTaskCancelled_ 会在任务终结时删掉对应行）——
+ * 如果只做 upsert，没法清掉"曾经活着、后来终结了，但因为ProjectionEngine.
+ * dispatch失败而卡在ActiveTasks里没被删掉"的陈旧行。所以这里改成
+ * 「清空数据行（保留表头）→ 把 Events 推导出的全部非终态任务一次性批量写回」，
+ * 这是对"过滤视图"唯一能保证"重建后与 Events 完全一致"的做法，也顺带避免了
+ * "先upsert活的、再逐行deleteRowByKey_清陈旧行"这种循环单行I/O（重犯
+ * HIGH RISK 1 同样的错）。
+ *
+ * @returns {number} 写回的活跃任务数
+ */
+function rebuildActiveTasksProjection() {
+  Logger.log('=== rebuildActiveTasksProjection ===');
+
+  var sheet;
+  try {
+    sheet = getSheet_('ActiveTasks'); // 05_SheetUtils.gs
+  } catch (e) {
+    Logger.log('⚠️ ActiveTasks Sheet 不存在，跳过重建（先跑 setupSheets() 建表）');
+    return 0;
+  }
+
+  var events = EventBus.getAllEvents();
+  var stateMap = {};
+  events.forEach(function (e) {
+    deriveFromEvent(e, stateMap); // 20_ProductivityModule.gs
+  });
+
+  var terminalStatuses = { 'DONE': true, 'CANCELLED': true };
+  var activeTasks = [];
+  for (var id in stateMap) {
+    var task = stateMap[id];
+    var status = String(task.status || '').toUpperCase();
+    if (terminalStatuses[status]) continue; // 只保留非终态（PENDING等）
+
+    if (!task.identity) {
+      task.identity = IdentityEngine.generateTaskIdentity(
+        task.chat_id   || '',
+        task.title     || '',
+        task.due_date  || '',
+        task.recurring || '',
+        task.priority  || 'MEDIUM',
+        task.category  || 'GENERAL'
+      );
+    }
+    activeTasks.push(task);
+  }
+
+  // 清空现有数据行（保留表头+格式），确保重建后不残留任何陈旧的终态任务
+  var lastRow = sheet.getLastRow();
+  if (lastRow >= 2) {
+    sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).clearContent();
+  }
+
+  var count = 0;
+  if (activeTasks.length > 0) {
+    var result = batchUpsertRowsByKey_('ActiveTasks', 'task_id', activeTasks); // 05_SheetUtils.gs
+    count = result.updated + result.appended;
+  }
+
+  Logger.log('✅ 重建 ActiveTasks 完成，共处理 ' + count + ' 个活跃任务');
+  return count;
+}
+
+/**
+ * 重建全部 Read Models。
+ */
+function rebuildAllProjections() {
+  Logger.log('=== rebuildAllProjections ===');
+  rebuildTasksProjection();
+  rebuildInventoryProjection();
+  rebuildActiveTasksProjection(); // v3.2新增（HIGH RISK 2修复）
+  Logger.log('✅ 所有 Projection 重建完成');
+}
+
+// ============ Step 3：校验 ============
+
+/**
+ * 快速校验：比较 Events 推导的状态 vs Tasks Sheet 当前内容。
+ * 只做抽样级别的一致性检查（数量是否相符、PENDING 任务是否都在 Sheet 里）。
+ * 不做全字段 diff（那太慢了）。
+ */
+function verifyProjection() {
+  Logger.log('=== verifyProjection ===');
+
+  var fromEvents = deriveTaskState_();       // 20_ProductivityModule，全量 derive
+  var pendingFromEvents = Object.keys(fromEvents).filter(function (id) {
+    return fromEvents[id].status === 'PENDING';
+  });
+
+  Logger.log('Events 推导的 PENDING 任务数: ' + pendingFromEvents.length);
+
+  // 读 Tasks Sheet
+  var sheet;
+  try {
+    sheet = getSheet_('Tasks');
+  } catch (e) {
+    Logger.log('❌ Tasks Sheet 不存在');
+    return;
+  }
+
+  var headerMap = getHeaderMap_(sheet);
+  var lastRow   = sheet.getLastRow();
+  if (lastRow < 2) {
+    Logger.log('❌ Tasks Sheet 是空的');
+    return;
+  }
+
+  var statusColIdx = headerMap['status'];
+  var taskIdColIdx = headerMap['task_id'];
+  if (statusColIdx === undefined || taskIdColIdx === undefined) {
+    Logger.log('❌ Tasks Sheet 缺少 status 或 task_id 列');
+    return;
+  }
+
+  var rows = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+  var pendingInSheet = rows.filter(function (row) {
+    return String(row[statusColIdx] || '').toUpperCase() === 'PENDING';
+  });
+
+  Logger.log('Tasks Sheet 里的 PENDING 任务数: ' + pendingInSheet.length);
+
+  // 检查 Events 里的 PENDING 是否都在 Sheet 里
+  var missing = [];
+  pendingFromEvents.forEach(function (id) {
+    var found = rows.some(function (row) {
+      return String(row[taskIdColIdx]) === String(id);
+    });
+    if (!found) missing.push(id);
+  });
+
+  if (missing.length === 0) {
+    Logger.log('✅ 校验通过：所有 PENDING 任务都在 Tasks Sheet 里');
+  } else {
+    Logger.log('❌ 校验失败：以下 task_id 在 Sheet 里缺失（运行 rebuildTasksProjection() 修复）:');
+    missing.forEach(function (id) { Logger.log('   - ' + id); });
+  }
+
+  // v3.2新增（发现的doc/code drift关联修复）：ActiveTasks一致性校验。
+  // 复用上面已经算好的fromEvents，不用再全量replay一次Events。
+  _verifyActiveTasksConsistency_(fromEvents);
+}
+
+/**
+ * 校验 ActiveTasks 跟 Events 推导出的"非终态任务集合"是否一致。
+ *
+ * ⚠️ 这个函数名之前只存在于 00_File_Map.gs 的描述里（声称verifyProjection()
+ * 已经在调用它），但实际代码里从未真正实现过——是这次修HIGH RISK 2（新增
+ * rebuildActiveTasksProjection）过程中顺带发现的第3处doc/code drift。既然
+ * 已经在这个文件里工作，且这正是"校验工具本身该覆盖但没覆盖"的缺口，
+ * 一并补上，不再让File_Map的那句描述继续是一张空头支票。
+ *
+ * 检查两个方向：
+ *   1. Events推导出的非终态任务，是否都能在ActiveTasks里找到（缺失=
+ *      ProjectionEngine.dispatch在TASK_CREATED时可能失败过）
+ *   2. ActiveTasks里的任务，是否都对应Events推导状态里的非终态（多出来的=
+ *      ProjectionEngine.dispatch在TASK_COMPLETED/CANCELLED时可能失败过，
+ *      陈旧行没被清掉）
+ *
+ * @param {object} fromEvents  deriveTaskState_()的返回值，调用方已经算过一次，
+ *                              这里直接复用，不重新全量replay Events。
+ */
+function _verifyActiveTasksConsistency_(fromEvents) {
+  var nonTerminal = {};
+  for (var id in fromEvents) {
+    var status = String(fromEvents[id].status || '').toUpperCase();
+    if (status !== 'DONE' && status !== 'CANCELLED') nonTerminal[id] = true;
+  }
+
+  var sheet;
+  try {
+    sheet = getSheet_('ActiveTasks');
+  } catch (e) {
+    Logger.log('⚠️ ActiveTasks Sheet 不存在，跳过 ActiveTasks 一致性校验');
+    return;
+  }
+
+  var headerMap = getHeaderMap_(sheet);
+  var taskIdColIdx = headerMap['task_id'];
+  if (taskIdColIdx === undefined) {
+    Logger.log('❌ ActiveTasks Sheet 缺少 task_id 列');
+    return;
+  }
+
+  var lastRow = sheet.getLastRow();
+  var idsInActiveTasks = {};
+  if (lastRow >= 2) {
+    var atRows = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+    atRows.forEach(function (row) {
+      idsInActiveTasks[String(row[taskIdColIdx])] = true;
+    });
+  }
+
+  var missingFromActiveTasks = Object.keys(nonTerminal).filter(function (id) {
+    return !idsInActiveTasks[id];
+  });
+  var staleInActiveTasks = Object.keys(idsInActiveTasks).filter(function (id) {
+    return !nonTerminal[id];
+  });
+
+  Logger.log('ActiveTasks 校验：Events推导非终态任务 ' + Object.keys(nonTerminal).length +
+             ' 个，ActiveTasks Sheet 里 ' + Object.keys(idsInActiveTasks).length + ' 个');
+
+  if (missingFromActiveTasks.length === 0 && staleInActiveTasks.length === 0) {
+    Logger.log('✅ ActiveTasks 一致性校验通过');
+    return;
+  }
+
+  if (missingFromActiveTasks.length > 0) {
+    Logger.log('❌ 以下非终态task_id缺失于ActiveTasks（运行 rebuildActiveTasksProjection() 修复）:');
+    missingFromActiveTasks.forEach(function (id) { Logger.log('   - ' + id); });
+  }
+  if (staleInActiveTasks.length > 0) {
+    Logger.log('❌ 以下task_id是ActiveTasks里的陈旧行，Events显示已终结（运行 rebuildActiveTasksProjection() 修复）:');
+    staleInActiveTasks.forEach(function (id) { Logger.log('   - ' + id); });
+  }
+}
+
+/**
+ * 比较 Projection 与 Events：输出每个任务的 Events 状态 vs Sheet 状态。
+ * 仅建议在调试时手动运行，输出量大。
+ */
+function compareProjectionWithEvents() {
+  Logger.log('=== compareProjectionWithEvents ===');
+
+  var fromEvents = deriveTaskState_();
+  var sheet;
+  try {
+    sheet = getSheet_('Tasks');
+  } catch (e) {
+    Logger.log('❌ Tasks Sheet 不存在');
+    return;
+  }
+
+  var headerMap = getHeaderMap_(sheet);
+  var lastRow   = sheet.getLastRow();
+  if (lastRow < 2) { Logger.log('Tasks Sheet 是空的'); return; }
+
+  var rows = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+  var sheetById = {};
+  rows.forEach(function (row) {
+    var id = String(row[headerMap['task_id']] || '');
+    if (id) sheetById[id] = row;
+  });
+
+  var mismatch = 0;
+  for (var id in fromEvents) {
+    var evStatus    = (fromEvents[id].status || '').toUpperCase();
+    var sheetRow    = sheetById[id];
+    var sheetStatus = sheetRow ? String(sheetRow[headerMap['status']] || '').toUpperCase() : 'MISSING';
+
+    if (evStatus !== sheetStatus) {
+      Logger.log('❌ 不一致 [' + id + ']: Events=' + evStatus + ', Sheet=' + sheetStatus);
+      mismatch++;
+    }
+  }
+
+  if (mismatch === 0) {
+    Logger.log('✅ 所有任务 status 一致（' + Object.keys(fromEvents).length + ' 个）');
+  } else {
+    Logger.log('共 ' + mismatch + ' 个不一致，运行 rebuildTasksProjection() 修复');
+  }
+}
+
+/**
+ * 修复 Projection（rebuildAllProjections 的别名，更符合「修复」语义）
+ */
+function repairProjection() {
+  rebuildAllProjections();
+}

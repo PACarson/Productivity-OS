@@ -1,0 +1,213 @@
+/**
+ * 02_EventBus.gs
+ * Productivity OS v3.1 — 事件总线（Events 表唯一写入口，本项目内）
+ *
+ * ⚠️ 2026-07-03 拆分说明：这是 Personal AI Core 的 02_EventBus.gs 的本地副本，
+ * 唯一改动是 _sheet_()——Core 是 container-bound 脚本，用
+ * SpreadsheetApp.getActiveSpreadsheet() 就能拿到正确的表；Productivity OS
+ * 是独立（standalone）脚本，没有"容器"，必须用 SpreadsheetApp.openById()
+ * 显式指定 Spreadsheet ID（跟 Core 用同一个共享 Spreadsheet，Script
+ * Properties 里的 SPREADSHEET_ID 要设成跟 Core 一样的值）。
+ *
+ * 为什么 Task 事件不通过 Core 的 EventBus，而是自己另开一份：
+ * P1（EventBus 是 Events 表唯一写入者）指的是"同一类事件只有一条定义清晰
+ * 的写入路径"，不是"物理上只能有一份代码"。Task/Reminder 相关事件
+ * （TASK_CREATED/COMPLETED/CANCELLED/REMINDER_SENT）现在唯一的写入路径
+ * 就是这份文件；Inventory 相关事件唯一的写入路径是 Core 自己的
+ * 02_EventBus.gs。两边都 append 到同一张共享 Events 表（Google Sheets
+ * 允许来自不同 Apps Script 项目的并发 appendRow，不会互相冲突），
+ * 历史仍然是一份完整、按时间顺序的记录，只是"谁有权限写哪类事件"按
+ * Domain 分开了。见 Personal AI Core 项目 00_Project_Constitution.gs 的
+ * P6.2（Execution → Event 关系）。
+ *
+ * 以下为原始文件头（Core 版本），逻辑未变：
+ *
+ * v3.0 变更（相比 v2）：
+ * 1. publish() 在 appendRow 之后同步调用 ProjectionEngine.dispatch(event)，
+ *    保证 Read Model 与 Event Store 实时同步（同一次执行内不会 stale）。
+ *    Projection 失败被 catch 并记录日志，不影响 Event 已写入的事实。
+ * 2. 新增第 5 个可选参数 identity：
+ *    - 由 09_IdempotencyManager / _createTaskDirect_ 传入
+ *    - EventBus 维护一个「本次执行内 identity 缓存」（_inExecIdentityCache_）
+ *    - 同一次脚本执行内，相同 identity 的 CREATE 事件只会写入一次
+ *    - 不跨执行持久化，不是「第二套状态」
+ *
+ * 架构铁律（保持不变）：
+ *  - 这是（本项目负责的那部分）Events 表唯一的写入者
+ *  - 只追加，不修改不删除
+ */
+
+var EventBus = (function () {
+  var SHEET_NAME = 'Events';
+  var COLS = ['event_id', 'timestamp', 'type', 'chat_id', 'payload', 'source'];
+
+  var _cachedEvents = null;        // 运行期内存缓存
+  var _inExecIdentityCache_ = {};  // 本次执行内的 identity 去重缓存
+
+  /**
+   * 2026-07-03 拆分新增：跨项目共享同一个 Spreadsheet，用 openById 而不是
+   * getActiveSpreadsheet（standalone 脚本没有 active spreadsheet 的概念）。
+   * SPREADSHEET_ID 要在本项目的 Script Properties 里设置成跟 Core 项目
+   * 一样的值（跟 Core 那份 Spreadsheet 的 ID，去 Core 的
+   * SecureConfig.getKey('SPREADSHEET_ID') 或者直接看那张表的 URL 抄）。
+   */
+  function _spreadsheet_() {
+    var id = SecureConfig.getKey('SPREADSHEET_ID');
+    if (!id) {
+      throw new Error('缺少 SPREADSHEET_ID（Script Properties）。这是跟 Personal AI Core ' +
+        '共享的同一张 Spreadsheet 的 ID，去 Core 项目那边的表格 URL 复制，' +
+        '然后 SecureConfig.setKey("SPREADSHEET_ID", "你复制的ID")。');
+    }
+    return SpreadsheetApp.openById(id);
+  }
+
+  function _sheet_() {
+    var ss = _spreadsheet_();
+    var sheet = ss.getSheetByName(SHEET_NAME);
+    if (!sheet) {
+      throw new Error('Events sheet 不存在，先跑本项目 15_Setup.gs 里的 setupSheets()（或者确认 SPREADSHEET_ID 指对了表）');
+    }
+    return sheet;
+  }
+
+  function _generateEventId_() {
+    return 'EVT-' + new Date().getTime() + '-' + Math.floor(Math.random() * 1000);
+  }
+
+  /**
+   * 唯一的写入函数
+   *
+   * @param {string} type      事件类型，比如 'TASK_CREATED'
+   * @param {object} payload   事件的数据
+   * @param {string} chatId
+   * @param {string} source    哪个模块发的，比如 'ProductivityModule'
+   * @param {string} [identity]  可选：业务身份 SHA-256。传入时启用执行内去重。
+   * @returns {object|null}  写入的 event 对象，或 null（被执行内去重拦截时）
+   */
+  function publish(type, payload, chatId, source, identity) {
+
+    if (identity) {
+      if (_inExecIdentityCache_[identity]) {
+        Logger.log('[EventBus] 执行内去重命中，跳过: type=' + type + ' identity=' + identity.slice(0, 12) + '...');
+        return null;
+      }
+      _inExecIdentityCache_[identity] = true;
+    }
+
+    var event = {
+      event_id: _generateEventId_(),
+      timestamp: new Date().toISOString(),
+      type: type,
+      chat_id: chatId || '',
+      payload: payload || {},
+      source: source || ''
+    };
+
+    _sheet_().appendRow([
+      event.event_id,
+      event.timestamp,
+      event.type,
+      event.chat_id,
+      JSON.stringify(event.payload),
+      event.source
+    ]);
+
+    _cachedEvents = null; // 写入新事件，缓存失效
+
+    // ── 同步触发 Projection，更新 Read Model ────────────────────────────────
+    if (typeof ProjectionEngine !== 'undefined' && typeof ProjectionEngine.dispatch === 'function') {
+      try {
+        ProjectionEngine.dispatch(event);
+      } catch (projErr) {
+        Logger.log('[EventBus] Projection 失败（非致命）: ' + projErr.message + '。运行 rebuildAllProjections() 修复 Read Model。');
+        _alertAdminProjectionFailure_(event, projErr);
+      }
+    }
+
+    return event;
+  }
+
+  /**
+   * Projection 失败时主动告警管理员。
+   * 2026-07-03 拆分说明：这里改成给 TELEGRAM_CHAT_ID 直接发消息（本项目
+   * 自己的 Output.gs 副本），不再经过 Core——避免"通知失败"这件小事也要
+   * 依赖一次跨项目调用。
+   */
+  function _alertAdminProjectionFailure_(event, err) {
+    try {
+      var adminChatId = (typeof SecureConfig !== 'undefined') ? SecureConfig.getKey('TELEGRAM_CHAT_ID') : null;
+      if (!adminChatId) {
+        Logger.log('[EventBus] ⚠️ 没有配置 TELEGRAM_CHAT_ID，无法发送 Projection 失败告警');
+        return;
+      }
+      var text = [
+        '🚨 [Productivity OS] Read Model 同步失败（Projection Error）',
+        '',
+        '事件: ' + event.type + ' (event_id=' + event.event_id + ')',
+        '错误: ' + err.message,
+        '',
+        '影响: Tasks/ActiveTasks Sheet 可能与 Events 表不一致。',
+        '处理: 在本项目 GAS 编辑器运行 rebuildAllProjections() 修复。'
+      ].join('\n');
+
+      if (typeof Output !== 'undefined' && typeof Output.sendMessage === 'function') {
+        Output.sendMessage(adminChatId, text);
+      } else {
+        Logger.log('[EventBus] ⚠️ Output 模块未加载，无法发送告警，告警内容: ' + text);
+      }
+    } catch (alertErr) {
+      Logger.log('[EventBus] ❌ 连Projection失败告警都发不出去: ' + alertErr.message);
+    }
+  }
+
+  /**
+   * 读取全部事件（按行顺序，也就是发生顺序）
+   * 本次执行内已读过则直接复用缓存。
+   *
+   * ⚠️ 这会读到 Core 那边写的 Inventory 事件也混在一起（同一张共享
+   * Events 表）。deriveFromEvent/deriveTaskState_（20_ProductivityModule.gs）
+   * 的 switch 只认 TASK_ 开头的几个 type 和 REMINDER_SENT，其余类型会落到 default
+   * 分支被忽略，所以混在一起不影响 Task 状态推导，不需要在这里过滤。
+   */
+  function getAllEvents() {
+    if (_cachedEvents !== null) return _cachedEvents;
+
+    var sheet = _sheet_();
+    var lastRow = sheet.getLastRow();
+    if (lastRow < 2) {
+      _cachedEvents = [];
+      return _cachedEvents;
+    }
+
+    var rows = sheet.getRange(2, 1, lastRow - 1, COLS.length).getValues();
+    _cachedEvents = rows.map(function (r) {
+      var payload = {};
+      try {
+        payload = r[4] ? JSON.parse(r[4]) : {};
+      } catch (e) {
+        payload = {};
+      }
+      return {
+        event_id:  r[0],
+        timestamp: r[1],
+        type:      r[2],
+        chat_id:   r[3],
+        payload:   payload,
+        source:    r[5]
+      };
+    });
+    return _cachedEvents;
+  }
+
+  function getEventsByType(type) {
+    return getAllEvents().filter(function (e) {
+      return e.type === type;
+    });
+  }
+
+  return {
+    publish:         publish,
+    getAllEvents:    getAllEvents,
+    getEventsByType: getEventsByType
+  };
+})();

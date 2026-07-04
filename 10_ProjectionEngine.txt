@@ -1,0 +1,160 @@
+/**
+ * 10_ProjectionEngine.gs
+ * Productivity OS v3.1 — Projection Engine（Read Model 实时更新器）
+ *
+ * 职责：EventBus.publish() 写完 Event 后立即调用本模块，将变更增量写入
+ * Read Model（Tasks Sheet / ActiveTasks Sheet）。
+ *
+ * 架构位置：
+ *   EventBus.publish() → [append Event] → ProjectionEngine.dispatch() → Read Model
+ *
+ * 设计原则：
+ *  - O(1) 更新：每个 Event 只读/写一行，从不全表重放
+ *  - 非阻断：Projection 失败时记录日志但不抛错（Event 已经写入是真相，
+ *    Read Model 偶尔 stale 可以通过 11_ProjectionRebuilder 修复）
+ *  - 只写 Read Model，从不读 Events 表
+ *
+ * ActiveTasks Sheet 是"每天工作台"，永远只存 PENDING/IN_PROGRESS/WAITING 任务。
+ * 维护策略：同步写，不做定时重建，保证 Tasks 与 ActiveTasks 之间没有不一致窗口。
+ *
+ *   TASK_CREATED   → upsert Tasks + upsert ActiveTasks（新任务默认是待做的）
+ *   TASK_COMPLETED → upsert Tasks（标 DONE）+ deleteRowByKey_ ActiveTasks（从工作台移除）
+ *   TASK_CANCELLED → upsert Tasks（标 CANCELLED）+ deleteRowByKey_ ActiveTasks
+ *   REMINDER_SENT  → upsert Tasks（reminder_count+1）—— 通常这条已经被
+ *                     Reminder OS 项目自己直接 upsert 过了（safety net），
+ *                     这里再处理一次是幂等的（upsert 覆写同一个值不会错），
+ *                     只有当 Reminder OS 换成"只发事件不直接写"的方式时，
+ *                     才会真正靠这条 case 来更新 Tasks。
+ *
+ * ⚠️ 2026-07-03 拆分说明：这是 Personal AI Core 10_ProjectionEngine.gs 的
+ * Task/Reminder 部分。Inventory 部分留在 Core 项目自己的副本里（本项目
+ * 不会收到 ITEM_* 类型的事件——就算共享 Events 表里混有 Core 写的
+ * Inventory 事件，本项目的 EventBus.publish() 也只会拿到自己刚写的那一条
+ * event 传给 dispatch，不会重放 Core 写的旧事件，所以下面就不需要
+ * Inventory 的 case 了）。
+ *
+ * 注：锁（ScriptLock）由上游 IdempotencyManager 持有，ProjectionEngine 本身不再
+ * 获取锁（防止与 IdempotencyManager 的锁形成重入死锁）。
+ *
+ * 依赖：05_SheetUtils（upsertRowByKey_, deleteRowByKey_, getSheet_, getHeaderMap_）
+ */
+
+var ProjectionEngine = (function () {
+
+  var TASKS_SHEET        = 'Tasks';
+  var ACTIVE_TASKS_SHEET = 'ActiveTasks';
+
+  // ============ 入口 ============
+
+  function dispatch(event) {
+    try {
+      var type = event.type;
+      switch (type) {
+        case 'TASK_CREATED':   projectTaskCreated_(event);   break;
+        case 'TASK_COMPLETED': projectTaskCompleted_(event); break;
+        case 'TASK_CANCELLED': projectTaskCancelled_(event); break;
+        case 'REMINDER_SENT':  projectReminderSent_(event);  break;
+
+        default:
+          break;
+      }
+    } catch (e) {
+      Logger.log('[ProjectionEngine] ERROR dispatching ' + (event && event.type) + ': ' + e.message);
+    }
+  }
+
+  // ============ Task Projectors ============
+
+  function projectTaskCreated_(event) {
+    var p = event.payload || {};
+    if (!p.task_id) return;
+
+    upsertRowByKey_(TASKS_SHEET, 'task_id', p.task_id, p);
+
+    try {
+      upsertRowByKey_(ACTIVE_TASKS_SHEET, 'task_id', p.task_id, p);
+    } catch (e) {
+      Logger.log('[ProjectionEngine] ActiveTasks upsert 失败（Sheet 可能尚未建立）: ' + e.message);
+    }
+  }
+
+  function projectTaskCompleted_(event) {
+    var p = event.payload || {};
+    if (!p.task_id) return;
+
+    var completedAt = event.timestamp || new Date().toISOString();
+
+    upsertRowByKey_(TASKS_SHEET, 'task_id', p.task_id, {
+      status:       'DONE',
+      completed_at: completedAt
+    });
+
+    try {
+      deleteRowByKey_(ACTIVE_TASKS_SHEET, 'task_id', p.task_id);
+    } catch (e) {
+      Logger.log('[ProjectionEngine] ActiveTasks 删除失败（Sheet 可能尚未建立）: ' + e.message);
+    }
+  }
+
+  function projectTaskCancelled_(event) {
+    var p = event.payload || {};
+    if (!p.task_id) return;
+
+    upsertRowByKey_(TASKS_SHEET, 'task_id', p.task_id, {
+      status: 'CANCELLED'
+    });
+
+    try {
+      deleteRowByKey_(ACTIVE_TASKS_SHEET, 'task_id', p.task_id);
+    } catch (e) {
+      Logger.log('[ProjectionEngine] ActiveTasks 删除失败（Sheet 可能尚未建立）: ' + e.message);
+    }
+  }
+
+  function projectReminderSent_(event) {
+    var p = event.payload || {};
+    if (!p.task_id) return;
+
+    var current = _getRowByKey_(TASKS_SHEET, 'task_id', p.task_id);
+    if (!current) return;
+
+    upsertRowByKey_(TASKS_SHEET, 'task_id', p.task_id, {
+      reminder_count: (Number(current.reminder_count) || 0) + 1
+    });
+    // ActiveTasks 不需要 reminder_count（工作台不展示这列），跳过
+  }
+
+  // ============ 内部工具 ============
+
+  function _getRowByKey_(sheetName, keyHeader, keyValue) {
+    try {
+      var sheet = getSheet_(sheetName);
+      var lastRow = sheet.getLastRow();
+      if (lastRow < 2) return null;
+
+      var headerMap = getHeaderMap_(sheet);
+      if (!(keyHeader in headerMap)) return null;
+
+      var keyCol = headerMap[keyHeader] + 1;
+      var ids = sheet.getRange(2, keyCol, lastRow - 1, 1).getValues();
+
+      for (var i = 0; i < ids.length; i++) {
+        if (String(ids[i][0]) === String(keyValue)) {
+          var numCols = sheet.getLastColumn();
+          var row = sheet.getRange(i + 2, 1, 1, numCols).getValues()[0];
+          var obj = {};
+          for (var h in headerMap) obj[h] = row[headerMap[h]];
+          return obj;
+        }
+      }
+    } catch (e) {
+      Logger.log('[ProjectionEngine] _getRowByKey_ error (' + sheetName + ', ' + keyValue + '): ' + e.message);
+    }
+    return null;
+  }
+
+  return {
+    dispatch:     dispatch,
+    _getRowByKey: _getRowByKey_
+  };
+})();

@@ -1,0 +1,175 @@
+/**
+ * 07_IdentityEngine.gs
+ * JARVIS CORE v3.0 — 业务身份引擎
+ *
+ * 职责：为每个业务对象生成确定性的 SHA-256 身份标识符（Identity）。
+ * Identity 是「这个业务对象是否已经存在」的判断依据，与存储 ID（task_id / item_id）无关。
+ *
+ * 架构铁律：
+ *  - 本模块不读写任何 Sheet，不调用 EventBus
+ *  - 纯函数：输入相同 → 输出必然相同
+ *  - 不依赖时间戳、随机数、UUID
+ *
+ * 依赖：无（最底层工具模块，零外部依赖）
+ */
+
+var IdentityEngine = (function () {
+
+  // ============ SHA-256 ============
+
+  /**
+   * 把任意字符串算成 SHA-256 hex string。
+   * GAS 内置 Utilities.computeDigest 返回有符号字节数组（-128~127），
+   * 用 & 0xFF 把负数转成无符号字节再转十六进制。
+   */
+  function sha256_(input) {
+    var bytes = Utilities.computeDigest(
+      Utilities.DigestAlgorithm.SHA_256,
+      String(input),
+      Utilities.Charset.UTF_8
+    );
+    return bytes.map(function (b) {
+      return ('0' + (b & 0xFF).toString(16)).slice(-2);
+    }).join('');
+  }
+
+  // ============ 文本标准化 ============
+
+  /**
+   * 折叠空白（多个连续空白 → 单个空格）并 trim
+   */
+  function normalizeWhitespace(text) {
+    return String(text || '').replace(/\s+/g, ' ').trim();
+  }
+
+  /**
+   * 转小写
+   */
+  function normalizeCase(text) {
+    return String(text || '').toLowerCase();
+  }
+
+  /**
+   * 全角 ASCII → 半角（输入法常见误输入：ＡＢＣ → ABC）
+   * GAS 不支持 String.prototype.normalize()，用简化替代。
+   */
+  function normalizeUnicode(text) {
+    return String(text || '').replace(/[\uFF01-\uFF5E]/g, function (ch) {
+      return String.fromCharCode(ch.charCodeAt(0) - 0xFEE0);
+    });
+  }
+
+  /**
+   * 标准化标题：
+   *  1. 全角转半角
+   *  2. 转小写
+   *  3. 移除标点符号（只保留中英文字母、数字、空格）
+   *  4. 折叠空白
+   *
+   * 效果：
+   *   「提醒我去买菜」「去买菜！」「去 买 菜」→ 三者 identity 相同
+   */
+  function normalizeTitle(title) {
+    var s = normalizeUnicode(title);
+    s = normalizeCase(s);
+    s = s.replace(/[^\w\u4e00-\u9fa5\u0020]/g, ' '); // 非字母数字中文 → 空格
+    s = normalizeWhitespace(s);
+    return s;
+  }
+
+  // ============ 业务 Identity 生成 ============
+
+  /**
+   * 任务 Identity
+   *
+   * 组合字段：chat_id | normalized_title | due_date | repeat_rule | priority | category
+   *
+   * ⚠️ 注意：相同标题 + 不同 due_date → 不同 identity → 可以共存
+   *   「明天买菜」和「后天买菜」是两个不同任务，不会互相拦截。
+   *   DONE / CANCELLED 不影响 identity 判断（那是 DeduplicationEngine 的事）。
+   */
+  function generateTaskIdentity(chatId, title, dueDate, repeatRule, priority, category) {
+    var parts = [
+      String(chatId || ''),
+      normalizeTitle(title),
+      String(dueDate || ''),
+      String(repeatRule || ''),
+      String(priority || 'MEDIUM'),
+      String(category || 'GENERAL')
+    ];
+    return sha256_(parts.join('|'));
+  }
+
+  /**
+   * 库存物品 Identity
+   *
+   * 组合字段：chat_id | normalized_name | unit
+   *
+   * 注意：expiry / batch / location 不参与 identity——
+   * 同名物品补货时 expiry 会变，但它们是同一个物品。
+   * DeduplicationEngine 找到后走补货路径，不走新建。
+   */
+  function generateInventoryIdentity(chatId, itemName, unit) {
+    var parts = [
+      String(chatId || ''),
+      normalizeTitle(itemName),
+      String(unit || '')
+    ];
+    return sha256_(parts.join('|'));
+  }
+
+  /**
+   * 提醒 Identity（为未来 ReminderEngine 幂等性预留）
+   */
+  function generateReminderIdentity(chatId, taskId, scheduledAt) {
+    var parts = [
+      String(chatId || ''),
+      String(taskId || ''),
+      String(scheduledAt || '')
+    ];
+    return sha256_(parts.join('|'));
+  }
+
+  // ============ 开发者测试 ============
+
+  function testIdentity() {
+    Logger.log('=== IdentityEngine Test ===');
+
+    // 1. 不同说法 → 相同 identity
+    var t1 = generateTaskIdentity('123', '提醒我去买菜', '2026-07-01', '', 'MEDIUM', 'SHOPPING');
+    var t2 = generateTaskIdentity('123', '去买菜！', '2026-07-01', '', 'MEDIUM', 'SHOPPING');
+    var t3 = generateTaskIdentity('123', '去 买 菜', '2026-07-01', '', 'MEDIUM', 'SHOPPING');
+    Logger.log('normalizeTitle "提醒我去买菜" → "' + normalizeTitle('提醒我去买菜') + '"');
+    Logger.log('normalizeTitle "去买菜！"    → "' + normalizeTitle('去买菜！') + '"');
+    Logger.log('t1 === t2? ' + (t1 === t2) + '  (expected: true)');
+    Logger.log('t2 === t3? ' + (t2 === t3) + '  (expected: true)');
+
+    // 2. 不同 due_date → 不同 identity
+    var t4 = generateTaskIdentity('123', '去买菜', '2026-07-02', '', 'MEDIUM', 'SHOPPING');
+    Logger.log('t1 === t4 (diff due_date)? ' + (t1 === t4) + '  (expected: false)');
+
+    // 3. 全角转换
+    var t5 = generateTaskIdentity('123', '去ＡＢＣ买菜', '2026-07-01', '', 'MEDIUM', 'SHOPPING');
+    var t6 = generateTaskIdentity('123', '去abc买菜', '2026-07-01', '', 'MEDIUM', 'SHOPPING');
+    Logger.log('全角ABC === 半角abc? ' + (t5 === t6) + '  (expected: true)');
+
+    // 4. 库存 identity
+    var i1 = generateInventoryIdentity('123', '鸡蛋', 'pcs');
+    var i2 = generateInventoryIdentity('123', '鸡 蛋', 'pcs');
+    Logger.log('inventory i1 === i2 (whitespace)? ' + (i1 === i2) + '  (expected: true)');
+
+    Logger.log('=== IdentityEngine Test DONE ===');
+  }
+
+  return {
+    sha256: sha256_,
+    normalizeTitle: normalizeTitle,
+    normalizeWhitespace: normalizeWhitespace,
+    normalizeCase: normalizeCase,
+    normalizeUnicode: normalizeUnicode,
+    generateTaskIdentity: generateTaskIdentity,
+    generateInventoryIdentity: generateInventoryIdentity,
+    generateReminderIdentity: generateReminderIdentity,
+    testIdentity: testIdentity
+  };
+})();

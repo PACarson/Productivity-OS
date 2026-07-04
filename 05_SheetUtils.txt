@@ -1,0 +1,335 @@
+/**
+ * 05_SheetUtils.gs
+ * JARVIS CORE v3.1 — 共用 Sheet 工具 + 共用小工具
+ *
+ * 用途：Tasks / Inventory 这类「派生视图」表，字段经常会改/加列，
+ * 所以一律按表头名字找列，不写死列号。
+ *
+ * ⚠️ 这些函数只用来维护「派生视图」表（Tasks, Inventory），
+ * 不允许用来写 EVENTS 表 —— EVENTS 表只能通过 EventBus.publish() 写。
+ *
+ * 本次修改（2026-06-27，外部审计MEDIUM RISK 7 / LOW RISK 9，核实属实后采纳）：
+ * 新增 isOverdue_/parseDueDate_/round1_/round2_ 四个共用函数。这些原本
+ * 各自散落在 92_ReminderEngine.gs（isOverdue_/parseDueDate_）和
+ * 93_MemoryEngine.gs（round1_/round2_，且93自己另外重复实现了一份过期判断
+ * 逻辑），21_InventoryModule.gs 和 94/95_*Engine.gs 又跨文件隐式调用它们——
+ * 这种"调用方靠猜全局作用域里有这个函数"的写法，一旦被调用的那个文件
+ * 重构（比如加IIFE），调用方会直接 ReferenceError 崩溃，犯C5。统一搬到
+ * 这里，所有调用方改成调这份。
+ *
+ * 本次修改（2026-06-29，外部审计HIGH RISK 2 / MEDIUM RISK 1，核实属实后采纳）：
+ * 1. 新增 batchUpsertRowsByKey_()：11_ProjectionRebuilder.gs 的全量重建
+ *    之前是循环里逐个调 upsertRowByKey_（每个 task/item 一次读+一次写），
+ *    历史 Events 数到几百上千条时极易触发 GAS 6 分钟执行超时。这个新函数
+ *    一次性读全表 → 内存里合并 → 最多两次 setValues() 写回（一次覆写已有行、
+ *    一次追加新行），I/O 次数跟数据量无关。upsertRowByKey_ 本身不删，
+ *    正常单行更新场景（如 completeTask 的安全兜底）继续用它，没有批量
+ *    需求时没必要换。
+ * 2. 新增共用 shallowCopy_(obj) / _cleanTitle_(text)：之前
+ *    20_ProductivityModule.gs 全局定义了 shallowCopy_，21_InventoryModule.gs
+ *    又用不同名字（shallowCopyInv_）重复实现了一份完全一样的逻辑；
+ *    06_TaskIntentParser.gs 和 22_InventoryIntentParser.gs 各自全局定义了
+ *    一份完全相同的 _cleanTitle_ —— 后加载的文件会静默覆盖先加载的同名声明
+ *    （GAS 全局命名空间扁平化），现在两边代码相同所以没事，但只要未来
+ *    任意一处改了逻辑，另一处就会出现隐蔽的业务异常（犯C5）。统一搬到
+ *    这里，06/20/21/22 的同名声明全部删除，调用方不用改任何调用代码
+ *    （函数名没变，只是声明的物理位置变了，GAS 全局作用域下完全透明）。
+ *
+ * 本次修改（2026-06-29，ActiveTasks/ArchiveTasks 落地新增）：
+ * 新增 deleteRowByKey_()：ActiveTasks 是"只放未完成任务"的工作台表，
+ * 任务一旦 DONE/CANCELLED 就要把整行从这张表物理删除（不是覆写状态）。
+ * upsertRowByKey_ 只会"找到就覆写/找不到就append"，没有删除语义，
+ * 所以单独加一个按主键删行的函数，跟 upsertRowByKey_ 配对使用。
+ */
+
+function getSheet_(sheetName) {
+  // 2026-07-03 拆分说明：Productivity OS 是独立（standalone）脚本，没有
+  // "容器"，不能用 getActiveSpreadsheet()。改用 openById 显式打开跟
+  // Personal AI Core 共享的同一张 Spreadsheet（Script Properties 里的
+  // SPREADSHEET_ID 要设成跟 Core 一样的值）。
+  var id = SecureConfig.getKey('SPREADSHEET_ID');
+  if (!id) {
+    throw new Error('缺少 SPREADSHEET_ID（Script Properties）。去 Personal AI Core 那张 ' +
+      'Spreadsheet 的 URL 复制 ID，然后 SecureConfig.setKey("SPREADSHEET_ID", "你复制的ID")。');
+  }
+  var sheet = SpreadsheetApp.openById(id).getSheetByName(sheetName);
+  if (!sheet) {
+    throw new Error('Sheet not found: ' + sheetName + ' — 请确认分页名是否一致');
+  }
+  return sheet;
+}
+
+/**
+ * 读取表头行，返回 { headerName: 0基索引 }
+ */
+function getHeaderMap_(sheet) {
+  var lastCol = sheet.getLastColumn();
+  if (lastCol === 0) {
+    return {}; // bugfix：完全空白的表(没有任何内容)，getRange(1,1,1,0)会直接抛错，这里提前返回空表头
+  }
+  var headerRow = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  var map = {};
+  headerRow.forEach(function (name, idx) {
+    if (name) map[String(name).trim()] = idx;
+  });
+  return map;
+}
+
+/**
+ * 按 keyHeader 列的值查找/更新一行；找不到就新增一行（append）。
+ * rowDataObj 里只需要给出要写的字段，没给的字段（已存在的行）保持原值不变。
+ *
+ * 适用场景：单行更新（如 completeTask/cancelTask 的安全兜底、ProjectionEngine
+ * 的逐事件 O(1) dispatch）。批量重建场景（N 个对象一次性写回）请用下面的
+ * batchUpsertRowsByKey_，否则会循环里逐行 I/O，大表会超时（见 HIGH RISK 2）。
+ *
+ * @param {string} sheetName
+ * @param {string} keyHeader     用来定位行的列名，比如 'task_id'
+ * @param {string} keyValue      要找的值
+ * @param {object} rowDataObj    { 列名: 值, ... }
+ */
+function upsertRowByKey_(sheetName, keyHeader, keyValue, rowDataObj) {
+  var sheet = getSheet_(sheetName);
+  var headerMap = getHeaderMap_(sheet);
+  var numCols = sheet.getLastColumn();
+
+  if (!(keyHeader in headerMap)) {
+    throw new Error('找不到列: ' + keyHeader + '，请确认 ' + sheetName + ' 表头里有这一列');
+  }
+
+  var keyColIndex = headerMap[keyHeader];
+  var lastRow = sheet.getLastRow();
+  var foundRow = -1;
+
+  if (lastRow >= 2) {
+    var keyValues = sheet.getRange(2, keyColIndex + 1, lastRow - 1, 1).getValues();
+    for (var i = 0; i < keyValues.length; i++) {
+      if (String(keyValues[i][0]) === String(keyValue)) {
+        foundRow = i + 2; // +2: 跳过表头 + 0基转1基
+        break;
+      }
+    }
+  }
+
+  var rowArray;
+  if (foundRow > 0) {
+    rowArray = sheet.getRange(foundRow, 1, 1, numCols).getValues()[0];
+  } else {
+    rowArray = new Array(numCols).fill('');
+  }
+
+  for (var key in rowDataObj) {
+    if (headerMap.hasOwnProperty(key)) {
+      var val = rowDataObj[key];
+      rowArray[headerMap[key]] = (val === null || val === undefined) ? '' : val;
+    }
+  }
+
+  if (foundRow > 0) {
+    sheet.getRange(foundRow, 1, 1, numCols).setValues([rowArray]);
+  } else {
+    sheet.appendRow(rowArray);
+  }
+}
+
+/**
+ * 按 keyHeader 列的值删除一行；找不到则静默跳过（不报错，返回false）。
+ *
+ * 2026-06-29新增（ActiveTasks/ArchiveTasks 落地）：ActiveTasks 的定义是
+ * "永远只放未完成任务"，任务一旦 DONE/CANCELLED 就必须把整行物理删掉，
+ * 不是覆写状态——upsertRowByKey_ 没有删除语义，所以加这个配对函数。
+ *
+ * @param {string} sheetName
+ * @param {string} keyHeader
+ * @param {string} keyValue
+ * @returns {boolean}  true=删掉了一行，false=没找到对应行
+ */
+function deleteRowByKey_(sheetName, keyHeader, keyValue) {
+  var sheet = getSheet_(sheetName);
+  var headerMap = getHeaderMap_(sheet);
+  if (!(keyHeader in headerMap)) {
+    throw new Error('找不到列: ' + keyHeader + '，请确认 ' + sheetName + ' 表头里有这一列');
+  }
+
+  var keyColIndex = headerMap[keyHeader];
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return false;
+
+  var keyValues = sheet.getRange(2, keyColIndex + 1, lastRow - 1, 1).getValues();
+  for (var i = 0; i < keyValues.length; i++) {
+    if (String(keyValues[i][0]) === String(keyValue)) {
+      sheet.deleteRow(i + 2); // +2: 跳过表头 + 0基转1基
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * 批量 upsert：一次性读全表 → 内存合并 → 最多两次 setValues() 写回。
+ *
+ * 🐛 bugfix（2026-06-29，外部审计HIGH RISK 2，核实属实后采纳）：
+ * 11_ProjectionRebuilder.gs 之前对 N 个 task/item 循环调 upsertRowByKey_，
+ * 每个对象触发一次"读整表找行号"+一次"写一行"——O(N) 次 Sheet I/O。
+ * 这里改成：先一次性读出全表现有行（1次I/O），在内存数组里原地合并需要
+ * 更新的字段、把全新的对象单独收集起来，最后已存在的行整块覆写一次
+ * （1次I/O），全新的行整块追加一次（1次I/O）。无论 N 多大，物理 Sheet
+ * I/O 调用次数固定在 ≤3 次，不会再随 Events 历史增长而逼近 6 分钟执行超限。
+ *
+ * @param {string} sheetName
+ * @param {string} keyHeader        用来定位行的列名，比如 'task_id'
+ * @param {object[]} rowDataObjArray  每个元素是 { [keyHeader]: value, 其余要写的字段... }
+ *                                    数组内 keyValue 不应重复（重建场景下每个
+ *                                    task_id/item_id 在 stateMap 里本来就只有一份）
+ * @returns {{updated:number, appended:number}}
+ */
+function batchUpsertRowsByKey_(sheetName, keyHeader, rowDataObjArray) {
+  if (!rowDataObjArray || rowDataObjArray.length === 0) {
+    return { updated: 0, appended: 0 };
+  }
+
+  var sheet = getSheet_(sheetName);
+  var headerMap = getHeaderMap_(sheet);
+  var numCols = sheet.getLastColumn();
+
+  if (!(keyHeader in headerMap)) {
+    throw new Error('找不到列: ' + keyHeader + '，请确认 ' + sheetName + ' 表头里有这一列');
+  }
+
+  var keyColIndex = headerMap[keyHeader];
+  var lastRow = sheet.getLastRow();
+
+  // 一次性读出全部现有数据行（没有数据行时为空数组）
+  var existingRows = (lastRow >= 2)
+    ? sheet.getRange(2, 1, lastRow - 1, numCols).getValues()
+    : [];
+
+  // 建 keyValue → existingRows 下标 的映射，一次扫描，避免每个对象都重新线性查找
+  var indexByKey = {};
+  for (var i = 0; i < existingRows.length; i++) {
+    var existingKey = existingRows[i][keyColIndex];
+    if (existingKey !== '' && existingKey !== null && existingKey !== undefined) {
+      indexByKey[String(existingKey)] = i;
+    }
+  }
+
+  var appendedRows = [];
+  var updated = 0;
+  var appended = 0;
+
+  rowDataObjArray.forEach(function (rowDataObj) {
+    var keyValue = rowDataObj[keyHeader];
+    if (keyValue === undefined || keyValue === null || keyValue === '') return; // 没有主键值，跳过
+
+    var idx = indexByKey[String(keyValue)];
+    if (idx !== undefined) {
+      // 已存在 → 在内存里原地合并字段（不立即写 Sheet）
+      for (var k1 in rowDataObj) {
+        if (headerMap.hasOwnProperty(k1)) {
+          var v1 = rowDataObj[k1];
+          existingRows[idx][headerMap[k1]] = (v1 === null || v1 === undefined) ? '' : v1;
+        }
+      }
+      updated++;
+    } else {
+      // 不存在 → 组一行新数组，先收集，最后一次性 append
+      var newRow = new Array(numCols).fill('');
+      for (var k2 in rowDataObj) {
+        if (headerMap.hasOwnProperty(k2)) {
+          var v2 = rowDataObj[k2];
+          newRow[headerMap[k2]] = (v2 === null || v2 === undefined) ? '' : v2;
+        }
+      }
+      appendedRows.push(newRow);
+      // 防止同一批次里出现两个相同 keyValue 时都走 append（重建场景下 stateMap
+      // 本身按 id 去重，这里只是防御性补一条索引，避免理论上的重复 append）
+      indexByKey[String(keyValue)] = -1; // -1 表示"本批次已处理，不是合法行下标"
+      appended++;
+    }
+  });
+
+  if (existingRows.length > 0) {
+    sheet.getRange(2, 1, existingRows.length, numCols).setValues(existingRows);
+  }
+  if (appendedRows.length > 0) {
+    sheet.getRange(lastRow + 1, 1, appendedRows.length, numCols).setValues(appendedRows);
+  }
+
+  return { updated: updated, appended: appended };
+}
+
+// ============ 共用：过期判断 ============
+// 原本在92_ReminderEngine.gs里，21_InventoryModule.gs跨文件直接调用它的
+// 私有函数（_parseDueDate_），93_MemoryEngine.gs又自己重复实现了一份一样
+// 的逻辑——现在统一成这一份，92/21/93都改成调这里的。
+
+/**
+ * 判断 due_date 是否已经过期。只处理日期类，里程类('40000km'这种)先跳过
+ * （依赖 RiderConnector 的当前里程数据，暂时无法判断）。
+ * @param {string} dueDateRaw  原始 due_date 字符串
+ */
+function isOverdue_(dueDateRaw) {
+  if (!dueDateRaw) return false;
+  var raw = String(dueDateRaw).trim();
+
+  if (/km$/i.test(raw)) {
+    return false;
+  }
+
+  var due = parseDueDate_(raw);
+  if (!due || isNaN(due.getTime())) return false;
+  return due.getTime() < Date.now();
+}
+
+/**
+ * 🐛 bugfix（原在92_ReminderEngine.gs）：纯日期字符串（'2026-06-22'，
+ * 没有时间部分）用 new Date() 解析时，JS 会按 UTC 处理，不是本地时区！
+ * 对 UTC+8 来说，这会让"到期"判断整体偏移8小时。这里改成纯日期字符串
+ * 手动按本地时区午夜算，带时间的字符串则正常解析（ES2015+规范：带T
+ * 无offset的日期时间字符串按本地时区解析，只有纯日期才按UTC，2026-06-25
+ * 外部审计MEDIUM RISK 2复核确认过，详见92_ReminderEngine.gs历史记录）。
+ */
+function parseDueDate_(raw) {
+  var dateOnlyMatch = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (dateOnlyMatch) {
+    return new Date(Number(dateOnlyMatch[1]), Number(dateOnlyMatch[2]) - 1, Number(dateOnlyMatch[3]));
+  }
+  return new Date(raw);
+}
+
+// ============ 共用：数值四舍五入 ============
+// 原本散落在93_MemoryEngine.gs，94/95跨文件隐式调用——统一成这一份。
+
+function round1_(n) {
+  return Math.round(n * 10) / 10;
+}
+
+function round2_(n) {
+  return Math.round(n * 100) / 100;
+}
+
+// ============ 共用：浅拷贝 ============
+// 2026-06-29新增（外部审计MEDIUM RISK 1关联项）：原本20_ProductivityModule.gs
+// 全局声明了一份shallowCopy_，21_InventoryModule.gs又用shallowCopyInv_这个
+// 不同名字重复实现了一份完全相同的逻辑。10_ProjectionEngine.gs里也有一份，
+// 但那份是包在IIFE里的私有函数，不会跟全局声明冲突，不动。
+
+function shallowCopy_(obj) {
+  var copy = {};
+  for (var k in obj) copy[k] = obj[k];
+  return copy;
+}
+
+// ============ 共用：标题/名称清洗 ============
+// 2026-06-29新增（外部审计MEDIUM RISK 1，核实属实后采纳）：原本
+// 06_TaskIntentParser.gs 和 22_InventoryIntentParser.gs 各自全局声明了
+// 一份完全相同的 _cleanTitle_。GAS按文件名字母序加载，后加载的文件（22）
+// 会静默覆盖先加载的文件（06）的同名声明——目前两份代码完全一致所以没有
+// 实际影响，但只要未来任意一处的清洗规则单独改了（比如06想支持更多标点），
+// 另一处会在不知不觉中被换成不一样的逻辑，犯C5（重复实现要合并）。
+
+function _cleanTitle_(text) {
+  return String(text || '')
+    .replace(/^[，,：:\s的、]+|[，,：:\s的、]+$/g, '')
+    .trim();
+}
