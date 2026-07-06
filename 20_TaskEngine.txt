@@ -1,10 +1,29 @@
 /**
  * 20_TaskEngine.gs
- * Productivity OS v4.0 — Task Engine（create / update / complete / cancel）
+ * Productivity OS v4.2 — Task Engine（create / update / complete / cancel）
  *
- * 【V4 改名+重构】原 20_ProductivityModule.gs。改动：
+ * 【V4.2 审计修复】（2026-07-06 第二轮外部审计，完整记录见
+ * 00_Project_State.gs"已知Bug"）：
  *
- * 1. 【修复 LOW RISK 2】整个模块包进 IIFE。原来的裸全局函数
+ *  - HIGH RISK 2 修复：updateTask 修改 title/due_date/category/priority/
+ *    recurring 任一字段时，重新计算 identity 并写回，避免去重系统认旧值。
+ *  - HIGH RISK 3 修复：completeTask/cancelTask/updateTask 不再无条件调用
+ *    materializeTaskRow_ 安全兜底——EventBus.publish() 内部已经同步调用
+ *    ProjectionEngine.dispatch() 并在失败时返回 event.projection_ok=false，
+ *    只有这个标志为 false（真的失败了）才触发一次额外写入，正常路径下
+ *    每次操作只有 Projection 那一次 Sheet I/O，不再有"写两遍"的冗余。
+ *  - MEDIUM RISK 1 修复：completeTask/cancelTask 在发布事件前先校验任务
+ *    存在，任务不存在（taskId 打错/已删）时直接拦截返回，不再产生
+ *    title/chat_id 全为空的"幽灵任务行"。
+ *  - LOW RISK 1 修复：删除文件尾部裸全局变量声明
+ *    （TASKS_SHEET_NAME/TASK_CATEGORIES/TASK_PRIORITIES/TASK_RECURRING），
+ *    全部改成读 ProductivityConfig.xxx。这几个名字足够通用，一旦 Core
+ *    主项目或其他 Library 恰好用了同名全局变量会被静默覆盖，风险面比
+ *    "少打几个字"划算不来。
+ *
+ * 【V4 改名+重构】原 20_ProductivityModule.gs：
+ *
+ * 1. 【修复 LOW RISK 2（V4初版审计）】整个模块包进 IIFE。原来的裸全局函数
  *    _createTaskDirect_ 变成 TaskEngine.createTaskDirect_（保留下划线
  *    后缀标注"内部函数，设计上只允许 09_IdempotencyManager 调用"的语义，
  *    但物理上不再是可以被任何文件意外碰到的裸全局）。
@@ -36,27 +55,18 @@ var ProductivityConfig = Object.freeze({
   TASKS_SHEET_NAME: 'Tasks',
   TASK_CATEGORIES:  ['MAINTENANCE', 'SHOPPING', 'ADMIN', 'HEALTH', 'GENERAL', 'PROJECT'],
   TASK_PRIORITIES:  ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'],
-  TASK_RECURRING:   ['', 'Daily', 'Weekly', 'Monthly', 'Yearly']
+  TASK_RECURRING:   ['', 'Daily', 'Weekly', 'Monthly', 'Yearly'],
+  // HIGH RISK 2 修复用：这几个字段任一变化都会让 IdentityEngine 算出不同
+  // 的 identity 哈希，updateTask 改到其中任一个都必须重新计算 identity。
+  IDENTITY_AFFECTING_FIELDS: ['title', 'due_date', 'recurring', 'priority', 'category']
 });
-
-// 向后兼容别名（指向同一个数组引用，不是拷贝）—— 现有调用代码不用改
-var TASKS_SHEET_NAME = ProductivityConfig.TASKS_SHEET_NAME;
-var TASK_CATEGORIES  = ProductivityConfig.TASK_CATEGORIES;
-var TASK_PRIORITIES  = ProductivityConfig.TASK_PRIORITIES;
-var TASK_RECURRING   = ProductivityConfig.TASK_RECURRING;
 
 var TaskEngine = (function () {
 
+  var CFG = ProductivityConfig; // 内部简写，不额外暴露成新的裸全局
+
   // ============ Create ============
 
-  /**
-   * 创建任务 —— 幂等路由层（内部经 09_IdempotencyManager，已有 ScriptLock）。
-   * @param {string} title
-   * @param {object} meta  { category, priority, due_date, recurring, context,
-   *                         budget, notes, description, tags }
-   * @param {string} chatId
-   * @returns {object} task 对象（新建或已有）
-   */
   function createTask(title, meta, chatId) {
     var result = IdempotencyManager.createTaskIfNotExists(title, meta || {}, chatId);
     return result.task;
@@ -66,19 +76,13 @@ var TaskEngine = (function () {
    * 实际创建函数 —— 只由 09_IdempotencyManager.createTaskIfNotExists() 调用
    * （已在锁内）。外部代码一律调 createTask()；禁止绕过 IdempotencyManager
    * 直接调本函数。
-   *
-   * @param {string} title
-   * @param {object} meta
-   * @param {string} chatId
-   * @param {string} identity
-   * @returns {object} task
    */
   function createTaskDirect_(title, meta, chatId, identity) {
     meta = meta || {};
 
-    var category  = TASK_CATEGORIES.indexOf(meta.category) !== -1 ? meta.category : 'GENERAL';
-    var priority   = TASK_PRIORITIES.indexOf(meta.priority) !== -1 ? meta.priority : 'MEDIUM';
-    var recurring  = TASK_RECURRING.indexOf(meta.recurring) !== -1 ? meta.recurring : '';
+    var category  = CFG.TASK_CATEGORIES.indexOf(meta.category) !== -1 ? meta.category : 'GENERAL';
+    var priority   = CFG.TASK_PRIORITIES.indexOf(meta.priority) !== -1 ? meta.priority : 'MEDIUM';
+    var recurring  = CFG.TASK_RECURRING.indexOf(meta.recurring) !== -1 ? meta.recurring : '';
 
     var task = {
       task_id:        generateTaskId_(),
@@ -93,8 +97,8 @@ var TaskEngine = (function () {
       context:        meta.context      || '',
       budget:         (meta.budget != null) ? meta.budget : '',
       notes:          meta.notes        || '',
-      description:    meta.description  || '', // V4新增列
-      tags:           meta.tags          || '', // V4新增列，逗号分隔字符串
+      description:    meta.description  || '',
+      tags:           meta.tags          || '',
       chat_id:        chatId             || '',
       completed_at:   '',
       reminder_count: 0,
@@ -102,34 +106,36 @@ var TaskEngine = (function () {
     };
 
     // EventBus.publish() 会自动调 ProjectionEngine.dispatch() 写
-    // Tasks + ActiveTasks + TaskFilters
+    // Tasks + ActiveTasks + TaskFilters。创建路径本来就没有额外的安全兜底
+    // 写入（只有 update/complete/cancel 曾经有，且已在 V4.2 改成"仅失败时"）。
     EventBus.publish('TASK_CREATED', task, chatId, 'TaskEngine', identity);
 
     return task;
   }
 
-  // ============ Update（V4新增） ============
+  // ============ Update（V4新增，V4.2 修复 identity 未重算） ============
 
   /**
    * 更新任务的可编辑字段。
    *
-   * 设计取舍：Update 不经过 IdempotencyManager/DeduplicationEngine——那两个
-   * 模块解决的是"这个业务对象是否已经存在"，Update 操作的前提是任务已经
-   * 存在（用 task_id 精确定位），跟"是否重复创建"是两个不同的问题，不需要
-   * identity 判重那一套。
+   * 允许更新的字段白名单：title, category, priority, due_date, recurring,
+   * context, budget, notes, description, tags（不允许改 task_id/chat_id/
+   * status/completed_at/identity——identity 是本函数内部按需自动重算的
+   * 派生值，不接受外部直接传入覆盖）。
    *
-   * 允许更新的字段白皮书（其余字段传入会被忽略，不允许通过 update 改
-   * task_id/chat_id/status/completed_at/identity 这些由生命周期事件专门
-   * 管理的字段——状态变更走 completeTask/cancelTask，不走 updateTask）：
-   *   title, category, priority, due_date, recurring, context, budget,
-   *   notes, description, tags
+   * 【HIGH RISK 2 修复】DeduplicationEngine.findExistingTask 完全依赖
+   * identity 列。title/due_date/category/priority/recurring 任一个变了，
+   * IdentityEngine 算出来的哈希就会不同——之前 updateTask 改了这些字段但
+   * 没有同步重算 identity，导致 Sheet 里留着旧哈希：旧属性的新任务会被
+   * 误判"已存在"而拦截，新属性的重复任务却因为哈希对不上而漏判重复。
+   * 现在只要 payload 命中 CFG.IDENTITY_AFFECTING_FIELDS 里任一个，就用
+   * "已有字段 + 本次改动"合并后的完整值重新算一次 identity，一并写进
+   * payload（TASK_UPDATED 事件 + Sheet）。
    *
    * @param {string} taskId
-   * @param {object} changes  上面白名单里的任意子集
+   * @param {object} changes
    * @param {string} chatId
-   * @returns {object|null}  更新后的字段集合（不是完整task，完整task请用
-   *                          TaskQueryEngine.getTask 重新查询），任务不存在
-   *                          时返回 null
+   * @returns {object|null}
    */
   var UPDATABLE_FIELDS = ['title', 'category', 'priority', 'due_date', 'recurring',
                            'context', 'budget', 'notes', 'description', 'tags'];
@@ -137,34 +143,54 @@ var TaskEngine = (function () {
   function updateTask(taskId, changes, chatId) {
     var existing = TaskQueryEngine.getTask(taskId, chatId);
     if (!existing) {
-      Logger.log('[TaskEngine] updateTask: 找不到任务 ' + taskId);
+      Logger.log('[TaskEngine] updateTask: 找不到任务 ' + taskId + '，拦截（防止产生幽灵行）');
       return null;
     }
 
+    changes = changes || {};
     var payload = { task_id: taskId };
     UPDATABLE_FIELDS.forEach(function (f) {
       if (changes.hasOwnProperty(f)) {
         var v = changes[f];
-        // category/priority/recurring 沿用 create 时的校验白名单，脏值不落盘
-        if (f === 'category' && TASK_CATEGORIES.indexOf(v) === -1) return;
-        if (f === 'priority' && TASK_PRIORITIES.indexOf(v) === -1) return;
-        if (f === 'recurring' && TASK_RECURRING.indexOf(v) === -1) return;
+        if (f === 'category'  && CFG.TASK_CATEGORIES.indexOf(v) === -1) return;
+        if (f === 'priority'  && CFG.TASK_PRIORITIES.indexOf(v) === -1) return;
+        if (f === 'recurring' && CFG.TASK_RECURRING.indexOf(v) === -1) return;
         payload[f] = v;
       }
     });
 
     if (Object.keys(payload).length === 1) {
-      // 只有 task_id，没有任何合法字段被改——不发空事件
-      return null;
+      return null; // 只有 task_id，没有任何合法字段被改——不发空事件
     }
 
-    EventBus.publish('TASK_UPDATED', payload, chatId || existing.chat_id, 'TaskEngine');
-
-    // 安全兜底：ProjectionEngine 失败时确保 Tasks/ActiveTasks/TaskFilters
-    // 仍被更新（跟 completeTask/cancelTask 的兜底同一套模式）
+    // 合并"已有字段 + 本次改动"，供下面 identity 重算和失败兜底共用，
+    // 避免同一份数据算两次。
     var merged = shallowCopy_(existing);
     for (var k in payload) merged[k] = payload[k];
-    materializeTaskRow_(taskId, merged);
+
+    var identityFieldChanged = CFG.IDENTITY_AFFECTING_FIELDS.some(function (f) {
+      return payload.hasOwnProperty(f);
+    });
+    if (identityFieldChanged) {
+      var newIdentity = IdentityEngine.generateTaskIdentity(
+        merged.chat_id || chatId || existing.chat_id,
+        merged.title,
+        merged.due_date  || '',
+        merged.recurring || '',
+        merged.priority  || 'MEDIUM',
+        merged.category  || 'GENERAL'
+      );
+      payload.identity = newIdentity;
+      merged.identity   = newIdentity;
+    }
+
+    var event = EventBus.publish('TASK_UPDATED', payload, chatId || existing.chat_id, 'TaskEngine');
+
+    // 【HIGH RISK 3 修复】只有 Projection 真的失败了才做安全兜底写入
+    // （event.projection_ok 由 02_EventBus.gs 在 dispatch 失败时置 false）。
+    if (event && event.projection_ok === false) {
+      materializeTaskRow_(taskId, merged);
+    }
 
     return payload;
   }
@@ -174,45 +200,56 @@ var TaskEngine = (function () {
   /**
    * 标记任务完成。
    *
-   * recurring 续期（如果该任务是recurring的）委托给 21_RecurringEngine.gs
-   * 的 spawnNextIfNeeded——TaskEngine 只管"完成这一次"的事实写入。
+   * 【MEDIUM RISK 1 修复】先用 TaskQueryEngine.getTask 校验任务存在；
+   * 找不到直接拦截返回，不发布事件——避免 materializeTaskRow_ 在 Tasks
+   * 表追加一行除 status/completed_at 外全为空的"幽灵行"。
    *
-   * @returns {{next_task: (object|null)}}  next_task非recurring或生成失败时为null
+   * @returns {{next_task: (object|null), not_found: (boolean|undefined)}}
    */
   function completeTask(taskId, chatId) {
-    var taskBeforeComplete = TaskQueryEngine.getTask(taskId, chatId); // 完成前先取快照
+    var taskBeforeComplete = TaskQueryEngine.getTask(taskId, chatId);
+    if (!taskBeforeComplete) {
+      Logger.log('[TaskEngine] completeTask: 找不到任务 ' + taskId + '，拦截（防止产生幽灵行）');
+      return { next_task: null, not_found: true };
+    }
 
-    EventBus.publish('TASK_COMPLETED', { task_id: taskId }, chatId, 'TaskEngine');
-    // 安全兜底：ProjectionEngine 失败时确保 Tasks（以及 ActiveTasks）仍被更新
-    materializeTaskRow_(taskId, { status: 'DONE', completed_at: new Date().toISOString() });
+    var event = EventBus.publish('TASK_COMPLETED', { task_id: taskId }, chatId, 'TaskEngine');
+
+    // 【HIGH RISK 3 修复】只有 Projection 真的失败才兜底写一次
+    if (event && event.projection_ok === false) {
+      materializeTaskRow_(taskId, { status: 'DONE', completed_at: event.timestamp });
+    }
 
     var nextTask = RecurringEngine.spawnNextIfNeeded(taskBeforeComplete, chatId);
     return { next_task: nextTask };
   }
 
   /**
-   * 取消任务
+   * 取消任务。【MEDIUM RISK 1 修复】同 completeTask，先校验任务存在。
+   * @returns {{not_found: (boolean|undefined)}}
    */
   function cancelTask(taskId, chatId) {
-    EventBus.publish('TASK_CANCELLED', { task_id: taskId }, chatId, 'TaskEngine');
-    materializeTaskRow_(taskId, { status: 'CANCELLED' });
+    var existing = TaskQueryEngine.getTask(taskId, chatId);
+    if (!existing) {
+      Logger.log('[TaskEngine] cancelTask: 找不到任务 ' + taskId + '，拦截（防止产生幽灵行）');
+      return { not_found: true };
+    }
+
+    var event = EventBus.publish('TASK_CANCELLED', { task_id: taskId }, chatId, 'TaskEngine');
+
+    if (event && event.projection_ok === false) {
+      materializeTaskRow_(taskId, { status: 'CANCELLED' });
+    }
+
+    return {};
   }
 
-  /**
-   * 获取 PENDING 任务列表——向后兼容 wrapper，V4 起新代码请直接用
-   * TaskQueryEngine.getTasks(chatId, {status:'PENDING'})。
-   * @param {string} [chatId]
-   * @returns {object[]}
-   */
   function getPendingTasks(chatId) {
     return TaskQueryEngine.getTasks(chatId, { status: 'PENDING' });
   }
 
   // ============ 派生引擎（保留供 11_ProjectionRebuilder 使用） ============
 
-  /**
-   * 纯函数 reducer：给定当前状态 map 和一个事件，返回更新后的状态 map。
-   */
   function deriveFromEvent(event, stateMap) {
     stateMap = stateMap || {};
     var p = event.payload || {};
@@ -223,7 +260,7 @@ var TaskEngine = (function () {
         if (!stateMap[p.task_id].chat_id) stateMap[p.task_id].chat_id = event.chat_id;
         break;
 
-      case 'TASK_UPDATED': // V4新增
+      case 'TASK_UPDATED':
         if (stateMap[p.task_id]) {
           for (var k in p) {
             if (k !== 'task_id') stateMap[p.task_id][k] = p[k];
@@ -255,10 +292,6 @@ var TaskEngine = (function () {
     return stateMap;
   }
 
-  /**
-   * 全量重放 Events → Task state map。
-   * 正常路径不调用此函数；只供 11_ProjectionRebuilder 和调试使用。
-   */
   function deriveTaskState_() {
     var events = EventBus.getAllEvents();
     var state = {};
@@ -271,15 +304,10 @@ var TaskEngine = (function () {
   // ============ 派生视图维护（Read Model 辅助） ============
 
   /**
-   * 把某个 task 当前算出来的状态覆写回 Tasks Sheet 对应行。
-   * 降级路径：(a) updateTask/completeTask/cancelTask 的安全兜底
-   * （ProjectionEngine 失败时）(b) rebuildTasksSheet_()（手动全量重建快捷函数）
-   *
-   * 写完 Tasks 后，如果最终 status 是 DONE/CANCELLED，顺手清掉 ActiveTasks
-   * 里可能残留的那一行。
-   *
-   * @param {string} taskId
-   * @param {object} [knownTask]  已知的字段 partial object 或完整 task 对象
+   * 【V4.2 起调用时机收紧】仅在以下场景调用：
+   *   (a) updateTask/completeTask/cancelTask 检测到 event.projection_ok===false
+   *       时的失败兜底
+   *   (b) rebuildTasksSheet_()（手动全量重建快捷函数）
    */
   function materializeTaskRow_(taskId, knownTask) {
     var task = knownTask;
@@ -288,7 +316,7 @@ var TaskEngine = (function () {
     }
     if (!task) return;
 
-    upsertRowByKey_(TASKS_SHEET_NAME, 'task_id', taskId, task);
+    upsertRowByKey_(CFG.TASKS_SHEET_NAME, 'task_id', taskId, task);
 
     var finalStatus = String(task.status || '').toUpperCase();
     if (finalStatus === 'DONE' || finalStatus === 'CANCELLED') {
@@ -306,9 +334,6 @@ var TaskEngine = (function () {
     }
   }
 
-  /**
-   * 全量重建 Tasks Sheet（快捷别名，委托给 ProjectionRebuilder）。
-   */
   function rebuildTasksSheet_() {
     rebuildTasksProjection(); // 11_ProjectionRebuilder.gs
   }
@@ -324,7 +349,7 @@ var TaskEngine = (function () {
 
   return {
     createTask:         createTask,
-    createTaskDirect_:  createTaskDirect_, // 仅供 09_IdempotencyManager 调用
+    createTaskDirect_:  createTaskDirect_,
     updateTask:         updateTask,
     completeTask:        completeTask,
     cancelTask:          cancelTask,
@@ -337,6 +362,15 @@ var TaskEngine = (function () {
 })();
 
 // ============ 向后兼容全局 wrapper（Core 项目 04_Main.gs 既有调用不用改） ============
+//
+// 【LOW RISK 1 修复】V4 初版这里还留过 TASKS_SHEET_NAME/TASK_CATEGORIES/
+// TASK_PRIORITIES/TASK_RECURRING 四个裸全局变量别名，本次审计发现这类
+// 通用名字在 GAS 扁平全局命名空间下有被 Core 主项目或其他 Library 同名
+// 变量静默覆盖的风险（且排查这种"值不对但是没有任何报错"的问题极难定位）。
+// 经检查，本项目内除 20_TaskEngine.gs 自己以外没有任何文件引用这四个裸
+// 全局名字，直接删除，全部改用 ProductivityConfig.xxx。函数级别的向后
+// 兼容 wrapper（下面这几个）风险性质不同——它们是具名的、语义明确的函数，
+// 不是容易被误撞的短名词，继续保留。
 
 function createTask(title, meta, chatId) {
   return TaskEngine.createTask(title, meta, chatId);
