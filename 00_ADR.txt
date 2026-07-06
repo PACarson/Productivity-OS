@@ -1,0 +1,222 @@
+/**
+ * 00_ADR.gs
+ * Productivity OS v4.3 — Architecture Decision Records
+ *
+ * 本文件收录本项目"影响后续所有开发判断"的重大架构决策，格式固定为
+ * Metadata（V4.3 新增，见下方字段定义） + Context / Decision /
+ * Consequences 三段式。跟 00_Project_State.gs 的区别：State 是会被覆盖的
+ * "当前快照"，ADR 是不会被覆盖的"决策历史"——一旦某条 ADR 被后续 ADR
+ * 取代，旧的 ADR 保留在这里并标注 Status: Superseded by ADR-xxxx，不删除、
+ * 不改写。
+ *
+ * 本文件对应 Universal Domain OS Blueprint「0. Governance → ADR (Optional)」
+ * 这一格（00_Project_Constitution.gs P4 之前原本写"暂无"，V4.1 起改为
+ * 指向本文件）。
+ *
+ * 【V4.3 变更】
+ *   1. 所有 ADR 统一补充 Metadata 区块（字段：ADR Number/Status/
+ *      Decision Date/Supersedes/Superseded By/Affected Modules/
+ *      Related ADR/Consequences/Notes）。ADR-2026-07-06 的原有 Context/
+ *      Decision/Consequences 正文内容保持不动，只在最前面加了这个区块。
+ *   2. 新增 ADR-2026-07-06-002（Schema Authority）。
+ */
+
+// ============================================================
+// ADR-2026-07-06：Dashboard 不是 Projection，是 Read Composition
+// ============================================================
+
+/**
+ * ── Metadata（V4.3 补充）──────────────────────────────────────────────────
+ *   ADR Number      : ADR-2026-07-06
+ *   Status          : Accepted
+ *   Decision Date   : 2026-07-06
+ *   Supersedes      : （无，本项目第一条 ADR）
+ *   Superseded By   : （无，仍然生效）
+ *   Affected Modules: 12_TaskQueryEngine.gs, 24_ViewEngine.gs,
+ *                     25_DashboardEngine.gs, 15_Setup.gs（不建 Dashboard
+ *                     Sheet，故 setupSheets() 不含这张表）
+ *   Related ADR     : ADR-2026-07-06-002（Schema Authority——两者都在
+ *                     回答"这类数据该不该有自己的物理表"这个同一大类问题，
+ *                     但结论方向相反：Dashboard 明确不建表，Schema 明确
+ *                     "当前用一个文件承载即可，不需要现在拆表/拆文件"）
+ *   Consequences    : 见下方 Consequences 正文（V4.1 原文，未改动）
+ *   Notes           : 本 ADR 首次提出 Write Model → Projection → Query
+ *                     Layer → View Layer 四层模型，后续 00_Roadmap.gs 和
+ *                     00_Project_Constitution.gs 的 Architecture Principles
+ *                     第6条（Views Never Persist）均以本 ADR 为权威依据，
+ *                     修改本 ADR 前请一并检查这两处是否需要同步更新。
+ *
+ * Status: Accepted
+ *
+ * ── Context ──────────────────────────────────────────────────────────────
+ *
+ * V4 原始设计草案（升级需求文档 Projection Design 小节）把 Dashboard 列在
+ * 跟 TaskStatistics/TaskFilters 同一条投影链上：
+ *
+ *   Events → Tasks → TaskStatistics → TaskFilters → Dashboard
+ *
+ * 隐含的意思是 Dashboard 也应该是一张物理 Projection Sheet，跟 Tasks/
+ * ActiveTasks 一样由 Event 增量维护。V4 落地时发现这个类比不成立：
+ * Tasks/ActiveTasks/TaskStatistics/TaskFilters 的共同特点是"可以完全由
+ * Event 历史推导，不依赖查询发生的那一刻"——
+ *
+ *   TASK_CREATED   → Tasks（新增一行）
+ *   TASK_COMPLETED → TaskStatistics（done_count+1）
+ *   TASK_CANCELLED → ArchiveTasks（最终会被归档）
+ *
+ * 而 Dashboard 里 Today / Overdue / This Week / Upcoming 这几个板块的内容
+ * 取决于"现在几点"，不取决于 Events 本身。同一组 Events、同一份 Tasks
+ * 数据，在 2026-07-06 23:58 查和 2026-07-07 00:00 查，"今天"指的是完全
+ * 不同的日期——Events 没变、Tasks 没变，Dashboard 自己变了。这跟
+ * Projection 的定义（"给定同一份 Event 历史，任何时刻重放结果都相同"）
+ * 是矛盾的，Dashboard 不满足 Projection 的这个基本性质。
+ *
+ * 持久化一张 Dashboard Sheet 需要每天定时 delete+rebuild+rewrite（或者
+ * 每次查询前重算覆写），换来的不是一致性或性能收益——反而多一张要跟着
+ * 每次 Schema 变更走迁移流程的表，且这张表永远只是"别的 Read Model 在
+ * 某一刻的组合视图"，本身不携带任何独立信息。
+ *
+ * ── Decision ──────────────────────────────────────────────────────────────
+ *
+ * 本项目的数据流分四层，Dashboard 属于第四层，不属于第二层：
+ *
+ *   1. Write Model（唯一真相，只追加）
+ *        Events
+ *
+ *   2. Projection Layer（可被 Event 历史完全推导，增量维护，物理落盘）
+ *        Tasks / ActiveTasks / ArchiveTasks / TaskStatistics / TaskFilters
+ *        （未来如需要：TaskPriority 缓存表，见下方 Consequences）
+ *
+ *   3. Query Layer（对外唯一查询入口，只读第2层，不重放 Events）
+ *        12_TaskQueryEngine.gs
+ *
+ *   4. View / Presentation Layer（依赖"查询发生的那一刻"，永不落盘）
+ *        24_ViewEngine.gs（今天/本周/逾期... 等逻辑视图）
+ *        25_DashboardEngine.gs（把多个逻辑视图 + 统计数字组合成最终展示文案）
+ *
+ * 正式条款（沿用需求方原始措辞，具有约束力，后续任何 PR 违反以下任一条
+ * 视为架构违规）：
+ *
+ *   - Dashboard SHALL be generated on demand（禁止预先算好存起来）。
+ *   - Dashboard SHALL compose existing Read Models（只能读第2层已经落盘的
+ *     投影表，通过 12_TaskQueryEngine 读，不允许自己开 Sheet 连接）。
+ *   - Dashboard SHALL never replay Events（不允许调用 EventBus.getAllEvents
+ *     或任何 deriveXxxState_ 函数）。
+ *   - Dashboard SHALL never become a persistent Sheet（不建物理 Dashboard
+ *     表，现在不建，以后除非有新的 ADR 明确推翻本条，否则不建）。
+ *   - Dashboard belongs to the Presentation Layer, not the Projection Layer
+ *     （00_File_Map.gs 的模块关系图、00_Project_Constitution.gs 的 Blueprint
+ *     映射表，均以本条为准）。
+ *
+ * 引擎职责进一步拆清楚（V4.1 明确化，V4 初版实现已经基本符合，本次只是
+ * 把"为什么这样分"写成正式条款，避免以后不小心把职责混回去）：
+ *
+ *   12_TaskQueryEngine  → 只做"取数据"：批量读 Read Model 一次，转交给下一层
+ *   24_ViewEngine       → 只做"整理数据"：过滤/排序/分组，产出 Today/Week/
+ *                          Overdue 等逻辑视图，纯函数，不知道"Telegram"是什么
+ *   25_DashboardEngine  → 只做"组合展示"：把多个逻辑视图 + PriorityEngine/
+ *                          AnalyticsEngine 的输出拼成一份完整 Dashboard 文案，
+ *                          纯函数，同样不知道"Telegram"是什么
+ *   06_TaskIntentParser → 只做"面向 Telegram 的呈现"：调用上面三层拿到文案，
+ *                          决定怎么发给用户
+ *
+ *   TaskQueryEngine → ViewEngine → DashboardEngine → (Telegram / 未来的
+ *   Web / App / 语音助手)
+ *
+ *   这条链路里任何一层都不直接依赖"Telegram"这个呈现介质——ViewEngine 和
+ *   DashboardEngine 产出的是纯数据/纯文本，不是 Telegram 消息格式。这意味着
+ *   未来如果本项目被 Web 前端或语音助手复用，可以直接复用 ViewEngine +
+ *   DashboardEngine 这两层，只需要新写一层"呈现"逻辑替换
+ *   06_TaskIntentParser，不需要碰 Query/View/Dashboard 三层的任何代码。
+ *
+ * ── Consequences ──────────────────────────────────────────────────────────
+ *
+ * 正面：
+ *   - 少维护一张表，少一处需要跟着 Schema 变更走迁移流程的地方
+ *   - 不存在"Dashboard Sheet 跟 Tasks 数据不一致"这类 bug 的可能性
+ *     （因为 Dashboard 每次都是现查现算，不可能 stale）
+ *   - Engine 分层职责单一，未来换前端（Web/App/语音）只需要换呈现层
+ *
+ * 需要接受的代价：
+ *   - 每次查询 Dashboard 都要重新扫一遍 Read Model + 现算 ViewEngine/
+ *     AnalyticsEngine——在当前数据量级（个人任务系统，几百到几千行）下
+ *     完全不是问题；如果未来数据量大到需要缓存，应该缓存的是"计算结果"
+ *     本身有没有 Event 驱动的必要性（比如 TaskPriority Score，如果发现
+ *     每次查询都重算很贵，可以加一张 TaskPriority 缓存表，由 TASK_CREATED/
+ *     TASK_UPDATED/REMINDER_SENT 事件增量维护——这属于第2层 Projection，
+ *     不影响本 ADR 关于 Dashboard 本身不落盘的结论），当前版本没有观察到
+ *     这个必要性，列入 00_Project_State.gs"下一步"待将来验证。
+ *
+ * 相关文件：00_Project_Constitution.gs P4/P7（已改为指向本 ADR）、
+ * 00_File_Map.gs（12/24/25 三个 Engine 的依赖关系图已按本 ADR 的分层描述）。
+ */
+
+// ============================================================
+// ADR-2026-07-06-002：Schema Authority
+// ============================================================
+
+/**
+ * ── Metadata ──────────────────────────────────────────────────────────────
+ *   ADR Number      : ADR-2026-07-06-002
+ *   Status          : Accepted
+ *   Decision Date   : 2026-07-06
+ *   Supersedes      : （无）
+ *   Superseded By   : （无，仍然生效）
+ *   Affected Modules: 15_Setup.gs（Schema 唯一权威来源）
+ *   Related ADR     : ADR-2026-07-06（同属"要不要为某类关注点单独建物理
+ *                     实体"这个问题，结论相反，见该 ADR 的 Related ADR 说明）
+ *   Consequences    : 见下方正文
+ *   Notes           : 本 ADR 是纯治理决策，不涉及任何代码改动——15_Setup.gs
+ *                     现在的内容不需要动一行。
+ *
+ * ── Context ──────────────────────────────────────────────────────────────
+ *
+ * 本项目五张 Read Model 表（Tasks/ActiveTasks/ArchiveTasks/TaskStatistics/
+ * TaskFilters）的表头定义（字段名、顺序、类型）目前只存在于一个地方：
+ * 15_Setup.gs 的 setupSheets()（建表用）和 _repairOneSheetHeader_()（修复
+ * 用）里各自维护一份字面量数组。这不是理想状态——同一份"标准表头"字面量
+ * 在文件里出现了两次（setupSheets 一次、repairSheetHeaders 一次），
+ * 如果以后加一个字段，两处都要改，忘改一处就会出现"建表建对了，修复却把
+ * 表头修复成旧版本"这种细微不一致。
+ *
+ * 但现在还没有到"必须拆出一个独立 04_Schema.gs 文件"的程度——本项目的表
+ * 结构变化频率低（V3 到 V4 半年才加了两列 + 两张表），拆出一个新文件只是
+ * 把"两处字面量不一致"换成"15_Setup.gs 和 04_Schema.gs 两个文件不一致"，
+ * 问题的本质（表头定义有没有单一权威来源）并没有被解决，只是徒增一个
+ * 文件、一条新的依赖边（15_Setup.gs → 04_Schema.gs），却没换来任何好处。
+ *
+ * ── Decision ──────────────────────────────────────────────────────────────
+ *
+ * 建立正式规则：Schema Authority（Schema 必须有唯一权威来源），但暂不
+ * 拆分代码：
+ *
+ *   - 目前：15_Setup.gs 是全部五张 Read Model 表 Schema 的唯一权威来源。
+ *   - 15_Setup.gs 内部的 setupSheets() 和 _repairOneSheetHeader_() 各自的
+ *     表头字面量数组，视为同一份权威定义的两份手工同步副本——修改任何一张
+ *     表的字段时，两处必须同时改，这是本 ADR 明确要求的纪律，不是建议。
+ *   - 未来触发拆分的条件（满足任一条即应该拆出独立的 04_Schema.gs，
+ *     15_Setup.gs 届时只保留 Create/Repair/Migration 三类操作性函数，
+ *     Schema 定义本身完全交给 04_Schema.gs 输出常量供两边引用）：
+ *       (a) Read Model 表的数量超过 8 张，或
+ *       (b) 单张表的字段数量频繁变化（半年内变化 3 次以上），或
+ *       (c) 除了 15_Setup.gs 之外，出现第三个需要读取"标准表头是什么"的
+ *           消费方（目前只有 setupSheets 和 _repairOneSheetHeader_ 两个
+ *           消费方，都在同一个文件内）。
+ *   - 在触发条件出现之前，不要因为"感觉应该拆得更细"而提前拆分——
+ *     Architecture Principles 第7条（Single Responsibility）追求的是
+ *     "职责边界清楚"，不是"文件数量越多越好"；没有第二个消费方之前，拆出
+ *     独立 Schema 文件不会让职责更清楚，只会多一层间接。
+ *
+ * ── Consequences ──────────────────────────────────────────────────────────
+ *
+ * 正面：
+ *   - 现在不用为了满足"看起来更规范"而做一次没有实际收益的代码拆分
+ *   - 触发条件写清楚了，以后真的要拆的时候，不需要重新论证"要不要拆"，
+ *     只需要确认"是不是满足了这几条里的至少一条"
+ *
+ * 需要接受的代价：
+ *   - 在拆分之前，15_Setup.gs 内部两处表头字面量仍然要靠人工纪律保持
+ *     同步，理论上还是有"改了一处忘了改另一处"的风险——这个风险目前
+ *     被认为可以接受（表结构变化频率低，且 15_Setup.gs 本身不大，两处
+ *     字面量在同一个文件里，review 时容易发现不一致）。
+ */
