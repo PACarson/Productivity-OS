@@ -1,0 +1,218 @@
+/**
+ * 12_TaskQueryEngine.gs
+ * Productivity OS v4.0 — Task Query Engine（V4 改名+中心化）
+ *
+ * 【V4】原 12_QueryEngine.gs。规格书要求的"centralized query API"：
+ * getTask / getTasks / getTodayTasks / getWeekTasks / getMonthTasks /
+ * getOverdueTasks / getUpcomingTasks / getRecurringTasks / getPriorityTasks /
+ * searchTasks / getDashboard / getStatistics。
+ *
+ * 架构铁律（00_Project_Constitution.gs P6 铁律5）：
+ *  - 本模块是本项目唯一允许直接读 Tasks/ActiveTasks/TaskStatistics/
+ *    TaskFilters 这几张 Sheet 的模块。
+ *  - 绝对禁止读 Events 表 / 调 EventBus / 调 deriveTaskState_。
+ *  - 每次查询只批量读一次 Sheet（_readAllTasks_），读出来的数组转交给
+ *    22_PriorityEngine / 23_SearchEngine / 24_ViewEngine / 25_DashboardEngine /
+ *    26_AnalyticsEngine 这五个纯函数 Engine 做内存运算，自己不重复实现
+ *    过滤逻辑。
+ *  - 所有 Telegram 指令（06_TaskIntentParser.gs）必须经过本层，不允许直接
+ *    读 Sheet。
+ *
+ * 依赖：05_SheetUtils（getSheet_, getHeaderMap_）
+ */
+
+var TaskQueryEngine = (function () {
+
+  var TASKS_SHEET       = 'Tasks';
+  var TASK_STATS_SHEET  = 'TaskStatistics';
+
+  // ============ 内部：批量读整张 Sheet（本模块唯一的 Sheet I/O 入口） ============
+
+  function _readAllRows_(sheetName) {
+    try {
+      var sheet = getSheet_(sheetName); // 05_SheetUtils.gs
+      var lastRow = sheet.getLastRow();
+      if (lastRow < 2) return [];
+
+      var headerMap = getHeaderMap_(sheet);
+      var numCols   = sheet.getLastColumn();
+      var rows      = sheet.getRange(2, 1, lastRow - 1, numCols).getValues();
+
+      return rows.map(function (row) {
+        var obj = {};
+        for (var h in headerMap) {
+          obj[h] = row[headerMap[h]];
+        }
+        return obj;
+      }).filter(function (obj) {
+        return Object.keys(obj).some(function (k) { return obj[k] !== ''; });
+      });
+    } catch (e) {
+      Logger.log('[TaskQueryEngine] _readAllRows_ error (' + sheetName + '): ' + e.message);
+      return [];
+    }
+  }
+
+  /**
+   * 本模块内部所有查询共用的"一次性批量读"入口。
+   * @param {string} [chatId]  不传则返回所有用户的任务
+   * @returns {object[]}
+   */
+  function _readAllTasks_(chatId) {
+    var rows = _readAllRows_(TASKS_SHEET);
+    if (!chatId) return rows;
+    return rows.filter(function (t) { return String(t.chat_id) === String(chatId); });
+  }
+
+  // ============ 单任务 / 通用列表 ============
+
+  /**
+   * 按 task_id 查单个任务。
+   * @param {string} taskId
+   * @param {string} [chatId]  传入时额外校验 chat_id 匹配（跨用户隔离）
+   * @returns {object|null}
+   */
+  function getTask(taskId, chatId) {
+    var rows = _readAllRows_(TASKS_SHEET);
+    for (var i = 0; i < rows.length; i++) {
+      if (String(rows[i].task_id) === String(taskId)) {
+        if (chatId && String(rows[i].chat_id) !== String(chatId)) return null;
+        return rows[i];
+      }
+    }
+    return null;
+  }
+
+  /**
+   * 通用查询：按任意字段做简单等值过滤（不支持 SearchEngine 那种全文/范围
+   * 搜索——复杂搜索请用 searchTasks）。
+   * @param {string} [chatId]
+   * @param {object} [filters]  { status: 'PENDING', category: 'SHOPPING', ... }
+   * @returns {object[]}
+   */
+  function getTasks(chatId, filters) {
+    var tasks = _readAllTasks_(chatId);
+    if (!filters) return tasks;
+
+    return tasks.filter(function (t) {
+      for (var k in filters) {
+        if (String(t[k] || '').toUpperCase() !== String(filters[k]).toUpperCase()) return false;
+      }
+      return true;
+    });
+  }
+
+  function getPendingTasks(chatId) {
+    return getTasks(chatId, { status: 'PENDING' });
+  }
+
+  function getCompletedTasks(chatId) {
+    return getTasks(chatId, { status: 'DONE' });
+  }
+
+  // ============ View Engine 转发 ============
+
+  function getTodayTasks(chatId)    { return ViewEngine.today(_readAllTasks_(chatId)); }
+  function getTomorrowTasks(chatId) { return ViewEngine.tomorrow(_readAllTasks_(chatId)); }
+  function getWeekTasks(chatId)     { return ViewEngine.thisWeek(_readAllTasks_(chatId)); }
+  function getMonthTasks(chatId)    { return ViewEngine.thisMonth(_readAllTasks_(chatId)); }
+  function getUpcomingTasks(chatId) { return ViewEngine.upcoming(_readAllTasks_(chatId)); }
+  function getOverdueTasks(chatId)  { return ViewEngine.overdue(_readAllTasks_(chatId)); }
+  function getRecurringTasks(chatId) { return ViewEngine.recurring(_readAllTasks_(chatId)); }
+  function getCancelledTasks(chatId) { return ViewEngine.cancelled(_readAllTasks_(chatId)); }
+  function getArchivedTasksInline(chatId) { return ViewEngine.archived(_readAllTasks_(chatId)); }
+
+  /** 冷归档库（ArchiveTasks 表，不是 Tasks 里 archived=true 标记）—— 转发给 13_ActiveTasksEngine */
+  function getArchivedTasks(chatId, limit) {
+    return ActiveTasksEngine.getArchivedTasks(chatId, limit); // 13_ActiveTasksEngine.gs
+  }
+
+  // ============ Priority Engine 转发 ============
+
+  /**
+   * High Priority 任务，按 Priority Score 降序排列。
+   * @param {string} chatId
+   * @returns {object[]}  每个元素附带 _priority_score
+   */
+  function getPriorityTasks(chatId) {
+    var nonTerminal = _readAllTasks_(chatId).filter(function (t) {
+      var s = String(t.status || '').toUpperCase();
+      return s !== 'DONE' && s !== 'CANCELLED';
+    });
+    return PriorityEngine.rankByPriority(nonTerminal); // 22_PriorityEngine.gs
+  }
+
+  // ============ Search Engine 转发 ============
+
+  /**
+   * @param {string} chatId
+   * @param {object|string} query  传字符串等价于 {text: query}（对应
+   *                                 Telegram "/search keyword"）
+   * @returns {object[]}
+   */
+  function searchTasks(chatId, query) {
+    var q = (typeof query === 'string') ? { text: query } : (query || {});
+    return SearchEngine.search(_readAllTasks_(chatId), q); // 23_SearchEngine.gs
+  }
+
+  // ============ Dashboard / Statistics 转发 ============
+
+  /**
+   * @param {string} type  'today'|'weekly'|'monthly'|'statistics'
+   * @param {string} chatId
+   * @returns {string}
+   */
+  function getDashboard(type, chatId) {
+    return DashboardEngine.build(type, _readAllTasks_(chatId)); // 25_DashboardEngine.gs
+  }
+
+  /**
+   * 优先读 TaskStatistics 投影表（O(1)，由 10_ProjectionEngine 增量维护）；
+   * 表不存在或该 chatId 还没有投影行时，退化为现算（
+   * AnalyticsEngine.computeStatistics 扫一次 _readAllTasks_(chatId)）。
+   *
+   * ⚠️ TaskStatistics 里没有的字段（overdue_count 等"日历相对"统计）永远
+   * 现算——见 00_Project_Constitution.gs P7 同一类"时间相关不适合纯事件
+   * 驱动增量维护"的讨论。TaskStatistics 只缓存"事件驱动"的计数（total/
+   * pending/done/cancelled/recurring/reminder 累计），overdue_rate等仍由
+   * AnalyticsEngine 现算后合并进返回值。
+   *
+   * @param {string} chatId
+   * @returns {object}
+   */
+  function getStatistics(chatId) {
+    var tasks = _readAllTasks_(chatId);
+    // AnalyticsEngine.computeStatistics 本身已经是 O(n) 一次扫描，数据量在
+    // GAS 场景下（个人任务系统，通常几百到几千行）现算完全够快，这里直接
+    // 现算即可保证数字绝对准确（不用担心 TaskStatistics 投影漂移的问题）。
+    // TaskStatistics 表仍然维护（10_ProjectionEngine 增量更新），供未来
+    // 需要跨 chatId 聚合总览时做低成本快照读取用，getStatistics 目前不依赖它。
+    return AnalyticsEngine.computeStatistics(tasks); // 26_AnalyticsEngine.gs
+  }
+
+  return {
+    getTask:             getTask,
+    getTasks:            getTasks,
+    getPendingTasks:     getPendingTasks,
+    getCompletedTasks:   getCompletedTasks,
+    getTodayTasks:       getTodayTasks,
+    getTomorrowTasks:    getTomorrowTasks,
+    getWeekTasks:        getWeekTasks,
+    getMonthTasks:       getMonthTasks,
+    getUpcomingTasks:    getUpcomingTasks,
+    getOverdueTasks:     getOverdueTasks,
+    getRecurringTasks:   getRecurringTasks,
+    getCancelledTasks:   getCancelledTasks,
+    getArchivedTasksInline: getArchivedTasksInline,
+    getArchivedTasks:    getArchivedTasks,
+    getPriorityTasks:    getPriorityTasks,
+    searchTasks:         searchTasks,
+    getDashboard:        getDashboard,
+    getStatistics:       getStatistics
+  };
+})();
+
+// ============ 向后兼容全局别名（原 QueryEngine 调用方不用改） ============
+// 部分历史代码（如 11_ProjectionRebuilder.gs 之外的调用方）可能还引用
+// 旧的全局 QueryEngine 名字，这里保留一个指向同一实现的别名。
+var QueryEngine = TaskQueryEngine;
