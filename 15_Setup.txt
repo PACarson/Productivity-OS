@@ -1,35 +1,25 @@
 /**
  * 15_Setup.gs
- * Productivity OS v1.0 — 一键初始化
+ * Productivity OS v4.0 — 一键初始化
  *
- * ⚠️ 2026-07-03 拆分说明：这是新文件，不是从 Core 搬过来的——Core 原来的
- * 15_Setup.gs 里跟 Tasks/ActiveTasks/ArchiveTasks/triggerDailyArchive 相关
- * 的部分被搬到这里，改成独立项目自己的初始化脚本。
+ * 【V4 变更】
+ *   1. Tasks/ActiveTasks/ArchiveTasks 表头新增 description/tags 两列
+ *      （向后兼容追加列，不影响旧数据）。
+ *   2. 新增 TaskStatistics / TaskFilters 两张 Projection 表。
+ *   3. runDiagnostics 覆盖新表 + 新 Engine 的基本冒烟测试。
  *
  * 使用顺序（重要，顺序不能反）：
  *   1. 先确认本项目 Script Properties 里的 SPREADSHEET_ID 已经设置成跟
- *      Personal AI Core 项目【同一张】Spreadsheet 的 ID：
- *        SecureConfig.setKey('SPREADSHEET_ID', '跟Core一样的那个ID')
- *   2. 跑一次 setupSheets() —— 建好 Tasks / ActiveTasks / ArchiveTasks 三张表
- *      （如果这张 Spreadsheet 之前已经有这三张表了——比如你是从合并在一起的
- *      旧版本迁移过来的——这个函数是幂等的，表已存在会跳过，不会破坏数据）
- *   3. （仅旧数据迁移时需要）跑一次 migrateAddIdentityColumns()（在
- *      11_ProjectionRebuilder.gs 里）
- *   4. 本项目【不需要】单独 Deploy as Web App，也不需要 registerWebhook()——
- *      它不直接接 Telegram，是被 Personal AI Core 当 Library 调用的（Core
- *      那边的 04_Main.gs 会 import 本项目，调用方式见 Core 项目的 README）。
- *      你只需要：Deploy → New deployment → Library，拿到 Script ID，
- *      去 Core 项目的 Editor → Libraries 里加上这个 Script ID，Identifier
- *      填 "ProductivityOS"。
- *   5. 跑一次 createTriggers() —— 挂上本项目自己的定时任务
- *      （triggerDailyArchive，每天凌晨2点冷归档）
+ *      Personal AI Core 项目【同一张】Spreadsheet 的 ID。
+ *   2. 跑一次 setupSheets() —— 建好全部五张表（幂等，已存在的表/列不会
+ *      被破坏）。
+ *   3. （仅从 V3 或更早版本迁移时需要）跑一次 migrateSchemaV4()（在
+ *      11_ProjectionRebuilder.gs 里）。
+ *   4. 本项目【不需要】单独 Deploy as Web App——它是被 Personal AI Core
+ *      当 Library 调用的。
+ *   5. 跑一次 createTriggers() —— 挂上本项目自己的定时任务。
  *   6.（仅首次上线/迁移、Events 已有历史 Task 事件时需要）跑一次
- *      rebuildAllProjections()（在 11_ProjectionRebuilder.gs 里）——
- *      从共享 Events 表里 TASK_ 开头的事件和 REMINDER_SENT 事件重建 Tasks/ActiveTasks
- *
- * 全部跑完后，回 Core 项目确认 04_Main.gs 能正常调用
- * ProductivityOS.handleTaskIntent(...)（比如在 Core 编辑器手动跑一次
- * ProductivityOS.handleTaskIntent('测试任务', 'test_chat') 看看有没有报错）。
+ *      rebuildAllProjections()（在 11_ProjectionRebuilder.gs 里）。
  */
 
 // ============ 1. 建表 ============
@@ -44,24 +34,35 @@ function setupSheets() {
 
   _ensureSheet_(ss, 'Tasks', [
     'task_id', 'timestamp', 'title', 'category', 'status', 'due_date',
-    'recurring', 'priority', 'context', 'budget', 'notes', 'chat_id',
-    'completed_at', 'reminder_count', 'identity', 'archived'
+    'recurring', 'priority', 'context', 'budget', 'notes', 'description',
+    'tags', 'chat_id', 'completed_at', 'reminder_count', 'identity', 'archived'
   ]);
 
   _ensureSheet_(ss, 'ActiveTasks', [
     'task_id', 'timestamp', 'title', 'category', 'status', 'due_date',
-    'recurring', 'priority', 'context', 'budget', 'notes', 'chat_id',
-    'completed_at', 'reminder_count', 'identity'
+    'recurring', 'priority', 'context', 'budget', 'notes', 'description',
+    'tags', 'chat_id', 'completed_at', 'reminder_count', 'identity'
   ]);
 
   _ensureSheet_(ss, 'ArchiveTasks', [
     'task_id', 'timestamp', 'title', 'category', 'status', 'due_date',
-    'recurring', 'priority', 'context', 'budget', 'notes', 'chat_id',
-    'completed_at', 'reminder_count', 'identity', 'archived_at'
+    'recurring', 'priority', 'context', 'budget', 'notes', 'description',
+    'tags', 'chat_id', 'completed_at', 'reminder_count', 'identity', 'archived_at'
   ]);
 
-  Logger.log('✅ Sheets 就位: Tasks, ActiveTasks, ArchiveTasks（Inventory/Events 由 Core 项目建）');
-  Logger.log('下一步: 如果 Tasks 已有旧数据 → migrateAddIdentityColumns()；然后 createTriggers()');
+  // V4 新增：TaskStatistics（每 chat_id 一行的累计计数器，10_ProjectionEngine 增量维护）
+  _ensureSheet_(ss, 'TaskStatistics', [
+    'chat_id', 'total_count', 'pending_count', 'done_count', 'cancelled_count',
+    'recurring_count', 'reminder_count_total', 'last_updated_at'
+  ]);
+
+  // V4 新增：TaskFilters（每 task_id 一行的搜索用扁平投影）
+  _ensureSheet_(ss, 'TaskFilters', [
+    'task_id', 'chat_id', 'searchable_text', 'tags_csv'
+  ]);
+
+  Logger.log('✅ Sheets 就位: Tasks, ActiveTasks, ArchiveTasks, TaskStatistics, TaskFilters（Events 由 Core 项目建）');
+  Logger.log('下一步: 如果 Tasks 已有旧数据（V3 或更早） → migrateSchemaV4()；然后 createTriggers()');
 }
 
 function _ensureSheet_(ss, name, headers) {
@@ -81,8 +82,9 @@ function _ensureSheet_(ss, name, headers) {
 
 /**
  * 本项目只有一个定时任务：triggerDailyArchive（每天凌晨2点，见
- * 13_ActiveTasksEngine.gs 的 runDailyArchive）。
- * checkReminders 不在这里——那是 Reminder OS 项目自己的触发器。
+ * 13_ActiveTasksEngine.gs 的 runDailyArchive）。V4 没有新增触发器——
+ * TaskStatistics/TaskFilters 都是事件驱动的同步增量维护，不需要定时任务；
+ * 如果发现漂移，手动跑 11_ProjectionRebuilder.gs 的对应 rebuild 函数即可。
  */
 function createTriggers() {
   var handlerNames = ['triggerDailyArchive'];
@@ -103,18 +105,25 @@ function createTriggers() {
 function repairSheetHeaders() {
   _repairOneSheetHeader_('Tasks', [
     'task_id', 'timestamp', 'title', 'category', 'status', 'due_date',
-    'recurring', 'priority', 'context', 'budget', 'notes', 'chat_id',
-    'completed_at', 'reminder_count', 'identity', 'archived'
+    'recurring', 'priority', 'context', 'budget', 'notes', 'description',
+    'tags', 'chat_id', 'completed_at', 'reminder_count', 'identity', 'archived'
   ]);
   _repairOneSheetHeader_('ActiveTasks', [
     'task_id', 'timestamp', 'title', 'category', 'status', 'due_date',
-    'recurring', 'priority', 'context', 'budget', 'notes', 'chat_id',
-    'completed_at', 'reminder_count', 'identity'
+    'recurring', 'priority', 'context', 'budget', 'notes', 'description',
+    'tags', 'chat_id', 'completed_at', 'reminder_count', 'identity'
   ]);
   _repairOneSheetHeader_('ArchiveTasks', [
     'task_id', 'timestamp', 'title', 'category', 'status', 'due_date',
-    'recurring', 'priority', 'context', 'budget', 'notes', 'chat_id',
-    'completed_at', 'reminder_count', 'identity', 'archived_at'
+    'recurring', 'priority', 'context', 'budget', 'notes', 'description',
+    'tags', 'chat_id', 'completed_at', 'reminder_count', 'identity', 'archived_at'
+  ]);
+  _repairOneSheetHeader_('TaskStatistics', [
+    'chat_id', 'total_count', 'pending_count', 'done_count', 'cancelled_count',
+    'recurring_count', 'reminder_count_total', 'last_updated_at'
+  ]);
+  _repairOneSheetHeader_('TaskFilters', [
+    'task_id', 'chat_id', 'searchable_text', 'tags_csv'
   ]);
 }
 
@@ -146,14 +155,14 @@ function _repairOneSheetHeader_(name, headers) {
 function setupAll() {
   setupSheets();
   Logger.log('=== 第一步完成 ===');
-  Logger.log('接下来: 1) migrateAddIdentityColumns()（如有旧数据）  2) Deploy as Library  ' +
+  Logger.log('接下来: 1) migrateSchemaV4()（如有 V3 或更早的旧数据）  2) Deploy as Library  ' +
     '3) 去 Core 项目 Editor→Libraries 加上本项目当 "ProductivityOS"  4) createTriggers()');
 }
 
 // ============ 诊断：不碰 Telegram，直接看本项目状态 ============
 
 function runDiagnostics() {
-  Logger.log('========== Productivity OS 诊断开始 ==========');
+  Logger.log('========== Productivity OS V4 诊断开始 ==========');
 
   var id = SecureConfig.getKey('SPREADSHEET_ID');
   if (!id) {
@@ -161,7 +170,7 @@ function runDiagnostics() {
   }
   var ss = id ? SpreadsheetApp.openById(id) : null;
 
-  ['Tasks', 'ActiveTasks', 'ArchiveTasks'].forEach(function (name) {
+  ['Tasks', 'ActiveTasks', 'ArchiveTasks', 'TaskStatistics', 'TaskFilters'].forEach(function (name) {
     if (!ss) return;
     var sheet = ss.getSheetByName(name);
     if (!sheet) {
@@ -173,6 +182,7 @@ function runDiagnostics() {
   });
 
   var testChatId = 'diagnostic_test_chat';
+
   try {
     var parsed = parseTaskIntent('提醒我明天3点交房租');
     Logger.log('✅ parseTaskIntent 测试结果: ' + JSON.stringify(parsed));
@@ -180,20 +190,43 @@ function runDiagnostics() {
     Logger.log('❌ parseTaskIntent 本身就报错: ' + e.message + '\n' + e.stack);
   }
 
+  var testTaskId = null;
   try {
     var task = createTask('诊断测试任务-可以删除', { category: 'GENERAL', notes: 'DIAGNOSTIC_TEST_TEMP' }, testChatId);
+    testTaskId = task.task_id;
     Logger.log('✅ createTask 测试结果: ' + JSON.stringify(task));
-    cancelTask(task.task_id, testChatId);
-    Logger.log('✅ 已自动取消诊断测试任务');
   } catch (e) {
     Logger.log('❌ createTask 报错: ' + e.message + '\n' + e.stack);
   }
 
-  try {
-    var pending = getPendingTasks(testChatId);
-    Logger.log('✅ getPendingTasks 测试结果，共 ' + pending.length + ' 条');
-  } catch (e) {
-    Logger.log('❌ getPendingTasks 报错: ' + e.message + '\n' + e.stack);
+  if (testTaskId) {
+    try {
+      var updated = updateTask(testTaskId, { notes: 'DIAGNOSTIC_TEST_TEMP_UPDATED' }, testChatId);
+      Logger.log('✅ updateTask 测试结果: ' + JSON.stringify(updated));
+    } catch (e) {
+      Logger.log('❌ updateTask 报错: ' + e.message + '\n' + e.stack);
+    }
+
+    try {
+      var pending = TaskQueryEngine.getPendingTasks(testChatId);
+      Logger.log('✅ TaskQueryEngine.getPendingTasks 测试结果，共 ' + pending.length + ' 条');
+    } catch (e) {
+      Logger.log('❌ TaskQueryEngine.getPendingTasks 报错: ' + e.message + '\n' + e.stack);
+    }
+
+    try {
+      var dash = TaskQueryEngine.getDashboard('today', testChatId);
+      Logger.log('✅ TaskQueryEngine.getDashboard 测试结果:\n' + dash);
+    } catch (e) {
+      Logger.log('❌ TaskQueryEngine.getDashboard 报错: ' + e.message + '\n' + e.stack);
+    }
+
+    try {
+      cancelTask(testTaskId, testChatId);
+      Logger.log('✅ 已自动取消诊断测试任务');
+    } catch (e) {
+      Logger.log('❌ cancelTask 报错: ' + e.message + '\n' + e.stack);
+    }
   }
 
   Logger.log('⚠️ 这些是本项目内部测试，不代表 Core 项目能成功调用本项目（Library 引入是否');

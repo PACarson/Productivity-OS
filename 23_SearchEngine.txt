@@ -1,0 +1,94 @@
+/**
+ * 23_SearchEngine.gs
+ * Productivity OS v4.0 — Search Engine（V4 新增）
+ *
+ * 职责：在一批已经在内存里的 task 对象上做多维度过滤/全文搜索。纯函数——
+ * 不读 Sheet，不读 Events。输入永远是 12_TaskQueryEngine.gs 已经批量读出
+ * 来的 task 数组（默认读 Tasks Sheet；Tasks 行上已经带有 description/tags
+ * 列，本 Engine 直接用，不需要再单独 join TaskFilters——TaskFilters 的
+ * searchable_text 是给"未来做真正大数据量全文索引"预留的加速路径，当前
+ * Tasks 数据量级下直接在内存里 filter 已经足够快，见
+ * 12_TaskQueryEngine.searchTasks 的实现说明）。
+ *
+ * 支持维度：title / description / category / priority / status / date /
+ * date range / recurring / tags / full text。
+ */
+
+var SearchEngine = (function () {
+
+  /**
+   * @param {object[]} tasks
+   * @param {object} query
+   *   {
+   *     text: string,           // 全文搜索：title+description+notes+tags 里任意包含（大小写不敏感）
+   *     title: string,          // 只搜 title
+   *     category: string,
+   *     priority: string,
+   *     status: string,
+   *     recurring: boolean,     // true=只要 recurring 非空的；false=只要没有 recurring 的
+   *     tag: string,            // tags 字段（逗号分隔）里包含这个 tag
+   *     dateFrom: string,       // 'yyyy-MM-dd'，due_date >= dateFrom
+   *     dateTo: string          // 'yyyy-MM-dd'，due_date <= dateTo
+   *   }
+   * @returns {object[]}
+   */
+  function search(tasks, query) {
+    query = query || {};
+    var textLower = query.text ? String(query.text).toLowerCase() : null;
+    var titleLower = query.title ? String(query.title).toLowerCase() : null;
+
+    var dateFrom = query.dateFrom ? parseDueDate_(query.dateFrom) : null; // 05_SheetUtils.gs
+    var dateTo   = query.dateTo   ? parseDueDate_(query.dateTo)   : null;
+
+    return tasks.filter(function (t) {
+      if (textLower && !_matchesFullText_(t, textLower)) return false;
+      if (titleLower && String(t.title || '').toLowerCase().indexOf(titleLower) === -1) return false;
+      if (query.category && String(t.category || '').toUpperCase() !== String(query.category).toUpperCase()) return false;
+      if (query.priority && String(t.priority || '').toUpperCase() !== String(query.priority).toUpperCase()) return false;
+      if (query.status && String(t.status || '').toUpperCase() !== String(query.status).toUpperCase()) return false;
+      if (query.recurring === true  && !t.recurring) return false;
+      if (query.recurring === false && t.recurring) return false;
+      if (query.tag && !_hasTag_(t, query.tag)) return false;
+
+      if (dateFrom || dateTo) {
+        if (!t.due_date) return false;
+        var due = parseDueDate_(String(t.due_date));
+        if (!due || isNaN(due.getTime())) return false;
+        if (dateFrom && due.getTime() < dateFrom.getTime()) return false;
+        if (dateTo && due.getTime() > dateTo.getTime()) return false;
+      }
+
+      return true;
+    });
+  }
+
+  function _matchesFullText_(task, textLower) {
+    var haystack = [task.title, task.description, task.notes, task.tags, task.category]
+      .filter(function (v) { return !!v; })
+      .join(' ')
+      .toLowerCase();
+    return haystack.indexOf(textLower) !== -1;
+  }
+
+  function _hasTag_(task, tag) {
+    if (!task.tags) return false;
+    var tags = String(task.tags).split(',').map(function (s) { return s.trim().toLowerCase(); });
+    return tags.indexOf(String(tag).trim().toLowerCase()) !== -1;
+  }
+
+  /**
+   * 便捷入口：单个关键字搜索（对应 Telegram "/search keyword" 指令），
+   * 等价于 search(tasks, {text: keyword})。
+   * @param {object[]} tasks
+   * @param {string} keyword
+   * @returns {object[]}
+   */
+  function searchByKeyword(tasks, keyword) {
+    return search(tasks, { text: keyword });
+  }
+
+  return {
+    search:          search,
+    searchByKeyword: searchByKeyword
+  };
+})();

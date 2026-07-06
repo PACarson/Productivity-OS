@@ -1,9 +1,10 @@
 /**
  * 00_Project_State.gs
- * Productivity OS v1.0 — 项目状态快照
+ * Productivity OS v4.0 — 项目状态快照
  *
  * ⚠️ 快照，不是日志。每次更新覆盖旧状态。
- * LAST_UPDATED: 2026-07-03 — 从 Personal AI Core 拆分而来，首次创建。
+ * LAST_UPDATED: 2026-07-06 — V4 架构升级：CQRS 严格化 + 9 Engine 落地 +
+ * 修复本文件"三、已知Bug"里记录的全部问题。
  */
 
 // ============================================================
@@ -11,19 +12,44 @@
 // ============================================================
 
 /**
- * - 2026-07-03：从 Personal AI Core 物理拆分为独立项目。06_TaskIntentParser.gs
- *   / 20_ProductivityModule.gs / 13_ActiveTasksEngine.gs 逐字未改地搬过来。
- *   09_IdempotencyManager.gs / 10_ProjectionEngine.gs / 12_QueryEngine.gs
- *   精简成只含 Task 部分（原文件在 Core 项目还有完整版）。
- *   02_EventBus.gs / 05_SheetUtils.gs 改用 SpreadsheetApp.openById 而不是
- *   getActiveSpreadsheet（standalone 脚本没有"容器"概念）。
- *   07_IdentityEngine.gs 顺手把物理文件名从 07_StateEngine_TaskMetrics.txt
- *   改正确（2026-07-01 LOW RISK 2 遗留问题，趁着搬文件一起处理了）。
+ * - 2026-07-06：V4 架构升级（本次）。
+ *   1. 修复 LOW RISK 2（09_IdempotencyManager.gs 与 20_ProductivityModule.gs
+ *      的裸全局函数耦合）——见下方"三、已知Bug"第1条的修复说明。
+ *   2. 修复一处本次审计新发现、之前未被记录的 bug——
+ *      11_ProjectionRebuilder.gs 里 rebuildInventoryProjection() /
+ *      _markRemovedItemsConsumed_() 是 2026-07-03 物理拆分时的遗漏：
+ *      拆分说明（文件头 + 00_File_Map.gs）都写"Inventory 部分留在 Core
+ *      项目自己的副本里"，10_ProjectionEngine.gs 和 12_QueryEngine.gs 确实
+ *      都已经精简掉了 Inventory case，但 11_ProjectionRebuilder.gs 唯独没有
+ *      跟着精简——这两个函数调用的 deriveInventory()（原属
+ *      21_InventoryModule.gs）在本项目里根本不存在，rebuildAllProjections()
+ *      之前会无条件调用 rebuildInventoryProjection()，也就是说只要有人在
+ *      本项目（不是 Core 项目）运行 rebuildAllProjections() 做 Read Model
+ *      修复，会直接 ReferenceError 崩掉，且连带炸掉同一函数里后面的
+ *      rebuildActiveTasksProjection()（因为是同步顺序调用，前一个抛错后面
+ *      不会执行）。V4 已从 rebuildAllProjections() 里删除这两个函数和它们
+ *      的调用，Inventory Read Model 重建始终应该在 Core 项目自己的
+ *      11_ProjectionRebuilder.gs 副本里做。
+ *   3. 架构违规修复：06_TaskIntentParser.gs 之前直接调用 getSheet_/
+ *      getHeaderMap_ 读 ActiveTasks/Tasks（_getActiveTasksForDisplay_ /
+ *      _getCompletedTasksForDisplay_），违反"所有查询必须经过 QueryEngine"
+ *      的架构铁律（00_File_Map.gs 铁律4）。V4 起，TaskIntentParser 不再直接
+ *      摸任何 Sheet，全部改经 12_TaskQueryEngine.gs。
+ *   4. 新增 8 个 Engine：21_RecurringEngine / 22_PriorityEngine /
+ *      23_SearchEngine / 24_ViewEngine / 25_DashboardEngine /
+ *      26_AnalyticsEngine，以及 20_ProductivityModule.gs → 20_TaskEngine.gs
+ *      改名 + IIFE 封装，12_QueryEngine.gs → 12_TaskQueryEngine.gs 改名 +
+ *      中心化（见 00_Project_Constitution.gs P4/P6）。
+ *   5. 新增 Tasks/ActiveTasks/ArchiveTasks 表的 description / tags 两列
+ *      （向后兼容的新增列，不影响旧数据）；新增 TaskStatistics / TaskFilters
+ *      两张 Projection 表（15_Setup.gs）。
+ *   6. Tasks Schema 新增 TASK_UPDATED 事件类型，支撑 20_TaskEngine.updateTask()
+ *      （V3 完全没有"更新任务"的能力，只有 create/complete/cancel——这是
+ *      V4 规格明确要求的 Task Engine 四件套之一，属于新功能补齐，不是bug）。
  *
- * - 拆分之前在 Personal AI Core 项目里的全部历史（bug 修复、recurring
- *   自动续期、ActiveTasks/ArchiveTasks 落地等）完整历史见 Personal AI
- *   Core 项目的 00_Project_State.gs（拆分之前的记录还留在那边，不重复
- *   搬过来）。
+ * - 2026-07-03：从 Personal AI Core 物理拆分为独立项目（历史记录，V3.x）。
+ *   完整历史见 Personal AI Core 项目的 00_Project_State.gs（拆分之前的
+ *   记录还留在那边，不重复搬过来）。
  */
 
 // ============================================================
@@ -39,13 +65,35 @@
 // ============================================================
 
 /**
- * 从 Personal AI Core 带过来、还没修的（拆分时特意不夹带修复）：
+ * 全部已在本次（2026-07-06）V4 升级中修复，记录留存供交接参考：
  *
- * - LOW RISK 2（2026-07-01 外部审计）：09_IdempotencyManager.gs 与
- *   20_ProductivityModule.gs 之间是"裸全局函数"耦合，没有走 public API /
- *   IIFE 封装。拆分后这个耦合的范围反而缩小了（现在只在本项目内部，
- *   不会被别的项目摸到），但耦合本身还在，要不要做 IIFE 封装是本项目
- *   自己的技术债，见下方"下一步"。
+ * - LOW RISK 2（2026-07-01 外部审计，2026-07-03 拆分时特意不夹带修复）：
+ *   09_IdempotencyManager.gs 与 20_ProductivityModule.gs 之间是"裸全局函数"
+ *   耦合（_createTaskDirect_），没有走 public API / IIFE 封装。
+ *   ✅ 修复方式：20_ProductivityModule.gs 改名 20_TaskEngine.gs，整个模块
+ *   包进 IIFE，_createTaskDirect_ 变成 TaskEngine.createTaskDirect_（保留
+ *   下划线后缀标注"内部函数，只允许 IdempotencyManager 调用"的语义，但不再
+ *   是裸全局）。09_IdempotencyManager.gs 改成调 TaskEngine.createTaskDirect_(...)。
+ *   createTask/completeTask/cancelTask/getPendingTasks 仍保留同名全局函数
+ *   作为向后兼容 wrapper（委托给 TaskEngine/TaskQueryEngine 的 IIFE 方法），
+ *   保证 Core 项目 04_Main.gs 里 ProductivityOS.createTask(...) 这类既有
+ *   Library 调用不用改一行代码。
+ *
+ * - 【本次审计新发现，之前未被任何文档记录】11_ProjectionRebuilder.gs 的
+ *   rebuildInventoryProjection() / _markRemovedItemsConsumed_() 引用了不
+ *   存在于本项目的 deriveInventory()（Inventory 逻辑，2026-07-03 拆分时应该
+ *   随 21_InventoryModule.gs 一起留在 Core 项目，但这两个重建函数被漏删）。
+ *   ✅ 修复方式：从本项目彻底删除这两个函数，rebuildAllProjections() 改成
+ *   只调 rebuildTasksProjection() + rebuildActiveTasksProjection() +（V4新增）
+ *   rebuildStatisticsProjection() + rebuildTaskFiltersProjection()。
+ *
+ * - 【架构违规，本次一并修复】06_TaskIntentParser.gs 的
+ *   _getActiveTasksForDisplay_ / _getCompletedTasksForDisplay_ 直接调
+ *   getSheet_/getHeaderMap_，绕过 QueryEngine 直接读 Sheet，违反
+ *   00_File_Map.gs 架构铁律4"所有查询必须经过 QueryEngine"。
+ *   ✅ 修复方式：改成调用 12_TaskQueryEngine.gs 的 getTodayTasks() /
+ *   getTasks() 等公开方法，TaskIntentParser 不再 import 05_SheetUtils.gs
+ *   的 Sheet 读取函数。
  */
 
 // ============================================================
@@ -53,21 +101,28 @@
 // ============================================================
 
 /**
- * 优先级 P2：
- *   1. 06/20/13 完整 IIFE 封装（需要先给 createTask/completeTask/
- *      cancelTask/getPendingTasks 等跨文件调用的函数设计 public API，
- *      再改全部调用方，是一次专门的重构，不要混进日常 bug 修复里）。
- *      2026-07-03 更新：这个耦合现在完全在本项目内部（Core/Reminder OS
- *      不会直接摸到这几个裸全局函数，只通过 Library 边界调用），优先级
- *      可以往后放，不是拆分后新引入的紧急问题。
- *
- * 优先级 P3（架构演进）：
- *   2. 给本项目补一套自己的 Foundation.Insights（现在暂时复用 Core 的
+ * 优先级 P3（架构演进，从 V3 State 沿用，仍未过期）：
+ *   1. 给本项目补一套自己的 Foundation.Insights（现在暂时复用 Core 的
  *      93-96，如果以后需要 Task-specific 的行为分析/建议，考虑在本项目
  *      内建一份专属的）。
- *   3. 如果未来真的有"Domain OS 之间要互相触发"的场景（比如 Property OS
+ *   2. 如果未来真的有"Domain OS 之间要互相触发"的场景（比如 Property OS
  *      完成某个操作要顺手建一个 Task），按 Core 项目 Constitution 的 D5
- *      Domain OS↔Domain OS Bridge 模式接（参照 Reminder OS 现在的接入
- *      方式：不建双向 Library 依赖，而是共享 Spreadsheet + 各自维护自己
- *      的 Sheet 所有权）。
+ *      Domain OS↔Domain OS Bridge 模式接（Integration.Bridge，见
+ *      00_Project_Constitution.gs P4 第4层）。
+ *
+ * 优先级 P2（V4 落地时刻意收窄、留给下一轮的范围）：
+ *   3. 22_PriorityEngine.gs 的 Urgency Score 目前只用 due_date 距今天数 +
+ *      逾期天数两个信号；Priority Score 用手动 priority + Urgency Score 的
+ *      简单加权。V4 规格里提到的"Estimated Duration / Importance"两个信号
+ *      现有 Tasks Schema 没有对应字段，本次没有新增（避免无意义的空列），
+ *      等真的有具体用例需要再加对应字段和权重。
+ *   4. 21_RecurringEngine.gs 的 recurrence lifecycle 目前只有"完成后自动
+ *      续期"这一种生命周期事件（继承自 V3 的 _spawnNextRecurrenceIfNeeded_），
+ *      没有"暂停/恢复某条 recurring 规则"的能力——V3.2 当时的产品判断
+ *      （"取消是否要连未来所有次都停掉有歧义，不擅自决定"）在 V4 继续有效，
+ *      真的需要"暂停这个 recurring 系列"时再单独设计。
+ *   5. 26_AnalyticsEngine.gs 的 workload 统计目前是"当前 PENDING 任务数 by
+ *      category/priority"的静态快照，不是"未来7天每天要做几件"的排班视图——
+ *      后者需要对 due_date 做更复杂的分桶，V4 先满足规格里明确列出的5个
+ *      统计项，排班视图留作后续。
  */

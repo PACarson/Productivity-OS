@@ -1,43 +1,25 @@
 /**
  * 06_TaskIntentParser.gs
- * JARVIS CORE v3.1 — 任务意图解析器
+ * Productivity OS v4.0 — 任务意图解析器
  *
- * v3.1 变更（2026-06-29）：
+ * 【V4 变更】
  *
- * 🐛 Bug fix：help/我的任务 被错误创建为任务
+ * 1. 【架构违规修复】原来的 _getActiveTasksForDisplay_ /
+ *    _getCompletedTasksForDisplay_ 直接调用 getSheet_/getHeaderMap_ 读
+ *    ActiveTasks/Tasks，绕过 QueryEngine，违反"所有查询必须经过 QueryEngine"
+ *    的架构铁律（见 00_Project_State.gs"已知Bug"第3条）。V4 起本文件全部
+ *    查询改经 12_TaskQueryEngine.gs，不再 import 05_SheetUtils.gs 的任何
+ *    Sheet 读取函数（只用它的 _cleanTitle_ 纯文本工具）。
  *
- * 原因：parseTaskIntent 末尾有一个过于贪婪的 TASK_CREATE 兜底——
- * 任何长度 ≥ 2 的文本，只要没被前面的模式捕获，一律视为创建任务。
- * 导致：
- *   "help" / "/help" → 变成标题为"help"的任务 ❌
- *   "我的任务"       → 没匹配 TASK_LIST（旧 regex 要求"任务列表"带"列表"后缀）→
- *                       变成标题为"我的任务"的任务 ❌
+ * 2. 新增指令（对应 V4 规格书 Telegram Commands 小节）：
+ *    /today /week /month /priority /overdue /upcoming /recurring
+ *    /dashboard /stats /search keyword
+ *    全部通过 12_TaskQueryEngine.gs 读，绝不重放 Events。
  *
- * 修复 1：TASK_LIST 模式增补
- *   旧：/^(我的?|所有|全部)?任务列表$/（必须有"列表"后缀）
- *   新：/^(我的?|所有|全部)?任务(列表)?$/（"列表"变可选）
- *   额外增加：/^(我的?任务|待办任务|所有任务|全部任务)$/（显式覆盖高频歧义词）
- *
- * 修复 2：skipPatterns 增补 help 类命令
- *   新增：/^\/?(help|帮助|命令|指南|菜单|使用说明|h)$/i
- *   新增：/^\// （所有其他 / 开头的指令，如果不是已知的任务指令，跳过，不当任务创建）
- *         注意：/tasks, /todos, /done, /cancel 等已在前面的模式中被捕获，
- *         这条兜底只会拦截真正未知的 slash 命令。
- *
- * 新增 TASK_HISTORY 意图："/history" / "历史" / "已完成" → 展示已完成任务
- *   读取来源：Tasks Sheet（status=DONE/CANCELLED，最新优先）
- *
- * 新增 TASK_ARCHIVE 意图："/archive" / "归档" → 展示更早的归档记录
- *   读取来源：ArchiveTasks Sheet（13_ActiveTasksEngine.getArchivedTasks）
- *
- * TASK_LIST 改读 ActiveTasks：
- *   "/tasks" / "我的任务" 等 → 读 ActiveTasks Sheet（只有未完成任务，更快）
- *   如果 ActiveTasks Sheet 尚未建立，自动退回读 Tasks Sheet（兜底）
- *
- * MEDIUM RISK 1 修复（外部审计，核实属实后采纳）：
- *   删除全局 _cleanTitle_ 声明，统一使用 05_SheetUtils.gs 里的版本。
- *   （原本 06 和 22 各自全局声明了一份相同的 _cleanTitle_，GAS 全局命名空间
- *    扁平化，后加载的文件静默覆盖先加载的声明，存在隐蔽冲突风险。）
+ * 沿用 v3.1 的 bug fix（历史记录）：
+ *   - help/我的任务 被错误创建为任务 → TASK_LIST 模式增补 + skipPatterns
+ *     增补 help 类命令。
+ *   - MEDIUM RISK 1：删除全局 _cleanTitle_ 声明，统一使用 05_SheetUtils.gs。
  */
 
 // ============ 意图识别 ============
@@ -46,12 +28,9 @@ function parseTaskIntent(rawText) {
   var text = String(rawText || '').trim();
 
   // ── 0. 明确排除的指令（必须在所有其他匹配之前检查）──────────────────────
-  // help 类命令
   if (/^\/?(help|帮助|命令|指南|菜单|使用说明|h)$/i.test(text)) {
     return { intent: null };
   }
-  // /history 和其别名（TASK_HISTORY 在下方独立捕获）
-  // 放这里只是让它比 TASK_CREATE 兜底更早被识别到 —— 实际会在下面 TASK_HISTORY 块处理
 
   // ── 1. TASK_HISTORY ──────────────────────────────────────────────────────
   var historyPatterns = [
@@ -65,7 +44,7 @@ function parseTaskIntent(rawText) {
     }
   }
 
-  // ── 1.5 TASK_ARCHIVE（v3.1新增：查 ArchiveTasks，区别于上面只看 Tasks 近期完成的 TASK_HISTORY）
+  // ── 1.5 TASK_ARCHIVE（查 ArchiveTasks，区别于只看 Tasks 近期完成的 TASK_HISTORY）
   if (/^\/archive$/i.test(text) || /^(归档|已归档|归档记录)$/.test(text)) {
     return { intent: 'TASK_ARCHIVE' };
   }
@@ -73,16 +52,30 @@ function parseTaskIntent(rawText) {
   // ── 2. TASK_LIST ──────────────────────────────────────────────────────────
   var listPatterns = [
     /^(show|list|查看?|看看?|显示)(一下|下)?任务s?$/i,
-    /^(我的?|所有|全部)?任务(列表)?$/,       // 🐛 fix：(列表)? 改为可选
-    /^(我的?任务|待办任务|所有任务|全部任务)$/, // 显式覆盖高频歧义词
+    /^(我的?|所有|全部)?任务(列表)?$/,
+    /^(我的?任务|待办任务|所有任务|全部任务)$/,
     /^(待办|todo|todos)$/i,
-    /^\/(tasks?|todos?)$/i
+    /^\/(tasks?|todos?|mytasks)$/i
   ];
   for (var i = 0; i < listPatterns.length; i++) {
     if (listPatterns[i].test(text)) {
       return { intent: 'TASK_LIST' };
     }
   }
+
+  // ── 2.5 V4 新增：View/Dashboard/Search 指令 ────────────────────────────────
+  if (/^\/today$/i.test(text) || /^今天(任务)?$/.test(text))      return { intent: 'TASK_TODAY' };
+  if (/^\/week$/i.test(text)  || /^本周(任务)?$/.test(text))       return { intent: 'TASK_WEEK' };
+  if (/^\/month$/i.test(text) || /^本月(任务)?$/.test(text))       return { intent: 'TASK_MONTH' };
+  if (/^\/priority$/i.test(text) || /^(优先级|高优先级)(任务)?$/.test(text)) return { intent: 'TASK_PRIORITY' };
+  if (/^\/overdue$/i.test(text)  || /^逾期(任务)?$/.test(text))     return { intent: 'TASK_OVERDUE' };
+  if (/^\/upcoming$/i.test(text) || /^即将到来$/.test(text))        return { intent: 'TASK_UPCOMING' };
+  if (/^\/recurring$/i.test(text) || /^(重复|循环)(任务)?$/.test(text)) return { intent: 'TASK_RECURRING_VIEW' };
+  if (/^\/dashboard$/i.test(text) || /^仪表盘$/.test(text))          return { intent: 'TASK_DASHBOARD' };
+  if (/^\/stats$/i.test(text) || /^(统计|统计数据)$/.test(text))      return { intent: 'TASK_STATS' };
+
+  var searchM = text.match(/^\/search\s+(.+)$/i) || text.match(/^搜索\s*(.+)$/);
+  if (searchM) return { intent: 'TASK_SEARCH', keyword: searchM[1].trim() };
 
   // ── 3. TASK_DONE ──────────────────────────────────────────────────────────
   var doneM = text.match(/^(?:done|完成|finish|finished|\/done)\s+(TSK-[\w-]+)$/i);
@@ -97,7 +90,7 @@ function parseTaskIntent(rawText) {
     /^\/inventory/i,
     /^(added?|加了|入库|库存|买了|用了|剩)/,
     /^(设置|更新)过期/,
-    /^\//   // 🐛 fix：其余所有 /xxx 指令（未被前面捕获的）不当作任务创建
+    /^\//   // 其余所有 /xxx 指令（未被前面捕获的）不当作任务创建
   ];
   for (var j = 0; j < skipPatterns.length; j++) {
     if (skipPatterns[j].test(text)) return { intent: null };
@@ -128,7 +121,7 @@ function handleTaskIntent(rawText, chatId) {
   switch (parsed.intent) {
 
     case 'TASK_CREATE': {
-      var recurringLabel = _recurrenceRuleToLegacyString_(parsed.recurrence_rule);
+      var recurringLabel = RecurringEngine.ruleToLegacyString(parsed.recurrence_rule); // 21_RecurringEngine.gs
       var result = IdempotencyManager.createTaskIfNotExists(
         parsed.title,
         { due_date: parsed.due_date, recurring: recurringLabel },
@@ -136,45 +129,71 @@ function handleTaskIntent(rawText, chatId) {
       );
 
       if (!result.created) {
-        return {
-          matched:   true,
-          intent:    'TASK_CREATE',
-          data:      result.task,
-          replyText: _buildDuplicateTaskReply_(result.task)
-        };
+        return { matched: true, intent: 'TASK_CREATE', data: result.task, replyText: _buildDuplicateTaskReply_(result.task) };
       }
-
-      return {
-        matched:   true,
-        intent:    'TASK_CREATE',
-        data:      result.task,
-        replyText: _buildCreateReply_(result.task)
-      };
+      return { matched: true, intent: 'TASK_CREATE', data: result.task, replyText: _buildCreateReply_(result.task) };
     }
 
     case 'TASK_LIST': {
-      // v3.1：优先读 ActiveTasks（只有未完成任务，更快）
-      var tasks = _getActiveTasksForDisplay_(chatId);
+      var tasks = TaskQueryEngine.getPendingTasks(chatId); // 12_TaskQueryEngine.gs
       return { matched: true, intent: 'TASK_LIST', data: tasks, replyText: _buildListReply_(tasks) };
     }
 
     case 'TASK_HISTORY': {
-      // 读 Tasks Sheet 里已完成/已取消的任务（最新30条）
-      var doneTasks = _getCompletedTasksForDisplay_(chatId);
+      var doneTasks = TaskQueryEngine.getCompletedTasks(chatId).slice(0, 30);
       return { matched: true, intent: 'TASK_HISTORY', data: doneTasks, replyText: _buildHistoryReply_(doneTasks) };
     }
 
     case 'TASK_ARCHIVE': {
-      // v3.1新增：读 ArchiveTasks（区别于 TASK_HISTORY 只看 Tasks 里近期的）
-      var archivedTasks = ActiveTasksEngine.getArchivedTasks(chatId, 20); // 13_ActiveTasksEngine.gs
+      var archivedTasks = TaskQueryEngine.getArchivedTasks(chatId, 20);
       return { matched: true, intent: 'TASK_ARCHIVE', data: archivedTasks, replyText: _buildArchiveReply_(archivedTasks) };
     }
 
+    // ── V4 新增分支 ──────────────────────────────────────────────────────
+    case 'TASK_TODAY': {
+      var t = TaskQueryEngine.getTodayTasks(chatId);
+      return { matched: true, intent: 'TASK_TODAY', data: t, replyText: _buildSimpleListReply_('🔥 今天', t) };
+    }
+    case 'TASK_WEEK': {
+      var t = TaskQueryEngine.getWeekTasks(chatId);
+      return { matched: true, intent: 'TASK_WEEK', data: t, replyText: _buildSimpleListReply_('📅 本周', t) };
+    }
+    case 'TASK_MONTH': {
+      var t = TaskQueryEngine.getMonthTasks(chatId);
+      return { matched: true, intent: 'TASK_MONTH', data: t, replyText: _buildSimpleListReply_('🗓️ 本月', t) };
+    }
+    case 'TASK_PRIORITY': {
+      var t = TaskQueryEngine.getPriorityTasks(chatId);
+      return { matched: true, intent: 'TASK_PRIORITY', data: t, replyText: _buildPriorityReply_(t) };
+    }
+    case 'TASK_OVERDUE': {
+      var t = TaskQueryEngine.getOverdueTasks(chatId);
+      return { matched: true, intent: 'TASK_OVERDUE', data: t, replyText: _buildSimpleListReply_('⚠ 逾期', t) };
+    }
+    case 'TASK_UPCOMING': {
+      var t = TaskQueryEngine.getUpcomingTasks(chatId);
+      return { matched: true, intent: 'TASK_UPCOMING', data: t, replyText: _buildSimpleListReply_('⏭️ 即将到来', t) };
+    }
+    case 'TASK_RECURRING_VIEW': {
+      var t = TaskQueryEngine.getRecurringTasks(chatId);
+      return { matched: true, intent: 'TASK_RECURRING_VIEW', data: t, replyText: _buildRecurringReply_(t) };
+    }
+    case 'TASK_DASHBOARD': {
+      var text = TaskQueryEngine.getDashboard('today', chatId);
+      return { matched: true, intent: 'TASK_DASHBOARD', data: null, replyText: text };
+    }
+    case 'TASK_STATS': {
+      var text = TaskQueryEngine.getDashboard('statistics', chatId);
+      return { matched: true, intent: 'TASK_STATS', data: null, replyText: text };
+    }
+    case 'TASK_SEARCH': {
+      var t = TaskQueryEngine.searchTasks(chatId, parsed.keyword);
+      return { matched: true, intent: 'TASK_SEARCH', data: t, replyText: _buildSearchReply_(parsed.keyword, t) };
+    }
+
     case 'TASK_DONE': {
-      var completeResult = completeTask(parsed.task_id, chatId);
+      var completeResult = completeTask(parsed.task_id, chatId); // 20_TaskEngine.gs 全局 wrapper
       var doneReply = '✅ 完成: ' + parsed.task_id;
-      // v3.2：recurring任务完成后自动生成了下一次，在回复里确认给用户看，
-      // 别让用户像这次一样，不确定"到底有没有续上"
       if (completeResult && completeResult.next_task) {
         doneReply += '\n🔁 已自动创建下一次: ' + completeResult.next_task.task_id +
                      '（' + completeResult.next_task.due_date + '）';
@@ -183,7 +202,7 @@ function handleTaskIntent(rawText, chatId) {
     }
 
     case 'TASK_CANCEL': {
-      cancelTask(parsed.task_id, chatId);
+      cancelTask(parsed.task_id, chatId); // 20_TaskEngine.gs 全局 wrapper
       return { matched: true, intent: 'TASK_CANCEL', data: { task_id: parsed.task_id }, replyText: '🗑️ 取消: ' + parsed.task_id };
     }
   }
@@ -191,93 +210,7 @@ function handleTaskIntent(rawText, chatId) {
   return { matched: false };
 }
 
-// ============ 数据读取（本地工具，不走 QueryEngine） ============
-
-/**
- * 读 ActiveTasks Sheet（工作台，只有未完成任务）。
- * 如果 ActiveTasks Sheet 不存在，自动降级到 getPendingTasks(chatId)。
- */
-function _getActiveTasksForDisplay_(chatId) {
-  try {
-    var sheet = getSheet_('ActiveTasks');
-    var lastRow = sheet.getLastRow();
-    if (lastRow < 2) return [];
-
-    var headerMap = getHeaderMap_(sheet);
-    var chatIdIdx = headerMap['chat_id'];
-    var numCols   = sheet.getLastColumn();
-    var rows      = sheet.getRange(2, 1, lastRow - 1, numCols).getValues();
-
-    var tasks = [];
-    rows.forEach(function (row) {
-      if (chatIdIdx !== undefined && String(row[chatIdIdx]) !== String(chatId)) return;
-      var task = {};
-      for (var h in headerMap) task[h] = row[headerMap[h]];
-      tasks.push(task);
-    });
-    return tasks;
-
-  } catch (e) {
-    // ActiveTasks 尚未建立或读取失败 → 降级
-    Logger.log('[TaskIntentParser] ActiveTasks 读取失败，降级到 getPendingTasks: ' + e.message);
-    return getPendingTasks(chatId); // 20_ProductivityModule.gs
-  }
-}
-
-/**
- * 读 Tasks Sheet 里 DONE/CANCELLED 任务，最新优先，最多30条。
- */
-function _getCompletedTasksForDisplay_(chatId) {
-  try {
-    var sheet = getSheet_('Tasks');
-    var lastRow = sheet.getLastRow();
-    if (lastRow < 2) return [];
-
-    var headerMap = getHeaderMap_(sheet);
-    var chatIdIdx   = headerMap['chat_id'];
-    var statusIdx   = headerMap['status'];
-    var completedIdx = headerMap['completed_at'];
-    var numCols     = sheet.getLastColumn();
-    var rows        = sheet.getRange(2, 1, lastRow - 1, numCols).getValues();
-
-    var doneStatuses = { 'DONE': true, 'CANCELLED': true };
-    var tasks = [];
-    rows.forEach(function (row) {
-      var status = String(row[statusIdx] || '').toUpperCase();
-      if (!doneStatuses[status]) return;
-      if (chatIdIdx !== undefined && String(row[chatIdIdx]) !== String(chatId)) return;
-      var task = {};
-      for (var h in headerMap) task[h] = row[headerMap[h]];
-      tasks.push(task);
-    });
-
-    // 按 completed_at 降序（最新在前）
-    tasks.sort(function (a, b) {
-      var ta = a.completed_at ? new Date(a.completed_at).getTime() : 0;
-      var tb = b.completed_at ? new Date(b.completed_at).getTime() : 0;
-      return tb - ta;
-    });
-
-    return tasks.slice(0, 30); // 最多展示30条
-
-  } catch (e) {
-    Logger.log('[TaskIntentParser] _getCompletedTasksForDisplay_ 失败: ' + e.message);
-    return [];
-  }
-}
-
 // ============ 回复文案 ============
-
-function _recurrenceRuleToLegacyString_(rule) {
-  if (!rule || rule.interval !== 1) return '';
-  switch (rule.type) {
-    case 'DAILY':   return 'Daily';
-    case 'WEEKLY':  return 'Weekly';
-    case 'MONTHLY': return 'Monthly';
-    case 'YEARLY':  return 'Yearly';
-  }
-  return '';
-}
 
 function _buildCreateReply_(task) {
   var lines = ['✅ 已建任务', 'ID: ' + task.task_id, '标题: ' + task.title];
@@ -322,7 +255,6 @@ function _buildHistoryReply_(tasks) {
   return lines.join('\n');
 }
 
-/** v3.1新增：归档列表回复（读 ArchiveTasks，由 triggerDailyArchive 每日搬运过去的） */
 function _buildArchiveReply_(tasks) {
   if (!tasks || tasks.length === 0) return '📭 归档库是空的（任务要 DONE/CANCELLED 超过7天才会被自动搬进来）';
   var lines = ['🗄️ 归档记录（最近 ' + tasks.length + ' 条）'];
@@ -334,6 +266,41 @@ function _buildArchiveReply_(tasks) {
   return lines.join('\n');
 }
 
-// 注：_cleanTitle_ 已统一到 05_SheetUtils.gs，此处不再声明全局版本。
-// 06_TaskIntentParser 内部调用的 _cleanTitle_ 直接用 GAS 全局作用域找到
-// 05_SheetUtils.gs 里的声明。
+/** V4 新增：通用简单列表文案（今天/本周/本月/逾期/即将到来 共用） */
+function _buildSimpleListReply_(label, tasks) {
+  if (!tasks || tasks.length === 0) return label + '：没有任务';
+  var lines = [label + '（' + tasks.length + '）'];
+  tasks.forEach(function (t, idx) {
+    var due = t.due_date ? (' | ' + t.due_date) : '';
+    lines.push((idx + 1) + '. [' + t.task_id + '] ' + t.title + due);
+  });
+  return lines.join('\n');
+}
+
+function _buildPriorityReply_(tasks) {
+  if (!tasks || tasks.length === 0) return '🎯 优先级：没有待办任务';
+  var lines = ['🎯 优先级排序（' + tasks.length + '）'];
+  tasks.forEach(function (t, idx) {
+    lines.push((idx + 1) + '. [' + t.task_id + '] ' + t.title + ' — 分数 ' + t._priority_score +
+      '（' + (t.priority || 'MEDIUM') + '）');
+  });
+  return lines.join('\n');
+}
+
+function _buildRecurringReply_(tasks) {
+  if (!tasks || tasks.length === 0) return '🔁 没有重复任务';
+  var lines = ['🔁 重复任务（' + tasks.length + '）'];
+  tasks.forEach(function (t, idx) {
+    lines.push((idx + 1) + '. [' + t.task_id + '] ' + t.title + ' — ' + RecurringEngine.describeRule(t.recurring)); // 21_RecurringEngine.gs
+  });
+  return lines.join('\n');
+}
+
+function _buildSearchReply_(keyword, tasks) {
+  if (!tasks || tasks.length === 0) return '🔍 "' + keyword + '"：没有匹配结果';
+  var lines = ['🔍 "' + keyword + '"（' + tasks.length + ' 条结果）'];
+  tasks.forEach(function (t, idx) {
+    lines.push((idx + 1) + '. [' + t.task_id + '] ' + t.title);
+  });
+  return lines.join('\n');
+}

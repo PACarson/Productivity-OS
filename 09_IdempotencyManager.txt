@@ -1,19 +1,22 @@
 /**
  * 09_IdempotencyManager.gs
- * Productivity OS v3.1 — 幂等性管理器（Task）
+ * Productivity OS v4.0 — 幂等性管理器（Task）
  *
  * 职责：确保每个创建操作恰好执行一次（Exactly-Once Semantics）。
  * 所有模块创建 Task 必须经过本层，禁止直接 EventBus.publish('TASK_CREATED')。
  *
- * ⚠️ 2026-07-03 拆分说明：这是 Personal AI Core 09_IdempotencyManager.gs 的
- * Task 部分，Inventory/Reminder 部分留在 Core 项目自己的副本里。
+ * 【V4 修复 LOW RISK 2】原来调用裸全局函数 _createTaskDirect_，现在改成调用
+ * TaskEngine.createTaskDirect_（20_TaskEngine.gs 的 IIFE 内部方法）。行为
+ * 完全不变，只是把"裸全局函数耦合"换成"显式命名空间方法调用"，消除了
+ * "任何文件都能不小心碰到/覆盖 _createTaskDirect_"的风险面。见
+ * 00_Project_State.gs"已知Bug"第1条。
  *
- * v3.1 新增（2026-06-29，外部审计HIGH RISK 1，核实属实后采纳）：
+ * v3.1 历史（保留，逻辑不变）：
  *
- * 原问题：去重校验（读 Read Model）和创建写入（写 Events + 更新 Read Model）是两个
- * 分离的步骤，之间没有锁保护。当 Telegram Webhook 并发重试（或用户快速连按）触发两个
- * 执行实例同时跑时，两个实例会同时读到"任务不存在"，然后都走创建路径，
- * 导致 Tasks Sheet 出现两行完全相同的任务（幂等机制失效）。
+ * 原问题：去重校验（读 Read Model）和创建写入（写 Events + 更新 Read Model）
+ * 是两个分离的步骤，之间没有锁保护。当 Telegram Webhook 并发重试（或用户
+ * 快速连按）触发两个执行实例同时跑时，两个实例会同时读到"任务不存在"，
+ * 然后都走创建路径，导致 Tasks Sheet 出现两行完全相同的任务（幂等机制失效）。
  *
  * 修复：在"读取-校验-写入"全程用 LockService.getScriptLock() 包住，
  * 强制串行化。第一个执行完毕、锁释放后，第二个进来时 DeduplicationEngine
@@ -21,17 +24,15 @@
  *
  * ⚠️ 锁说明：
  *  - getScriptLock() 是进程级（Script）锁，同一个 GAS 部署（本项目）下所有
- *    并发执行共用。2026-07-03 拆分后：这把锁只保护本项目自己的并发执行，
- *    不跨项目——Personal AI Core 项目的 Inventory 创建走它自己独立的锁，
- *    两边不互相阻塞，也不需要互相阻塞（不同 Sheet/identity 空间）。
+ *    并发执行共用，只保护本项目自己的并发执行，不跨项目。
  *  - waitLock(10000) = 最多等 10 秒，超时则抛 "Could not obtain lock" 并向上传播。
  *  - 锁统一在 finally 块释放，保证不论成功/失败/异常都不死锁。
- *  - 注意：GAS LockService 锁不可重入。_createTaskDirect_ 不尝试再获取
+ *  - GAS LockService 锁不可重入。TaskEngine.createTaskDirect_ 不尝试再获取
  *    ScriptLock，所以安全。
  *
  * 依赖：
- *   07_IdentityEngine, 08_DeduplicationEngine
- *   _createTaskDirect_ — 20_ProductivityModule.gs 里的全局函数（同项目）
+ *   07_IdentityEngine, 08_DeduplicationEngine, 20_TaskEngine.gs
+ *   (TaskEngine.createTaskDirect_)
  */
 
 var IdempotencyManager = (function () {
@@ -42,7 +43,7 @@ var IdempotencyManager = (function () {
    * 创建任务（幂等，并发安全）
    *
    * @param {string} title
-   * @param {object} meta   { category, priority, due_date, recurring, context, budget, notes }
+   * @param {object} meta   { category, priority, due_date, recurring, context, budget, notes, description, tags }
    * @param {string} chatId
    * @returns {{ task: object, created: boolean }}
    */
@@ -71,7 +72,7 @@ var IdempotencyManager = (function () {
         return { task: existing, created: false };
       }
 
-      var task = _createTaskDirect_(title, meta, chatId, identity);
+      var task = TaskEngine.createTaskDirect_(title, meta, chatId, identity); // V4: 命名空间调用
       return { task: task, created: true };
 
     } finally {
@@ -105,7 +106,6 @@ var IdempotencyManager = (function () {
 
   function testConcurrentExecution() {
     Logger.log('=== IdempotencyManager.testConcurrentExecution ===');
-    Logger.log('v3.1 防线：ScriptLock（waitLock 10s）确保"读-校验-写"串行化。');
     Logger.log('三层总防线：');
     Logger.log('  防线1：ScriptLock             → 并发执行串行化（最强）');
     Logger.log('  防线2：EventBus._inExecIdentityCache_ → 同次执行内双写（补充）');

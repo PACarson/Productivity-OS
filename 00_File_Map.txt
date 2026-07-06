@@ -1,9 +1,9 @@
 /**
  * 00_File_Map.gs
- * Productivity OS v1.0 — 文件地图
+ * Productivity OS v4.0 — 文件地图
  *
  * 本文件只放两类内容：文件职责 / 模块关系。
- * LAST_UPDATED: 2026-07-03 — 从 Personal AI Core 拆分而来，首次创建。
+ * LAST_UPDATED: 2026-07-06 — V4：9 Engine 架构，Task Query Engine 中心化。
  */
 
 // ============================================================
@@ -11,53 +11,102 @@
 // ============================================================
 
 /**
- * 06_TaskIntentParser.gs — 逐字未改（从 Core 项目原样搬来）
- *   parseTaskIntent / handleTaskIntent，识别 TASK_CREATE / LIST / HISTORY /
- *   ARCHIVE / DONE / CANCEL。完整历史见 Core 项目 00_File_Map.gs 的旧记录
- *   （拆分前的版本历史）。
+ * ── Foundation ──────────────────────────────────────────────────────────
  *
- * 20_ProductivityModule.gs — 逐字未改
- *   _createTaskDirect_ / createTask / completeTask / cancelTask /
- *   getPendingTasks（委托 QueryEngine）/ deriveFromEvent / deriveTaskState_ /
- *   _materializeTaskRow_ / rebuildTasksSheet_。含 recurring 自动续期逻辑
- *   （_spawnNextRecurrenceIfNeeded_）。
- *
- * 13_ActiveTasksEngine.gs — 逐字未改
- *   runDailyArchive（每日冷归档，本项目自己的 createTriggers 挂载）/
- *   getArchivedTasks。
- *
- * 09_IdempotencyManager.gs — 【2026-07-03 精简】只保留 Task 部分：
- *   createTaskIfNotExists（ScriptLock 保护"读-校验-写"原子化）。
- *   Inventory/Reminder 部分留在 Core 项目自己的副本里。
- *
- * 10_ProjectionEngine.gs — 【2026-07-03 精简】只保留 Task/Reminder 的
- *   dispatch case：TASK_CREATED/TASK_COMPLETED/TASK_CANCELLED/
- *   REMINDER_SENT。Inventory 的 case 在 Core 项目自己的副本里。
- *
- * 12_QueryEngine.gs — 【2026-07-03 精简】只保留 getPendingTasks/
- *   getCompletedTasks/getTaskById。Inventory 查询在 Core 项目自己的
- *   副本里。
- *
- * 11_ProjectionRebuilder.gs — 完整保留（含 migrateAddIdentityColumns /
- *   rebuildTasksProjection / rebuildActiveTasksProjection /
- *   verifyProjection / compareProjectionWithEvents，全部原始函数都在，
- *   因为 deriveFromEvent 就在本项目里，不需要精简）。
- *
+ * 01_SecureConfig.gs — 本地副本，逐字未改。
+ * 05_SheetUtils.gs — 本地副本，逐字未改（getSheet_/getHeaderMap_/
+ *   upsertRowByKey_/deleteRowByKey_/batchUpsertRowsByKey_/isOverdue_/
+ *   parseDueDate_/round1_/round2_/shallowCopy_/_cleanTitle_）。
  * 07_IdentityEngine.gs — 本地副本，纯函数零依赖，逐字跟 Core 项目一致。
  * 08_DeduplicationEngine.gs — 本地副本，逐字未改。
- * 09_TemporalParser.gs — 本地副本，纯函数零依赖，逐字跟 Core 项目一致。
- * 01_SecureConfig.gs — 本地副本，逐字未改。
+ * 09_TemporalParser.gs — 本地副本，逐字未改（日期/时间/重复规则解析，
+ *   21_RecurringEngine.gs 包装它的重复规则相关函数对外暴露）。
+ *
+ * ── Runtime ─────────────────────────────────────────────────────────────
+ *
+ * 02_EventBus.gs — 本地副本，逐字未改（Events 表唯一写入口，本项目负责
+ *   的事件类型：TASK_CREATED / TASK_UPDATED（V4新增）/ TASK_COMPLETED /
+ *   TASK_CANCELLED / REMINDER_SENT）。
  * 03_Output.gs — 本地副本，逐字未改（本项目目前不直接调用，留着备用）。
+ * 06_TaskIntentParser.gs — 【V4 重写】parseTaskIntent / handleTaskIntent。
+ *   V4 变更：
+ *     1. 新增指令：/today /week /month /priority /overdue /upcoming
+ *        /recurring /dashboard /stats /search keyword（对应规格书
+ *        Telegram Commands 小节）。
+ *     2. 【架构违规修复】_getActiveTasksForDisplay_ /
+ *        _getCompletedTasksForDisplay_ 不再直接调 getSheet_/getHeaderMap_，
+ *        改成全部经由 12_TaskQueryEngine.gs（见 00_Project_State.gs
+ *        "已知Bug"第3条）。TaskIntentParser 现在不 import 05_SheetUtils.gs
+ *        的任何 Sheet 读取函数，只用它的 _cleanTitle_ 纯文本工具。
+ * 09_IdempotencyManager.gs — 【V4 微调】createTaskIfNotExists 内部调用改成
+ *   TaskEngine.createTaskDirect_(...)（原来是裸全局 _createTaskDirect_，
+ *   见 00_Project_State.gs "已知Bug"第1条修复）。
+ * 10_ProjectionEngine.gs — 【V4 扩展】dispatch 新增 TASK_UPDATED case；
+ *   新增对 TaskStatistics（计数器增量维护）和 TaskFilters（搜索用扁平表
+ *   逐行 upsert）两张 Projection 表的同步维护。
+ * 11_ProjectionRebuilder.gs — 【V4 修复+扩展】
+ *     1. 删除 rebuildInventoryProjection() / _markRemovedItemsConsumed_()
+ *        （本次审计新发现的 bug，见 00_Project_State.gs）。
+ *     2. 新增 rebuildStatisticsProjection() / rebuildTaskFiltersProjection()，
+ *        rebuildAllProjections() 改成依次调用 Tasks→ActiveTasks→
+ *        Statistics→TaskFilters 四个重建函数。
+ * 12_TaskQueryEngine.gs — 【V4 改名+中心化】原 12_QueryEngine.gs。
+ *   规格书要求的"centralized query API"：getTask / getTasks /
+ *   getTodayTasks / getWeekTasks / getMonthTasks / getOverdueTasks /
+ *   getUpcomingTasks / getRecurringTasks / getPriorityTasks / searchTasks /
+ *   getDashboard / getStatistics。
+ *   本项目唯一允许直接读 Tasks/ActiveTasks/TaskStatistics/TaskFilters 这几张
+ *   Sheet 的模块（00_Project_Constitution.gs P6 铁律5）；每次查询只批量读
+ *   一次 Sheet，读出来的任务数组转交给 View/Priority/Search/Dashboard/
+ *   Analytics 五个纯函数 Engine 做内存运算，自己不重复实现过滤逻辑。
+ * 20_TaskEngine.gs — 【V4 改名+IIFE封装】原 20_ProductivityModule.gs。
+ *   createTask / updateTask（V4新增） / completeTask / cancelTask /
+ *   createTaskDirect_（原_createTaskDirect_，改为 IIFE 内部方法，只允许
+ *   09_IdempotencyManager 调用）/ deriveFromEvent / deriveTaskState_ /
+ *   materializeTaskRow_（原_materializeTaskRow_）/ rebuildTasksSheet_。
+ *   保留同名全局函数 createTask/completeTask/cancelTask/getPendingTasks 作
+ *   向后兼容 wrapper，Core 项目 04_Main.gs 的既有 Library 调用不用改。
  *
- * 02_EventBus.gs — 【2026-07-03 modified】_sheet_() 改用
- *   SpreadsheetApp.openById(SecureConfig.getKey('SPREADSHEET_ID'))，其余
- *   逻辑跟 Core 项目一致。
- * 05_SheetUtils.gs — 【2026-07-03 modified】getSheet_() 同上改用 openById，
- *   其余函数逐字未改。
+ * ── Intelligence ────────────────────────────────────────────────────────
  *
- * 15_Setup.gs — 新文件（本项目专属）：setupSheets（建 Tasks/ActiveTasks/
- *   ArchiveTasks）/ createTriggers（挂 triggerDailyArchive）/
- *   repairSheetHeaders / runDiagnostics。
+ * 21_RecurringEngine.gs — 【V4 新增】recurring rules（包装
+ *   09_TemporalParser.gs 的重复规则解析）/ next occurrence（
+ *   computeNextDueDate，包装 computeNextDueDateFromLabel）/ recurrence
+ *   lifecycle（spawnNextIfNeeded，原 20_ProductivityModule.gs 的
+ *   _spawnNextRecurrenceIfNeeded_ 搬到这里，20_TaskEngine.completeTask
+ *   改成调用 RecurringEngine.spawnNextIfNeeded）。
+ * 22_PriorityEngine.gs — 【V4 新增】computePriorityScore / computeUrgencyScore /
+ *   suggestPriority。纯函数，输入是 TaskQueryEngine 已经读出的 task 对象，
+ *   不读 Sheet。永不自动改任务（00_Project_Constitution.gs P5）。
+ * 23_SearchEngine.gs — 【V4 新增】search(tasks, queryObj)。纯函数，支持
+ *   title/description/category/priority/status/date/date range/recurring/
+ *   tags/full text。输入来自 TaskQueryEngine.getTasks() + TaskFilters
+ *   Projection 表（预算好的 searchable_text/tags，避免每次查询都重新拼字符串）。
+ * 24_ViewEngine.gs — 【V4 新增】today/tomorrow/thisWeek/thisMonth/upcoming/
+ *   overdue/recurring/highPriority/completed/cancelled/archived 十一种视图
+ *   过滤器，纯函数，输入是 task 数组。
+ * 25_DashboardEngine.gs — 【V4 新增】buildTodayDashboard/buildWeeklyDashboard/
+ *   buildMonthlyDashboard/buildStatisticsDashboard，组合 ViewEngine +
+ *   AnalyticsEngine 的输出拼成规格书里的展示格式。不额外落盘（见
+ *   00_Project_Constitution.gs P7 架构决策）。
+ * 26_AnalyticsEngine.gs — 【V4 新增】completionRate/overdueRate/
+ *   reminderStatistics/recurringStatistics/workload，默认只读 Read Model
+ *   （TaskStatistics + Tasks）。唯一允许重放 Events 的例外：
+ *   replayCompletionTrend_()（历史趋势，Read Model 当前状态天然不包含时间
+ *   序列，见 00_Project_Constitution.gs P6 铁律4），此函数明确标注仅供
+ *   debug/深度分析场景手动调用，不在任何 Telegram 指令路径上。
+ *
+ * ── Testing/Setup ───────────────────────────────────────────────────────
+ *
+ * 15_Setup.gs — 【V4 扩展】setupSheets 新增建 TaskStatistics/TaskFilters
+ *   两张表；Tasks/ActiveTasks/ArchiveTasks 表头新增 description/tags 两列
+ *   （向后兼容追加列）；createTriggers/repairSheetHeaders/runDiagnostics
+ *   同步更新。13_ActiveTasksEngine.gs（Archive Engine）触发器不变。
+ * 13_ActiveTasksEngine.gs — 逐字未改（Blueprint 术语里对应 Archive Engine：
+ *   archive=runDailyArchive / restore=（暂无，见下方"下一步"）/
+ *   retention=DEFAULT_ARCHIVE_DAYS）。文件名保留 v3 命名，避免无意义的
+ *   改名 churn——Blueprint 分类见 00_Project_Constitution.gs P4 第2层
+ *   已经把它标注为 Archive Engine 的实现。
  */
 
 // ============================================================
@@ -65,22 +114,21 @@
 // ============================================================
 
 /**
- * 全部依赖都在本项目内部，没有一个函数需要跨项目调用（这是设计目标——
- * 见 Core 项目 Constitution 的 D2 Blueprint 说明：Library 依赖必须单向，
- * 本项目不能反过来调用 Core，所以本项目对外只暴露"入口函数"，内部所有
- * 支撑都自带一份本地副本）。
+ * 全部依赖都在本项目内部，没有一个函数需要跨项目调用。
  *
  * 06_TaskIntentParser.gs
  *   → 09_IdempotencyManager.gs  (createTaskIfNotExists)
- *   → 20_ProductivityModule.gs  (getPendingTasks, completeTask, cancelTask)
+ *   → 20_TaskEngine.gs  (completeTask, cancelTask)
+ *   → 12_TaskQueryEngine.gs  (getTodayTasks, getTasks, getDashboard, ...)
+ *   → 21_RecurringEngine.gs  (通过 _recurrenceRuleToLegacyString_ 间接，
+ *      仅做 legacy 字符串转换，不直接调 RecurringEngine 的续期逻辑)
  *   → 09_TemporalParser.gs  (extractDateTime)
- *   → 05_SheetUtils.gs  (_cleanTitle_, getSheet_, getHeaderMap_)
- *   → 13_ActiveTasksEngine.gs  (getArchivedTasks)
+ *   → 05_SheetUtils.gs  (_cleanTitle_，纯文本工具，不是 Sheet 读取)
  *
  * 09_IdempotencyManager.gs
  *   → 07_IdentityEngine.gs  (generateTaskIdentity)
  *   → 08_DeduplicationEngine.gs  (findExistingTask)
- *   → _createTaskDirect_  (20_ProductivityModule.gs 的全局函数)
+ *   → 20_TaskEngine.gs  (TaskEngine.createTaskDirect_)
  *   → LockService（GAS内建）
  *
  * 08_DeduplicationEngine.gs → 05_SheetUtils.gs (getSheet_, getHeaderMap_)
@@ -91,37 +139,61 @@
  *
  * 11_ProjectionRebuilder.gs
  *   → 02_EventBus.gs (getAllEvents)
- *   → 10_ProjectionEngine.gs (dispatch)
+ *   → 10_ProjectionEngine.gs (dispatch，仅用于对照，不依赖其内部实现)
  *   → 05_SheetUtils.gs (getSheet_, getHeaderMap_, upsertRowByKey_, batchUpsertRowsByKey_)
  *   → 07_IdentityEngine.gs (generateTaskIdentity)
- *   → 20_ProductivityModule.gs (deriveFromEvent)
+ *   → 20_TaskEngine.gs (deriveFromEvent)
  *
- * 12_QueryEngine.gs → 05_SheetUtils.gs (getSheet_, getHeaderMap_)
+ * 12_TaskQueryEngine.gs
+ *   → 05_SheetUtils.gs (getSheet_, getHeaderMap_)
+ *   → 24_ViewEngine.gs, 22_PriorityEngine.gs, 23_SearchEngine.gs,
+ *     25_DashboardEngine.gs, 26_AnalyticsEngine.gs
+ *   （TaskQueryEngine 是这五个纯函数 Engine 唯一的调用方之一——
+ *    05_DashboardEngine 内部也会调 24/26，但不会自己读 Sheet）
+ *
  * 13_ActiveTasksEngine.gs → 05_SheetUtils.gs (getSheet_, getHeaderMap_)
- *
- * 02_EventBus.gs
- *   → 01_SecureConfig.gs (getKey('SPREADSHEET_ID'), getKey('TELEGRAM_CHAT_ID'))
- *   → 03_Output.gs (sendMessage，Projection 失败告警用)
- *
- * 20_ProductivityModule.gs
- *   → 09_IdempotencyManager.gs (createTaskIfNotExists)
- *   → 12_QueryEngine.gs (getPendingTasks, getTaskById)
- *   → 09_TemporalParser.gs (computeNextDueDateFromLabel)
- *   → 02_EventBus.gs (publish, getAllEvents)
- *   → 05_SheetUtils.gs (upsertRowByKey_, deleteRowByKey_, shallowCopy_)
  *
  * 15_Setup.gs → 13_ActiveTasksEngine.gs (triggerDailyArchive，createTriggers挂载用)
  *
- * ── 架构铁律（跟 Core 项目一致，本项目范围内的版本）───────────────────
+ * 20_TaskEngine.gs
+ *   → 09_IdempotencyManager.gs (createTaskIfNotExists)
+ *   → 12_TaskQueryEngine.gs (getTask，completeTask取快照用)
+ *   → 21_RecurringEngine.gs (spawnNextIfNeeded)
+ *   → 02_EventBus.gs (publish, getAllEvents)
+ *   → 05_SheetUtils.gs (upsertRowByKey_, deleteRowByKey_, shallowCopy_)
+ *
+ * 21_RecurringEngine.gs
+ *   → 09_TemporalParser.gs (computeNextDueDateFromLabel)
+ *   → 09_IdempotencyManager.gs (createTaskIfNotExists，生成下一次实例用)
+ *
+ * 22_PriorityEngine.gs ← 纯函数，零 Sheet/Event 依赖
+ * 23_SearchEngine.gs   ← 纯函数，零 Sheet/Event 依赖
+ * 24_ViewEngine.gs     ← 纯函数，零 Sheet/Event 依赖
+ *
+ * 25_DashboardEngine.gs
+ *   → 24_ViewEngine.gs (今日/本周/逾期等视图过滤)
+ *   → 26_AnalyticsEngine.gs (统计数字)
+ *
+ * 26_AnalyticsEngine.gs
+ *   → 05_SheetUtils.gs (round1_/round2_，纯计算工具)
+ *   → 02_EventBus.gs (仅 replayCompletionTrend_ 例外调用 getAllEvents，
+ *      见文件头注释)
+ *
+ * ── 架构铁律（V4，见 00_Project_Constitution.gs P6 完整版本）─────────────
  * 1. 箭头只能往更底层指，禁止循环依赖；本项目不依赖 Core / Reminder OS
  *    的任何代码
  * 2. Events 表（共享）里 TASK_ 开头和 REMINDER_SENT 类型的事件只有本项目的
  *    02_EventBus.publish() 能写
- * 3. Tasks/ActiveTasks（Read Model）只有本项目的 10_ProjectionEngine 能写
- *    （_materializeTaskRow_ 是安全兜底，属例外）；ArchiveTasks 只有
- *    13_ActiveTasksEngine.runDailyArchive() 能写
- * 4. 所有查询必须经过 12_QueryEngine 或 13_ActiveTasksEngine，禁止直接
- *    derive Events
+ * 3. Tasks/ActiveTasks/TaskStatistics/TaskFilters（Read Model）只有本项目的
+ *    10_ProjectionEngine 能写（materializeTaskRow_ 是安全兜底，属例外）；
+ *    ArchiveTasks 只有 13_ActiveTasksEngine.runDailyArchive() 能写
+ * 4. 所有查询必须经过 12_TaskQueryEngine，禁止直接 derive Events，
+ *    禁止 View/Priority/Search/Dashboard/Analytics 五个纯函数 Engine
+ *    自己读 Sheet
  * 5. 所有 Create 操作必须经过 09_IdempotencyManager，禁止直接
- *    EventBus.publish CREATE 事件
+ *    EventBus.publish CREATE 事件；Update 操作经由 20_TaskEngine.updateTask
+ *    直接发 TASK_UPDATED（不需要幂等去重，因为不涉及"是否已存在"判断，
+ *    只是改已存在任务的字段）
+ * 6. 只有 26_AnalyticsEngine.gs 明确标注的历史趋势函数可以重放 Events，
+ *    其余任何模块（尤其是 Telegram 指令路径上的一切）禁止重放
  */

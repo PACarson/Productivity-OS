@@ -1,15 +1,147 @@
 /**
  * 00_Project_Constitution.gs
- * Productivity OS v1.0 — 项目宪法
+ * Productivity OS v4.0 — 项目宪法
  *
- * 本文件只放这个 OS 自己的东西。平台级原则（IMIOR、UDP、Domain OS
- * Blueprint、Engine 命名规范等）的权威定义在 Personal AI Core 项目的
- * 00_Project_Constitution.gs，这里只做「这个 OS 具体怎么套用」的记录，
- * 不重复定义，避免以后两边措辞不一致（drift）。
+ * 本文件只放这个 OS 自己的东西。平台级原则（IMIOR、UDP、Engine 命名规范等）
+ * 的权威定义在 Personal AI Core 项目的 00_Project_Constitution.gs，这里只做
+ * 「这个 OS 具体怎么套用」的记录，不重复定义，避免以后两边措辞不一致（drift）。
  *
  * 新窗口交接时，先贴这份文件 + Core 项目的 00_Project_Constitution.gs。
  *
- * LAST_UPDATED: 2026-07-03 — 从 Personal AI Core 物理拆分而来，首次创建。
+ * LAST_UPDATED: 2026-07-06 — V4 架构升级：CQRS 严格化 + Universal Domain OS
+ * Blueprint 落地 + Task Query Engine 中心化 + 8 个新 Engine 上线。
+ */
+
+// ============================================================
+// 零、Universal Domain OS Blueprint（标准模板，V4 新增）
+// ============================================================
+
+/**
+ * 以下是平台级「Universal Domain OS Blueprint」的标准模板，供本项目内部
+ * 交接、review、以及未来任何新 Domain OS（Property OS/Shopping OS/等）
+ * 对齐参考。这是模板本身（跟具体某个 Domain 无关的通用结构），下面
+ * 「一、P4」是这份模板在 Productivity OS 具体落地时每一格填的是哪个文件。
+ *
+ * Universal Domain OS Blueprint
+ *
+ * ├── 0. Governance
+ * │   ├── Project Constitution   — 本 OS 的宪法：定位/边界/铁律/架构决策
+ * │   ├── Project State          — 状态快照：已完成/进行中/已知Bug/下一步
+ * │   ├── File Map                — 文件职责 + 模块依赖方向
+ * │   └── ADR (Optional)          — 单项重大架构决策记录（本项目暂时把 ADR
+ * │                                 级别的决策直接写进 Constitution 对应
+ * │                                 小节并注明日期，未单独开 ADR 文件）
+ * │
+ * ├── 1. Foundation
+ * │   ├── Configuration           — 敏感配置 + 业务常量枚举
+ * │   ├── Schema                  — 各 Read Model 表的表头定义（唯一权威来源）
+ * │   ├── Identity                — 业务对象去重用的确定性身份生成（纯函数）
+ * │   ├── Event Definitions       — 本 OS 负责写入的事件类型清单
+ * │   ├── Permissions             — 谁能写哪张表 / 哪类事件
+ * │   └── Versioning               — 版本号 + 变更时间戳
+ * │
+ * ├── 2. Runtime（Domain Pattern，一次请求的完整生命周期）
+ * │   ├── Request                 — 接收原始输入（自然语言/指令）
+ * │   ├── Planner                 — 识别意图 + 抽取参数，不落盘
+ * │   ├── Decision                 — 给出建议/评分，永不自动执行
+ * │   ├── User Confirmation        — 需要用户明确确认才会进入 Execution
+ * │   ├── Execution                 — 真正调用业务逻辑（create/update/...）
+ * │   ├── Event                     — 写入事实到 Events 表（Write Model）
+ * │   ├── Projection                 — Events → Read Model 的增量更新
+ * │   └── Query                      — 唯一对外的查询入口，只读 Read Model
+ * │
+ * ├── 3. Intelligence
+ * │   ├── Knowledge                  — 需要维护的参考数据
+ * │   ├── Analytics                   — 统计类数字（完成率/逾期率/workload等）
+ * │   ├── Prediction                   — 预测类模型（跟 Decision 的"建议"不同，
+ * │                                      Prediction 通常基于历史数据推断
+ * │                                      未来，不是规则打分）
+ * │   ├── Suggestions                  — 面向用户的主动建议（跟 Decision 的
+ * │                                      区别：Decision 是"这次请求该怎么判"，
+ * │                                      Suggestions 是主动推送的、不依赖
+ * │                                      某次具体请求）
+ * │   ├── Insights                      — 行为洞察/长期趋势观察
+ * │   └── Learning                       — 从历史反馈调整未来建议（本 OS
+ * │                                      暂无实现，见下方 P4 第3层）
+ * │
+ * ├── 4. Integration
+ * │   ├── Bridge                          — 跟其他 Domain OS 互相触发
+ * │   ├── Connectors                       — 连接外部第三方服务
+ * │   ├── APIs                             — 对外暴露的 REST/其他 API
+ * │   ├── Import / Export                   — 批量导入导出
+ * │   └── External Systems                  — 外部系统集成点
+ * │
+ * └── 5. Testing
+ *     ├── Unit Tests                          — 单个函数/模块级别的测试
+ *     ├── Integration Tests                    — 多模块协作的端到端测试
+ *     ├── Migration Tests                       — Schema/Read Model 迁移验证
+ *     └── Validation                             — Read Model 与 Write Model
+ *                                                的一致性校验
+ *
+ * 使用方式：新开一个 Domain OS 时，按这张表逐格盘点"这一格我有没有对应
+ * 实现，如果没有是刻意留白还是遗漏"，写进该 OS 自己的 Constitution P4。
+ * 刻意留白的格子照样写"（暂无，原因）"，不要留空——这样下一次交接/审计
+ * 能一眼看出"没做"和"忘了做"的区别。
+ */
+
+// ============================================================
+// 零之二、核心流程（CQRS + Runtime Domain Pattern，V4 新增）
+// ============================================================
+
+/**
+ * 本 OS 的两条核心流程，是上面 Blueprint 里「1. Foundation」和
+ * 「2. Runtime」在数据流向上的具体体现，交接时建议跟 Blueprint 模板一起看：
+ *
+ * 流程 A：CQRS 写入链路（Write Model → Read Model）
+ *
+ *   Events（唯一 Write Model，只追加）
+ *     ↓ Projection（10_ProjectionEngine.gs，增量，O(1)）
+ *   Tasks（全量 Read Model，含所有状态）
+ *     ↓ Projection（同上，同步）
+ *   ActiveTasks（工作台，只有非终态任务）
+ *     ↓ Archive Engine（13_ActiveTasksEngine.runDailyArchive，每日定时，低频）
+ *   ArchiveTasks（冷归档库，只增不删）
+ *
+ *   同一条 Events 流也并行驱动：
+ *   Events → TaskStatistics（计数器增量，10_ProjectionEngine._bumpStatistics_）
+ *   Events → TaskFilters（搜索用扁平投影，10_ProjectionEngine._upsertTaskFilters_）
+ *
+ *   铁律：Events 只能追加；Tasks/ActiveTasks/TaskStatistics/TaskFilters 只能
+ *   被 Projection（增量）或 ProjectionRebuilder（全量重建，仅限迁移/修复）
+ *   写入；ArchiveTasks 只能被 Archive Engine 写入。任何查询路径都不允许
+ *   反过来读 Events 重放当查询用（唯一例外见流程B下方"例外"）。
+ *
+ * 流程 B：Runtime Domain Pattern（一次 Telegram 请求的生命周期）
+ *
+ *   Request（06_TaskIntentParser.parseTaskIntent，接收原始文字）
+ *     ↓
+ *   Planner（同文件内，识别意图 TASK_CREATE/TASK_DONE/TASK_TODAY/... + 抽参数）
+ *     ↓
+ *   Decision（22_PriorityEngine，仅在 /priority 等需要评分排序的路径上介入，
+ *            只产出建议分数，不改任何数据）
+ *     ↓
+ *   User Confirmation（用户已经在发指令这个动作本身里做了确认——
+ *            "done TSK-xxx" / "cancel TSK-xxx" 都是用户主动明确的指令，
+ *            不需要额外一轮"你确定吗"，除非未来接入 inline keyboard 二次确认）
+ *     ↓
+ *   Execution（20_TaskEngine.createTask/updateTask/completeTask/cancelTask，
+ *            经由 09_IdempotencyManager 的锁 + 幂等去重）
+ *     ↓
+ *   Event（02_EventBus.publish，唯一写入口，写完立即同步调 Projection）
+ *     ↓
+ *   Projection（10_ProjectionEngine.dispatch，增量更新全部 Read Model）
+ *     ↓
+ *   Query（12_TaskQueryEngine，本流程之外的"读"路径入口——注意 Query 不是
+ *            这条写入链路的下一步，而是任何时候需要展示数据时独立进入的
+ *            并行路径，只读 Read Model，见流程A）
+ *
+ *   例外（唯一允许偏离"Query 只读 Read Model"这条规则的场景）：
+ *     26_AnalyticsEngine.replayCompletionTrend_() 为了算历史时间序列
+ *     （"过去8周每周完成几个"），会重放 Events——因为这类数据 Read Model
+ *     的"当前状态快照"结构性地不包含。这是本 OS 唯一被允许重放 Events 的
+ *     函数，且明确不在任何 Telegram 指令路径上（见
+ *     00_Project_Constitution.gs P6 铁律4、00_File_Map.gs 26_AnalyticsEngine
+ *     小节）。
  */
 
 // ============================================================
@@ -18,54 +150,137 @@
 
 /**
  * P1. 定位
- *     Productivity OS 管 Task 的完整生命周期：创建/查询/完成/取消/
- *     recurring 续期/冷归档。范围比"任务"更广（Priority/Recurring/
- *     Search/Archive/Statistics/Dashboard 等 Engine 最终都会挂在这里），
- *     所以叫 Productivity OS，不是 Task OS（2026-07-03 Carson 确认）。
+ *     Productivity OS 是一个完整的「任务操作系统」，管 Task 的完整生命周期：
+ *     创建/更新/查询/完成/取消/recurring 续期/优先级建议/搜索/多维度视图/
+ *     仪表盘/统计分析/冷归档。V4 把这些能力拆成 9 个独立 Engine（见下方
+ *     P4 Blueprint 映射表），不再是单一模块。
  *
- * P2. 部署形态
+ * P2. 部署形态（不变）
  *     独立 Apps Script 项目，以 Library 形式被 Personal AI Core 引入
  *     （Identifier: ProductivityOS）。不接 Telegram webhook，被 Core 的
- *     04_Main.gs 调用（handleTaskIntent/completeTask 等）。
- *     Library 依赖方向单向：Core → ProductivityOS。本项目不依赖、不调用
- *     Core 的任何代码。
+ *     04_Main.gs 调用。Library 依赖方向单向：Core → ProductivityOS。
+ *     本项目不依赖、不调用 Core 的任何代码。
  *
- * P3. 数据边界
+ * P3. 数据边界（不变）
  *     跟 Personal AI Core / Reminder OS 共享同一个 Google Spreadsheet
  *     （SPREADSHEET_ID 三边一致）。本项目拥有 Tasks / ActiveTasks /
- *     ArchiveTasks 三张表的写入权（通过本项目自己的
- *     09_IdempotencyManager / 10_ProjectionEngine）。Events 表是共享的
- *     追加日志，本项目只追加自己的 TASK_ 开头和 REMINDER_SENT 事件，不改
- *     不删别的项目写的行。
+ *     ArchiveTasks / TaskStatistics / TaskFilters 五张表的写入权。Events 表
+ *     是共享的追加日志，本项目只追加自己的 TASK_ 开头和 REMINDER_SENT 事件。
  *
- * P4. Foundation / Runtime / Intelligence（D6 Blueprint 在本项目的落地）
- *       Foundation.Governance → 这三份文件（Constitution/State/File_Map）
- *       Foundation.Identity   → 07_IdentityEngine.gs（本地副本，纯函数，
- *                                跟 Core 的那份代码完全一致，可以放心
- *                                独立维护）
- *       Runtime.Domain Pattern → P6.2 Level 2（Core 定义），本项目的
- *                                Request=06_TaskIntentParser / Planner=
- *                                同文件内解析 / Decision=同文件内优先级
- *                                判断 / Confirmation=Telegram inline
- *                                keyboard 或直接文字确认 / Execution=
- *                                20_ProductivityModule / Event=本地
- *                                02_EventBus / Projection=本地
- *                                10_ProjectionEngine / Insights=（暂无，
- *                                复用 Core 的 93-96）/ Bridge=（暂无，
- *                                本项目目前不需要连外部系统）
- *       Intelligence.Knowledge → （暂无，Task domain 目前没有需要维护的
- *                                参考数据）
- *       Intelligence.Insights  → 暂时复用 Core 的 93_MemoryEngine 等（本
- *                                项目没有自己的副本，Core 的 93 直接读
- *                                共享 Events 表里的 TASK_* 事件）
- *       Intelligence.Bridge    → 暂无（本项目不连接外部系统）
+ * P4. Universal Domain OS Blueprint 在本项目的落地
  *
- * P5. 不变的东西（沿用 Core 宪法，这里重申，方便本项目单独开窗口时也能
- *     看到）：
- *       - AI 只建议，不自动执行（Core P4）——本项目的 Decision 阶段
- *         （比如判断优先级）永远只是提案，真正创建/完成/取消任务要么是
- *         用户明确发消息/点按钮触发，要么是已确认的 recurring 规则自动
- *         续期（这个例外在拆分前就存在，没有改变）。
+ *   0. Governance
+ *      Project Constitution / Project State / File Map
+ *        → 这三份文件（00_ 开头）。本项目暂无独立 ADR 文件，重大架构决策
+ *          直接写进 Constitution 的对应小节并注明日期（如下方 P6 CQRS 铁律、
+ *          P7 Dashboard 不落盘的决策）。
+ *
+ *   1. Foundation
+ *      Configuration        → 01_SecureConfig.gs（敏感配置）+
+ *                              20_TaskEngine.gs 里的 ProductivityConfig
+ *                              （业务常量：category/priority/recurring 枚举）
+ *      Schema                → 15_Setup.gs（Tasks/ActiveTasks/ArchiveTasks/
+ *                              TaskStatistics/TaskFilters 五张表的表头定义，
+ *                              唯一权威来源，别处不重复写字段列表）
+ *      Identity               → 07_IdentityEngine.gs（本地副本，纯函数）
+ *      Event Definitions      → 02_EventBus.gs 文件头注释里的事件类型清单
+ *                              （TASK_CREATED/UPDATED/COMPLETED/CANCELLED/
+ *                              REMINDER_SENT）
+ *      Permissions            → 00_File_Map.gs「架构铁律」小节（谁能写哪张表/
+ *                              哪类事件）
+ *      Versioning             → 本文件头的 LAST_UPDATED + 各文件头的版本号
+ *
+ *   2. Runtime（Domain Pattern，Core P6.2 Level 2 在本项目的落地）
+ *      Request                → 06_TaskIntentParser.gs（parseTaskIntent）
+ *      Planner                → 06_TaskIntentParser.gs 同文件内解析
+ *                              （识别意图 + 抽取参数，不落盘）
+ *      Decision               → 22_PriorityEngine.gs（优先级/紧急度建议，
+ *                              只建议不执行，见 P5）
+ *      User Confirmation      → Telegram inline keyboard 或直接文字确认
+ *                              （TASK_DONE/TASK_CANCEL 需要用户明确发指令）
+ *      Execution              → 20_TaskEngine.gs（create/update/complete/
+ *                              cancel）+ 21_RecurringEngine.gs（续期生成，
+ *                              经由 TaskEngine 同一路径）
+ *      Event                  → 02_EventBus.gs（Events 表唯一写入口）
+ *      Projection             → 10_ProjectionEngine.gs（实时增量）+
+ *                              11_ProjectionRebuilder.gs（全量重建/修复）
+ *      Query                  → 12_TaskQueryEngine.gs（Task Query Engine，
+ *                              唯一对外查询入口，见下方 P6 CQRS 铁律）
+ *
+ *   3. Intelligence
+ *      Knowledge              →（暂无，Task domain 目前没有需要维护的参考数据）
+ *      Analytics              → 26_AnalyticsEngine.gs（完成率/逾期率/提醒
+ *                              统计/recurring 统计/workload）
+ *      Prediction              →（暂无，Priority/Urgency Score 属于 Decision
+ *                              范畴，不是预测模型，归 22_PriorityEngine.gs）
+ *      Suggestions            → 22_PriorityEngine.gs（优先级建议，永不自动
+ *                              执行，只建议）
+ *      Insights                →（暂无，复用 Core 的 93_MemoryEngine 等，
+ *                              本项目没有自己的副本）
+ *      Learning                →（暂无）
+ *
+ *   4. Integration
+ *      Bridge                  →（暂无，本项目目前不需要连外部系统）
+ *      Connectors              →（暂无）
+ *      APIs                    →（暂无，本项目对外只有 Library 导出函数，
+ *                              没有独立 REST API）
+ *      Import / Export         →（暂无）
+ *      External Systems        →（暂无）
+ *
+ *   5. Testing
+ *      Unit Tests               → 各 Engine 文件内的 test* 函数（如
+ *                              07_IdentityEngine.testIdentity()、
+ *                              09_IdempotencyManager.testWebhookRetry()）
+ *      Integration Tests        → 15_Setup.gs 的 runDiagnostics()
+ *      Migration Tests           → 11_ProjectionRebuilder.gs 的
+ *                              verifyProjection() / compareProjectionWithEvents()
+ *      Validation                → 11_ProjectionRebuilder.gs 的
+ *                              _verifyActiveTasksConsistency_() 等
+ *
+ * P5. 不变的东西（沿用 Core 宪法，这里重申）
+ *       - AI 只建议，不自动执行（Core P4）——22_PriorityEngine.gs 的
+ *         Decision 阶段（优先级/紧急度）永远只是提案，真正创建/更新/完成/
+ *         取消任务要么是用户明确发消息/点按钮触发，要么是已确认的 recurring
+ *         规则自动续期（这个例外在 V3 就存在，V4 不变）。
  *       - Execution 层发指令，Event 是真正的写入事实，两者是先后关系，
- *         不是同一件事的两种说法（Core P6.2，2026-07-03 修正过的措辞）。
+ *         不是同一件事的两种说法（Core P6.2）。
+ *
+ * P6. CQRS 铁律（V4 新增，本次架构升级的核心）
+ *       1. Events 是唯一的 Write Model，只能追加，不能重放着当查询用。
+ *       2. Tasks / ActiveTasks / ArchiveTasks / TaskStatistics / TaskFilters
+ *          都是 Read Model（Projection），只能被 10_ProjectionEngine.gs（增量）
+ *          和 11_ProjectionRebuilder.gs（全量重建，仅限迁移/修复场景手动运行）
+ *          写入。
+ *       3. 任何 Telegram 指令（经由 06_TaskIntentParser.gs）禁止直接调用
+ *          EventBus.getAllEvents() / deriveTaskState_()，一律经过
+ *          12_TaskQueryEngine.gs 读 Read Model。
+ *       4. 唯一允许重放 Events 的例外是 26_AnalyticsEngine.gs 里明确标注为
+ *          「历史趋势」的函数（如 replayCompletionTrend_()）——因为「过去N周
+ *          每周完成几个」这种时间序列数据，Read Model 的当前状态快照结构性
+ *          地不包含，只有 Events 的时间轴才有。除此之外 AnalyticsEngine 的
+ *          日常统计（completionRate/overdueRate等当前值）一样只读
+ *          TaskStatistics/Tasks Read Model，不重放 Events。
+ *       5. 12_TaskQueryEngine.gs 是唯一允许直接读 Tasks/ActiveTasks/
+ *          TaskStatistics/TaskFilters 这几张 Sheet 的模块。View/Priority/
+ *          Search/Dashboard/Analytics 五个 Engine 都是纯函数：接收
+ *          TaskQueryEngine 已经读出来的任务数组做内存运算，自己不摸 Sheet、
+ *          不摸 Events。
+ *
+ * P7. Dashboard 不额外落盘的架构决策（2026-07-06，V4 设计决定）
+ *       原始设计草案里 Dashboard 被列为跟 TaskStatistics/TaskFilters 同级的
+ *       Projection 表。落地时发现 Dashboard（Today/Weekly/Monthly/Statistics）
+ *       本质是"以当前时刻为参照点"对 Tasks/ActiveTasks/TaskStatistics 三个
+ *       已经是 Read Model 的表做的一次组装展示——跟 Overdue/Today 视图是
+ *       同一类问题（哪些任务算"今天/逾期"，取决于查询发生的那一刻，不是
+ *       任何 Event 本身携带的信息，属于同一类"日历相对"计算，不是"事件驱动"
+ *       状态）。额外持久化一张 Dashboard Sheet 需要每天/每次查询前重算并
+ *       覆写，得不到任何一致性或性能收益（不像 TaskStatistics 的计数器可以
+ *       被 TASK_CREATED/COMPLETED 事件增量维护），反而多一张要跟着维护迁移
+ *       的表。
+ *       决定：Dashboard 由 25_DashboardEngine.gs 在查询时从
+ *       12_TaskQueryEngine.gs 已经读出的 Tasks/ActiveTasks/TaskStatistics
+ *       Read Model 现算现拼，不建物理 Dashboard Sheet。这仍然完全符合 P6
+ *       CQRS 铁律第 5 条（不碰 Events，只读其他 Read Model），只是不额外
+ *       持久化这一份「视图的视图」。TaskStatistics/TaskFilters 两张表按原计划
+ *       落地为真正的物理 Projection 表。
  */
