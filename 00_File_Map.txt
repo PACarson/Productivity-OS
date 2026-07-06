@@ -1,9 +1,12 @@
 /**
  * 00_File_Map.gs
- * Productivity OS v4.0 — 文件地图
+ * Productivity OS v4.3 — 文件地图
  *
  * 本文件只放两类内容：文件职责 / 模块关系。
- * LAST_UPDATED: 2026-07-06 — V4：9 Engine 架构，Task Query Engine 中心化。
+ * LAST_UPDATED: 2026-07-06 — V4.3：新增「三、Architecture Layer Map」，
+ * 把全部 21 个可执行文件（不含 00_ 开头的治理文档）归类到
+ * Presentation/Application/Domain/Infrastructure 四层中的唯一一层，
+ * 对应 00_Project_Constitution.gs 新增的「零之四、Dependency Rules」。
  */
 
 // ============================================================
@@ -82,13 +85,16 @@
  *   title/description/category/priority/status/date/date range/recurring/
  *   tags/full text。输入来自 TaskQueryEngine.getTasks() + TaskFilters
  *   Projection 表（预算好的 searchable_text/tags，避免每次查询都重新拼字符串）。
- * 24_ViewEngine.gs — 【V4 新增】today/tomorrow/thisWeek/thisMonth/upcoming/
+ * 24_ViewEngine.gs — 【V4 新增，属于 ADR-2026-07-06 定义的第4层 View/
+ *   Presentation Layer】today/tomorrow/thisWeek/thisMonth/upcoming/
  *   overdue/recurring/highPriority/completed/cancelled/archived 十一种视图
- *   过滤器，纯函数，输入是 task 数组。
- * 25_DashboardEngine.gs — 【V4 新增】buildTodayDashboard/buildWeeklyDashboard/
- *   buildMonthlyDashboard/buildStatisticsDashboard，组合 ViewEngine +
- *   AnalyticsEngine 的输出拼成规格书里的展示格式。不额外落盘（见
- *   00_Project_Constitution.gs P7 架构决策）。
+ *   过滤器，纯函数，输入是 task 数组，只做"整理数据"，不知道"Telegram"
+ *   是什么（见 00_ADR.gs ADR-2026-07-06 引擎职责划分）。
+ * 25_DashboardEngine.gs — 【V4 新增，属于第4层 View/Presentation Layer】
+ *   buildTodayDashboard/buildWeeklyDashboard/buildMonthlyDashboard/
+ *   buildStatisticsDashboard，只做"组合展示"：拼装 ViewEngine + PriorityEngine
+ *   + AnalyticsEngine 的输出成最终展示文案。不额外落盘、不重放 Events、
+ *   不知道"Telegram"是什么（完整论证见 00_ADR.gs ADR-2026-07-06）。
  * 26_AnalyticsEngine.gs — 【V4 新增】completionRate/overdueRate/
  *   reminderStatistics/recurringStatistics/workload，默认只读 Read Model
  *   （TaskStatistics + Tasks）。唯一允许重放 Events 的例外：
@@ -196,4 +202,82 @@
  *    只是改已存在任务的字段）
  * 6. 只有 26_AnalyticsEngine.gs 明确标注的历史趋势函数可以重放 Events，
  *    其余任何模块（尤其是 Telegram 指令路径上的一切）禁止重放
+ */
+
+// ============================================================
+// 三、Architecture Layer Map（V4.3 新增）
+// ============================================================
+
+/**
+ * 跟上面「二、模块关系」的区别：「二」画的是"谁调用谁"的具体函数级依赖图，
+ * 本节画的是每个文件在 Clean Architecture 四层里属于哪一层——这是更粗粒度
+ * 的分类，用来配合 00_Project_Constitution.gs「零之四、Dependency Rules」
+ * 检查"有没有箭头往上指"。00_ 开头的四份治理文档（Constitution/State/
+ * File Map/ADR）以及本次新增的 00_Roadmap.gs 不参与这个分层——它们属于
+ * Blueprint 的 Governance 顶层分类，跟"请求怎么被处理"这件事无关。
+ *
+ * Architecture Layer Map
+ *
+ * Presentation
+ *   06_TaskIntentParser.gs
+ *     ↓
+ * Application
+ *   08_DeduplicationEngine.gs
+ *   09_IdempotencyManager.gs
+ *   11_ProjectionRebuilder.gs
+ *   12_TaskQueryEngine.gs
+ *   15_Setup.gs
+ *   20_TaskEngine.gs
+ *     ↓
+ * Domain
+ *   07_IdentityEngine.gs
+ *   09_TemporalParser.gs
+ *   21_RecurringEngine.gs
+ *   22_PriorityEngine.gs
+ *   23_SearchEngine.gs
+ *   24_ViewEngine.gs
+ *   25_DashboardEngine.gs
+ *   26_AnalyticsEngine.gs
+ *     ↓
+ * Infrastructure
+ *   01_SecureConfig.gs
+ *   02_EventBus.gs
+ *   03_Output.gs
+ *   05_SheetUtils.gs
+ *   10_ProjectionEngine.gs
+ *   13_ActiveTasksEngine.gs
+ *
+ * 共 21 个文件，每个文件恰好出现一次（"所有文件必须归类到唯一 Layer"，
+ * 见需求方 Upgrade 4 原文）。分类理由简述：
+ *
+ *   Presentation（1个）：唯一"知道 Telegram 是什么"的文件——负责把用户
+ *   原始文字变成意图，把 Domain/Application 层返回的数据拼成 Telegram
+ *   看得懂的文案。
+ *
+ *   Application（6个）：这几个文件都是"协调 Domain + Infrastructure 完成
+ *   一个具体用例"，但自己不承载可复用的业务判断规则——09_IdempotencyManager
+ *   协调锁+去重+创建；08_DeduplicationEngine 是"检查 Read Model 里是否已
+ *   存在"这个应用层判断（直接读 Sheet，因此不能算 Domain，Domain 层规定
+ *   不摸 Sheet）；12_TaskQueryEngine 协调"读 Sheet 一次 + 分发给 5 个
+ *   Domain Engine"；20_TaskEngine 协调"发 Event + 调用 Recurring"完成
+ *   create/update/complete/cancel 四个用例；11_ProjectionRebuilder 和
+ *   15_Setup 协调"重放 Events/迁移 Schema"这类管理用例（这两个文件在
+ *   Blueprint 宏观分类里属于 Operations，跟这里的 Application 微观分层
+ *   是两套不同的问题，见 00_Project_Constitution.gs 零之四开头的说明）。
+ *
+ *   Domain（8个）：承载具体、可复用的业务规则，全部不摸 Sheet/Events（
+ *   09_TemporalParser 例外允许调用 Utilities/Session 这类 GAS 内建纯函数
+ *   API，不算 Infrastructure I/O）。22/23/24/25/26 五个是纯函数 Engine
+ *   （Architecture Principles 第2条）；07_IdentityEngine 是纯哈希计算；
+ *   21_RecurringEngine 基本纯函数，唯一的例外依赖见下方「已知例外」。
+ *
+ *   Infrastructure（6个）：直接做 I/O 或提供不含业务判断的机械工具——
+ *   02_EventBus（Events 表读写）、05_SheetUtils（Sheet 读写基础设施）、
+ *   10_ProjectionEngine（Read Model 写入）、01_SecureConfig（配置读取）、
+ *   03_Output（尚未启用的输出工具）、13_ActiveTasksEngine（机械的"按
+ *   retention 天数搬行"，不含打分/排序等业务判断，故不归 Domain）。
+ *
+ * 已知例外（跟 00_Project_Constitution.gs 零之四「已知例外」是同一件事，
+ * 这里只是从"文件归类"这个角度再确认一遍，不是第二个例外）：
+ *   21_RecurringEngine.gs（Domain）→ 09_IdempotencyManager.gs（Application）
  */
