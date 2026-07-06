@@ -1,6 +1,18 @@
 /**
  * 06_TaskIntentParser.gs
- * Productivity OS v4.0 — 任务意图解析器
+ * Productivity OS v4.2 — 任务意图解析器
+ *
+ * 【V4.2 审计修复】
+ *
+ * 1. HIGH RISK 1 配套修复：09_IdempotencyManager.gs 现在会在 3 秒内拿不到
+ *    锁时抛出 "SYSTEM_BUSY:" 开头的 Error（fail-fast，避免占用 Webhook
+ *    执行通道）。TASK_CREATE 分支现在 catch 住这个错误，回复用户"系统繁忙
+ *    请重试"，而不是让异常从 handleTaskIntent 裸抛出去。
+ *
+ * 2. MEDIUM RISK 1 配套修复：20_TaskEngine.completeTask/cancelTask 现在
+ *    会在任务不存在时拦截并返回 { not_found: true }（不再产生幽灵行）。
+ *    TASK_DONE/TASK_CANCEL 分支相应增加了对 not_found 的判断，回复
+ *    "找不到任务"而不是继续回"✅ 完成"这种误导性文案。
  *
  * 【V4 变更】
  *
@@ -122,11 +134,29 @@ function handleTaskIntent(rawText, chatId) {
 
     case 'TASK_CREATE': {
       var recurringLabel = RecurringEngine.ruleToLegacyString(parsed.recurrence_rule); // 21_RecurringEngine.gs
-      var result = IdempotencyManager.createTaskIfNotExists(
-        parsed.title,
-        { due_date: parsed.due_date, recurring: recurringLabel },
-        chatId
-      );
+
+      // 【V4.2 修复 HIGH RISK 1 的调用方那一半】09_IdempotencyManager.gs
+      // 把"3秒内没拿到锁"包装成 "SYSTEM_BUSY:" 开头的 Error 抛出来——这里
+      // 必须接住，给用户一句友好提示，不能让它从 handleTaskIntent 裸抛
+      // 出去（那样 Telegram Webhook 那头看到的就是一次失败的调用，用户
+      // 完全不知道发生了什么，还可能触发 Telegram 自己的重试）。
+      var result;
+      try {
+        result = IdempotencyManager.createTaskIfNotExists(
+          parsed.title,
+          { due_date: parsed.due_date, recurring: recurringLabel },
+          chatId
+        );
+      } catch (e) {
+        if (String(e.message || '').indexOf('SYSTEM_BUSY') === 0) {
+          Logger.log('[TaskIntentParser] TASK_CREATE 遇到 SYSTEM_BUSY，回复用户稍后重试: ' + e.message);
+          return {
+            matched: true, intent: 'TASK_CREATE', data: null,
+            replyText: '⏳ 系统当前写入较多，这个任务没建成，请几秒后重发一次。'
+          };
+        }
+        throw e; // 其他类型的错误不是本函数能处理的，原样往上抛
+      }
 
       if (!result.created) {
         return { matched: true, intent: 'TASK_CREATE', data: result.task, replyText: _buildDuplicateTaskReply_(result.task) };
@@ -193,6 +223,17 @@ function handleTaskIntent(rawText, chatId) {
 
     case 'TASK_DONE': {
       var completeResult = completeTask(parsed.task_id, chatId); // 20_TaskEngine.gs 全局 wrapper
+
+      // 【V4.2 配套 MEDIUM RISK 1 修复】completeTask 现在会在任务不存在时
+      // 拦截并返回 {next_task: null, not_found: true}，而不是继续发布事件
+      // 产生幽灵行——这里要把这个情况回复清楚，不能还是回"✅ 完成"。
+      if (completeResult && completeResult.not_found) {
+        return {
+          matched: true, intent: 'TASK_DONE', data: { task_id: parsed.task_id },
+          replyText: '❓ 找不到任务 ' + parsed.task_id + '，请检查 ID 是否正确（可以用 /mytasks 查看当前任务）。'
+        };
+      }
+
       var doneReply = '✅ 完成: ' + parsed.task_id;
       if (completeResult && completeResult.next_task) {
         doneReply += '\n🔁 已自动创建下一次: ' + completeResult.next_task.task_id +
@@ -202,7 +243,16 @@ function handleTaskIntent(rawText, chatId) {
     }
 
     case 'TASK_CANCEL': {
-      cancelTask(parsed.task_id, chatId); // 20_TaskEngine.gs 全局 wrapper
+      var cancelResult = cancelTask(parsed.task_id, chatId); // 20_TaskEngine.gs 全局 wrapper
+
+      // 【V4.2 配套 MEDIUM RISK 1 修复】同 TASK_DONE。
+      if (cancelResult && cancelResult.not_found) {
+        return {
+          matched: true, intent: 'TASK_CANCEL', data: { task_id: parsed.task_id },
+          replyText: '❓ 找不到任务 ' + parsed.task_id + '，请检查 ID 是否正确（可以用 /mytasks 查看当前任务）。'
+        };
+      }
+
       return { matched: true, intent: 'TASK_CANCEL', data: { task_id: parsed.task_id }, replyText: '🗑️ 取消: ' + parsed.task_id };
     }
   }
