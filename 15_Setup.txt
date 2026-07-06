@@ -1,235 +1,353 @@
 /**
- * 15_Setup.gs
- * Productivity OS v4.0 — 一键初始化
+ * 10_ProjectionEngine.gs
+ * Productivity OS v4.2 — Projection Engine（Read Model 实时更新器）
  *
- * 【V4 变更】
- *   1. Tasks/ActiveTasks/ArchiveTasks 表头新增 description/tags 两列
- *      （向后兼容追加列，不影响旧数据）。
- *   2. 新增 TaskStatistics / TaskFilters 两张 Projection 表。
- *   3. runDiagnostics 覆盖新表 + 新 Engine 的基本冒烟测试。
+ * 职责：EventBus.publish() 写完 Event 后立即调用本模块，将变更增量写入
+ * Read Model（Tasks / ActiveTasks / TaskStatistics / TaskFilters）。
  *
- * 使用顺序（重要，顺序不能反）：
- *   1. 先确认本项目 Script Properties 里的 SPREADSHEET_ID 已经设置成跟
- *      Personal AI Core 项目【同一张】Spreadsheet 的 ID。
- *   2. 跑一次 setupSheets() —— 建好全部五张表（幂等，已存在的表/列不会
- *      被破坏）。
- *   3. （仅从 V3 或更早版本迁移时需要）跑一次 migrateSchemaV4()（在
- *      11_ProjectionRebuilder.gs 里）。
- *   4. 本项目【不需要】单独 Deploy as Web App——它是被 Personal AI Core
- *      当 Library 调用的。
- *   5. 跑一次 createTriggers() —— 挂上本项目自己的定时任务。
- *   6.（仅首次上线/迁移、Events 已有历史 Task 事件时需要）跑一次
- *      rebuildAllProjections()（在 11_ProjectionRebuilder.gs 里）。
+ * 架构位置：
+ *   EventBus.publish() → [append Event] → ProjectionEngine.dispatch() → Read Model
+ *
+ * 设计原则：
+ *  - O(1) 更新：每个 Event 只读/写少量行，从不全表重放
+ *  - 非阻断：Projection 失败时记录日志但不抛错（Event 已经写入是真相，
+ *    Read Model 偶尔 stale 可以通过 11_ProjectionRebuilder 修复）
+ *  - 只写 Read Model，从不读 Events 表
+ *
+ * 【V4.2 审计修复】：
+ *   1. HIGH RISK 3（频繁同步 Sheet 读写）：projectTaskUpdated_ 之前对同一
+ *      个 task_id 读了两次 Tasks 行（一次判断 ActiveTasks 该不该同步、
+ *      一次为了拼 TaskFilters 的 searchable_text）。现在合并成一次读取
+ *      （before），后面 ActiveTasks 同步 / TaskFilters 刷新 / TaskStatistics
+ *      漂移修正三处共用同一份数据。
+ *   2. MEDIUM RISK 2（TaskStatistics 更新漂移）：新增 _adjustStatisticsForUpdate_，
+ *      当 TASK_UPDATED 改动了 recurring 或 chat_id 时同步调整
+ *      TaskStatistics 对应计数器，之前这类改动完全不会反映到统计表上。
+ *
+ * 【V4 扩展】相比 v3.1：
+ *   1. 新增 TASK_UPDATED case（对应 20_TaskEngine.updateTask 新功能）。
+ *   2. 新增对 TaskStatistics 表的增量维护（total/pending/done/cancelled/
+ *      recurring/reminder 累计计数器，见 projectStatistics_）。
+ *   3. 新增对 TaskFilters 表的维护（预算好的 searchable_text/tags_csv，
+ *      给 23_SearchEngine 未来做更大数据量搜索时用；当前实现下
+ *      23_SearchEngine 直接在 Tasks 行上过滤已经够快，TaskFilters 先维护
+ *      起来但暂未被读取路径依赖，属于面向未来的投影）。
+ *
+ * ActiveTasks Sheet 是"每天工作台"，永远只存 PENDING/IN_PROGRESS/WAITING 任务。
+ * 维护策略：同步写，不做定时重建，保证 Tasks 与 ActiveTasks 之间没有不一致窗口。
+ *
+ *   TASK_CREATED   → upsert Tasks + upsert ActiveTasks + upsert TaskFilters
+ *                     + increment TaskStatistics
+ *   TASK_UPDATED   → upsert Tasks（+ ActiveTasks，如果任务当前非终态）
+ *                     + upsert TaskFilters（重新拼 searchable_text）
+ *                     + 如有需要，调整 TaskStatistics（V4.2新增）
+ *   TASK_COMPLETED → upsert Tasks（标 DONE）+ deleteRowByKey_ ActiveTasks
+ *                     + increment TaskStatistics
+ *   TASK_CANCELLED → upsert Tasks（标 CANCELLED）+ deleteRowByKey_ ActiveTasks
+ *                     + increment TaskStatistics
+ *   REMINDER_SENT  → upsert Tasks（reminder_count+1）+ increment TaskStatistics
+ *
+ * 注：锁（ScriptLock）由上游 IdempotencyManager 持有，ProjectionEngine 本身不再
+ * 获取锁（防止与 IdempotencyManager 的锁形成重入死锁）。
+ *
+ * 依赖：05_SheetUtils（upsertRowByKey_, deleteRowByKey_, getSheet_, getHeaderMap_）
  */
 
-// ============ 1. 建表 ============
+var ProjectionEngine = (function () {
 
-function setupSheets() {
-  var id = SecureConfig.getKey('SPREADSHEET_ID');
-  if (!id) {
-    Logger.log('❌ 先设置 SPREADSHEET_ID: SecureConfig.setKey("SPREADSHEET_ID", "跟Core项目一样的Spreadsheet ID")');
-    return;
-  }
-  var ss = SpreadsheetApp.openById(id);
+  var TASKS_SHEET        = 'Tasks';
+  var ACTIVE_TASKS_SHEET = 'ActiveTasks';
+  var TASK_STATS_SHEET   = 'TaskStatistics';
+  var TASK_FILTERS_SHEET = 'TaskFilters';
 
-  _ensureSheet_(ss, 'Tasks', [
-    'task_id', 'timestamp', 'title', 'category', 'status', 'due_date',
-    'recurring', 'priority', 'context', 'budget', 'notes', 'description',
-    'tags', 'chat_id', 'completed_at', 'reminder_count', 'identity', 'archived'
-  ]);
+  // ============ 入口 ============
 
-  _ensureSheet_(ss, 'ActiveTasks', [
-    'task_id', 'timestamp', 'title', 'category', 'status', 'due_date',
-    'recurring', 'priority', 'context', 'budget', 'notes', 'description',
-    'tags', 'chat_id', 'completed_at', 'reminder_count', 'identity'
-  ]);
-
-  _ensureSheet_(ss, 'ArchiveTasks', [
-    'task_id', 'timestamp', 'title', 'category', 'status', 'due_date',
-    'recurring', 'priority', 'context', 'budget', 'notes', 'description',
-    'tags', 'chat_id', 'completed_at', 'reminder_count', 'identity', 'archived_at'
-  ]);
-
-  // V4 新增：TaskStatistics（每 chat_id 一行的累计计数器，10_ProjectionEngine 增量维护）
-  _ensureSheet_(ss, 'TaskStatistics', [
-    'chat_id', 'total_count', 'pending_count', 'done_count', 'cancelled_count',
-    'recurring_count', 'reminder_count_total', 'last_updated_at'
-  ]);
-
-  // V4 新增：TaskFilters（每 task_id 一行的搜索用扁平投影）
-  _ensureSheet_(ss, 'TaskFilters', [
-    'task_id', 'chat_id', 'searchable_text', 'tags_csv'
-  ]);
-
-  Logger.log('✅ Sheets 就位: Tasks, ActiveTasks, ArchiveTasks, TaskStatistics, TaskFilters（Events 由 Core 项目建）');
-  Logger.log('下一步: 如果 Tasks 已有旧数据（V3 或更早） → migrateSchemaV4()；然后 createTriggers()');
-}
-
-function _ensureSheet_(ss, name, headers) {
-  var sheet = ss.getSheetByName(name);
-  if (!sheet) {
-    sheet = ss.insertSheet(name);
-  }
-  if (sheet.getLastRow() === 0) {
-    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-    sheet.setFrozenRows(1);
-    sheet.getRange(2, 1, Math.max(sheet.getMaxRows() - 1, 1), headers.length).setNumberFormat('@');
-  }
-  return sheet;
-}
-
-// ============ 2. 定时触发器 ============
-
-/**
- * 本项目只有一个定时任务：triggerDailyArchive（每天凌晨2点，见
- * 13_ActiveTasksEngine.gs 的 runDailyArchive）。V4 没有新增触发器——
- * TaskStatistics/TaskFilters 都是事件驱动的同步增量维护，不需要定时任务；
- * 如果发现漂移，手动跑 11_ProjectionRebuilder.gs 的对应 rebuild 函数即可。
- */
-function createTriggers() {
-  var handlerNames = ['triggerDailyArchive'];
-  ScriptApp.getProjectTriggers().forEach(function (t) {
-    if (handlerNames.indexOf(t.getHandlerFunction()) !== -1) {
-      ScriptApp.deleteTrigger(t);
-    }
-  });
-
-  ScriptApp.newTrigger('triggerDailyArchive').timeBased().everyDays(1).atHour(2).create();
-
-  Logger.log('✅ Productivity OS 自己的触发器挂好了:');
-  Logger.log('  triggerDailyArchive — 每天 02:00 左右（冷归档）');
-}
-
-// ============ 修复：表头被污染 ============
-
-function repairSheetHeaders() {
-  _repairOneSheetHeader_('Tasks', [
-    'task_id', 'timestamp', 'title', 'category', 'status', 'due_date',
-    'recurring', 'priority', 'context', 'budget', 'notes', 'description',
-    'tags', 'chat_id', 'completed_at', 'reminder_count', 'identity', 'archived'
-  ]);
-  _repairOneSheetHeader_('ActiveTasks', [
-    'task_id', 'timestamp', 'title', 'category', 'status', 'due_date',
-    'recurring', 'priority', 'context', 'budget', 'notes', 'description',
-    'tags', 'chat_id', 'completed_at', 'reminder_count', 'identity'
-  ]);
-  _repairOneSheetHeader_('ArchiveTasks', [
-    'task_id', 'timestamp', 'title', 'category', 'status', 'due_date',
-    'recurring', 'priority', 'context', 'budget', 'notes', 'description',
-    'tags', 'chat_id', 'completed_at', 'reminder_count', 'identity', 'archived_at'
-  ]);
-  _repairOneSheetHeader_('TaskStatistics', [
-    'chat_id', 'total_count', 'pending_count', 'done_count', 'cancelled_count',
-    'recurring_count', 'reminder_count_total', 'last_updated_at'
-  ]);
-  _repairOneSheetHeader_('TaskFilters', [
-    'task_id', 'chat_id', 'searchable_text', 'tags_csv'
-  ]);
-}
-
-function _repairOneSheetHeader_(name, headers) {
-  var id = SecureConfig.getKey('SPREADSHEET_ID');
-  var ss = SpreadsheetApp.openById(id);
-  var sheet = ss.getSheetByName(name);
-  if (!sheet) {
-    Logger.log('❌ ' + name + ' 不存在，先跑 setupSheets()');
-    return;
-  }
-
-  var firstCell = String(sheet.getRange(1, 1).getValue()).trim();
-  if (firstCell === headers[0]) {
-    Logger.log('✅ ' + name + ' 表头是对的（第一格="' + firstCell + '"），跳过');
-    return;
-  }
-
-  Logger.log('⚠️ ' + name + ' 第一行不是表头（第一格="' + firstCell + '"），插入正确表头行，原有数据往下挪一行');
-  sheet.insertRowBefore(1);
-  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-  sheet.setFrozenRows(1);
-  sheet.getRange(2, 1, Math.max(sheet.getMaxRows() - 1, 1), headers.length).setNumberFormat('@');
-  Logger.log('✅ ' + name + ' 表头已修复');
-}
-
-// ============ 一键跑完第一步 ============
-
-function setupAll() {
-  setupSheets();
-  Logger.log('=== 第一步完成 ===');
-  Logger.log('接下来: 1) migrateSchemaV4()（如有 V3 或更早的旧数据）  2) Deploy as Library  ' +
-    '3) 去 Core 项目 Editor→Libraries 加上本项目当 "ProductivityOS"  4) createTriggers()');
-}
-
-// ============ 诊断：不碰 Telegram，直接看本项目状态 ============
-
-function runDiagnostics() {
-  Logger.log('========== Productivity OS V4 诊断开始 ==========');
-
-  var id = SecureConfig.getKey('SPREADSHEET_ID');
-  if (!id) {
-    Logger.log('❌ SPREADSHEET_ID 没设置，下面的检查会全部失败');
-  }
-  var ss = id ? SpreadsheetApp.openById(id) : null;
-
-  ['Tasks', 'ActiveTasks', 'ArchiveTasks', 'TaskStatistics', 'TaskFilters'].forEach(function (name) {
-    if (!ss) return;
-    var sheet = ss.getSheetByName(name);
-    if (!sheet) {
-      Logger.log('❌ Sheet "' + name + '" 不存在！先跑 setupSheets()');
-    } else {
-      Logger.log('✅ Sheet "' + name + '" 存在，表头: ' + JSON.stringify(sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0]));
-      Logger.log('   当前行数（含表头）: ' + sheet.getLastRow());
-    }
-  });
-
-  var testChatId = 'diagnostic_test_chat';
-
-  try {
-    var parsed = parseTaskIntent('提醒我明天3点交房租');
-    Logger.log('✅ parseTaskIntent 测试结果: ' + JSON.stringify(parsed));
-  } catch (e) {
-    Logger.log('❌ parseTaskIntent 本身就报错: ' + e.message + '\n' + e.stack);
-  }
-
-  var testTaskId = null;
-  try {
-    var task = createTask('诊断测试任务-可以删除', { category: 'GENERAL', notes: 'DIAGNOSTIC_TEST_TEMP' }, testChatId);
-    testTaskId = task.task_id;
-    Logger.log('✅ createTask 测试结果: ' + JSON.stringify(task));
-  } catch (e) {
-    Logger.log('❌ createTask 报错: ' + e.message + '\n' + e.stack);
-  }
-
-  if (testTaskId) {
+  function dispatch(event) {
     try {
-      var updated = updateTask(testTaskId, { notes: 'DIAGNOSTIC_TEST_TEMP_UPDATED' }, testChatId);
-      Logger.log('✅ updateTask 测试结果: ' + JSON.stringify(updated));
+      var type = event.type;
+      switch (type) {
+        case 'TASK_CREATED':   projectTaskCreated_(event);   break;
+        case 'TASK_UPDATED':   projectTaskUpdated_(event);   break;
+        case 'TASK_COMPLETED': projectTaskCompleted_(event); break;
+        case 'TASK_CANCELLED': projectTaskCancelled_(event); break;
+        case 'REMINDER_SENT':  projectReminderSent_(event);  break;
+
+        default:
+          break;
+      }
     } catch (e) {
-      Logger.log('❌ updateTask 报错: ' + e.message + '\n' + e.stack);
+      Logger.log('[ProjectionEngine] ERROR dispatching ' + (event && event.type) + ': ' + e.message);
     }
+  }
+
+  // ============ Task Projectors ============
+
+  function projectTaskCreated_(event) {
+    var p = event.payload || {};
+    if (!p.task_id) return;
+
+    upsertRowByKey_(TASKS_SHEET, 'task_id', p.task_id, p);
 
     try {
-      var pending = TaskQueryEngine.getPendingTasks(testChatId);
-      Logger.log('✅ TaskQueryEngine.getPendingTasks 测试结果，共 ' + pending.length + ' 条');
+      upsertRowByKey_(ACTIVE_TASKS_SHEET, 'task_id', p.task_id, p);
     } catch (e) {
-      Logger.log('❌ TaskQueryEngine.getPendingTasks 报错: ' + e.message + '\n' + e.stack);
+      Logger.log('[ProjectionEngine] ActiveTasks upsert 失败（Sheet 可能尚未建立）: ' + e.message);
     }
 
+    _upsertTaskFilters_(p.task_id, p);
+    _bumpStatistics_(p.chat_id, { total: 1, pending: 1, recurring: p.recurring ? 1 : 0 });
+  }
+
+  /** V4 新增 */
+  function projectTaskUpdated_(event) {
+    var p = event.payload || {};
+    if (!p.task_id) return;
+
+    var fields = shallowCopy_(p);
+    delete fields.task_id;
+    if (Object.keys(fields).length === 0) return;
+
+    // 【V4.2 修复 HIGH RISK 3 之一】之前这里对同一个 task_id 读了两次
+    // Tasks 行（一次判断 ActiveTasks 该不该同步、一次为了拼 TaskFilters 的
+    // searchable_text）。改成只读一次，'before' 在下面被 ActiveTasks 同步、
+    // TaskFilters 刷新、TaskStatistics 漂移修正三处共用。
+    var before = _getRowByKey_(TASKS_SHEET, 'task_id', p.task_id);
+
+    upsertRowByKey_(TASKS_SHEET, 'task_id', p.task_id, fields);
+
+    // 只有当任务当前还是非终态才需要同步 ActiveTasks（终态任务本来就不在
+    // ActiveTasks 里，upsert 一个不存在的 key 会误新增一行——upsertRowByKey_
+    // 找不到就 append，所以这里用 before 的状态判断，避免把已完成/取消的
+    // 任务意外重新塞回工作台）
     try {
-      var dash = TaskQueryEngine.getDashboard('today', testChatId);
-      Logger.log('✅ TaskQueryEngine.getDashboard 测试结果:\n' + dash);
+      var status = before ? String(before.status || '').toUpperCase() : '';
+      if (status !== 'DONE' && status !== 'CANCELLED') {
+        upsertRowByKey_(ACTIVE_TASKS_SHEET, 'task_id', p.task_id, fields);
+      }
     } catch (e) {
-      Logger.log('❌ TaskQueryEngine.getDashboard 报错: ' + e.message + '\n' + e.stack);
+      Logger.log('[ProjectionEngine] ActiveTasks update 同步失败: ' + e.message);
     }
 
-    try {
-      cancelTask(testTaskId, testChatId);
-      Logger.log('✅ 已自动取消诊断测试任务');
-    } catch (e) {
-      Logger.log('❌ cancelTask 报错: ' + e.message + '\n' + e.stack);
+    if (before) {
+      // 重新拼 searchable_text 需要完整字段（title/description/tags/category
+      // 都可能没在这次 update 的 payload 里），用 before + 本次改动合并即可，
+      // 不需要再查一次 Sheet。
+      var merged = shallowCopy_(before);
+      for (var k in fields) merged[k] = fields[k];
+      _upsertTaskFilters_(p.task_id, merged);
+
+      // 【V4.2 修复 MEDIUM RISK 2：TaskStatistics 漂移】
+      // recurring 或 chat_id 变更会让 TaskStatistics 的累计计数器失真——
+      // 之前 projectTaskUpdated_ 完全没有触发 _bumpStatistics_，见
+      // _adjustStatisticsForUpdate_ 的详细说明。
+      _adjustStatisticsForUpdate_(before, merged);
     }
   }
 
-  Logger.log('⚠️ 这些是本项目内部测试，不代表 Core 项目能成功调用本项目（Library 引入是否');
-  Logger.log('   配置正确要去 Core 项目那边测：ProductivityOS.handleTaskIntent(...)）。');
-  Logger.log('========== 诊断结束 ==========');
-}
+  /**
+   * 【V4.2 新增，修复 MEDIUM RISK 2】TaskStatistics 是靠
+   * TASK_CREATED/COMPLETED/CANCELLED/REMINDER_SENT 四类事件增量维护的
+   * 累计计数器（见 _bumpStatistics_）。TASK_UPDATED 之前完全没有触发过
+   * 任何调整——如果这次更新把一个 recurring 任务改成一次性的（或反过来），
+   * 或者把任务的 chat_id 改到了另一个用户名下，TaskStatistics 里的
+   * recurring_count / 各 chat_id 的计数就会跟 Tasks 表实际内容悄悄脱节，
+   * 且不会有任何报错——只会让 /stats 展示的数字越来越不可信。
+   *
+   * 处理两种情况：
+   *  (a) chat_id 没变、只是 recurring 从"有"变"无"或反过来 → 对应
+   *      chat_id 的 recurring_count ±1。
+   *  (b) chat_id 变了（任务被重新指派给另一个用户）→ 把这个任务在
+   *      total/pending-done-cancelled/recurring/reminder 各项上的贡献，
+   *      整体从旧 chat_id 名下减掉、加到新 chat_id 名下（按 before 的
+   *      status/reminder_count 计算，因为这次 update 本身不改变任务的
+   *      完成状态）。
+   *
+   * @param {object} before  更新前的完整 Tasks 行
+   * @param {object} after   更新后的完整字段（before 与本次 fields 合并）
+   */
+  function _adjustStatisticsForUpdate_(before, after) {
+    var oldChat = before.chat_id || '';
+    var newChat = after.chat_id  || '';
+    var oldRecurring = !!before.recurring;
+    var newRecurring = !!after.recurring;
+
+    if (oldChat === newChat) {
+      if (oldRecurring !== newRecurring) {
+        _bumpStatistics_(newChat, { recurring: newRecurring ? 1 : -1 });
+      }
+      return;
+    }
+
+    // chat_id 被改了：把这个任务的全部计数从旧 chat_id 迁到新 chat_id
+    var status = String(before.status || '').toUpperCase();
+    var isPending = status !== 'DONE' && status !== 'CANCELLED';
+    var reminderCount = Number(before.reminder_count) || 0;
+
+    _bumpStatistics_(oldChat, {
+      total:     -1,
+      pending:   isPending ? -1 : 0,
+      done:      status === 'DONE' ? -1 : 0,
+      cancelled: status === 'CANCELLED' ? -1 : 0,
+      recurring: oldRecurring ? -1 : 0,
+      reminder:  -reminderCount
+    });
+    _bumpStatistics_(newChat, {
+      total:     1,
+      pending:   isPending ? 1 : 0,
+      done:      status === 'DONE' ? 1 : 0,
+      cancelled: status === 'CANCELLED' ? 1 : 0,
+      recurring: newRecurring ? 1 : 0,
+      reminder:  reminderCount
+    });
+  }
+
+  function projectTaskCompleted_(event) {
+    var p = event.payload || {};
+    if (!p.task_id) return;
+
+    var completedAt = event.timestamp || new Date().toISOString();
+    var current = _getRowByKey_(TASKS_SHEET, 'task_id', p.task_id);
+
+    upsertRowByKey_(TASKS_SHEET, 'task_id', p.task_id, {
+      status:       'DONE',
+      completed_at: completedAt
+    });
+
+    try {
+      deleteRowByKey_(ACTIVE_TASKS_SHEET, 'task_id', p.task_id);
+    } catch (e) {
+      Logger.log('[ProjectionEngine] ActiveTasks 删除失败（Sheet 可能尚未建立）: ' + e.message);
+    }
+
+    _bumpStatistics_(event.chat_id || (current && current.chat_id), { pending: -1, done: 1 });
+  }
+
+  function projectTaskCancelled_(event) {
+    var p = event.payload || {};
+    if (!p.task_id) return;
+
+    var current = _getRowByKey_(TASKS_SHEET, 'task_id', p.task_id);
+
+    upsertRowByKey_(TASKS_SHEET, 'task_id', p.task_id, {
+      status: 'CANCELLED'
+    });
+
+    try {
+      deleteRowByKey_(ACTIVE_TASKS_SHEET, 'task_id', p.task_id);
+    } catch (e) {
+      Logger.log('[ProjectionEngine] ActiveTasks 删除失败（Sheet 可能尚未建立）: ' + e.message);
+    }
+
+    _bumpStatistics_(event.chat_id || (current && current.chat_id), { pending: -1, cancelled: 1 });
+  }
+
+  function projectReminderSent_(event) {
+    var p = event.payload || {};
+    if (!p.task_id) return;
+
+    var current = _getRowByKey_(TASKS_SHEET, 'task_id', p.task_id);
+    if (!current) return;
+
+    upsertRowByKey_(TASKS_SHEET, 'task_id', p.task_id, {
+      reminder_count: (Number(current.reminder_count) || 0) + 1
+    });
+    // ActiveTasks 不需要 reminder_count（工作台不展示这列），跳过
+
+    _bumpStatistics_(event.chat_id || current.chat_id, { reminder: 1 });
+  }
+
+  // ============ TaskStatistics 维护（V4新增） ============
+
+  /**
+   * 对某个 chat_id 的 TaskStatistics 行做增量调整（读-改-写一行，不扫全表）。
+   * 找不到该 chat_id 的行时，视为 0 起步新建一行。
+   *
+   * @param {string} chatId
+   * @param {object} deltas  { total, pending, done, cancelled, recurring, reminder }
+   *                          均可选，缺省为0，可正可负
+   */
+  function _bumpStatistics_(chatId, deltas) {
+    if (!chatId) return;
+    try {
+      var current = _getRowByKey_(TASK_STATS_SHEET, 'chat_id', chatId) || {
+        chat_id: chatId, total_count: 0, pending_count: 0, done_count: 0,
+        cancelled_count: 0, recurring_count: 0, reminder_count_total: 0
+      };
+
+      var updated = {
+        chat_id:               chatId,
+        total_count:           (Number(current.total_count) || 0)          + (deltas.total     || 0),
+        pending_count:         (Number(current.pending_count) || 0)        + (deltas.pending   || 0),
+        done_count:            (Number(current.done_count) || 0)           + (deltas.done      || 0),
+        cancelled_count:       (Number(current.cancelled_count) || 0)      + (deltas.cancelled || 0),
+        recurring_count:       (Number(current.recurring_count) || 0)      + (deltas.recurring || 0),
+        reminder_count_total:  (Number(current.reminder_count_total) || 0) + (deltas.reminder  || 0),
+        last_updated_at:       new Date().toISOString()
+      };
+
+      upsertRowByKey_(TASK_STATS_SHEET, 'chat_id', chatId, updated);
+    } catch (e) {
+      Logger.log('[ProjectionEngine] TaskStatistics 更新失败（不影响主 Read Model，' +
+        '可用 rebuildStatisticsProjection() 修复）: ' + e.message);
+    }
+  }
+
+  // ============ TaskFilters 维护（V4新增） ============
+
+  /**
+   * 拼好 searchable_text（title+description+notes+tags+category 小写拼接），
+   * upsert 到 TaskFilters。见文件头注释——当前 23_SearchEngine 暂未依赖这张表
+   * （直接在 Tasks 行上过滤已经够快），这里先维护起来，面向未来更大数据量。
+   */
+  function _upsertTaskFilters_(taskId, task) {
+    try {
+      var searchableText = [task.title, task.description, task.notes, task.tags, task.category]
+        .filter(function (v) { return !!v; })
+        .join(' ')
+        .toLowerCase();
+
+      upsertRowByKey_(TASK_FILTERS_SHEET, 'task_id', taskId, {
+        task_id:         taskId,
+        chat_id:         task.chat_id || '',
+        searchable_text: searchableText,
+        tags_csv:        task.tags || ''
+      });
+    } catch (e) {
+      Logger.log('[ProjectionEngine] TaskFilters upsert 失败（Sheet 可能尚未建立）: ' + e.message);
+    }
+  }
+
+  // ============ 内部工具 ============
+
+  function _getRowByKey_(sheetName, keyHeader, keyValue) {
+    try {
+      var sheet = getSheet_(sheetName);
+      var lastRow = sheet.getLastRow();
+      if (lastRow < 2) return null;
+
+      var headerMap = getHeaderMap_(sheet);
+      if (!(keyHeader in headerMap)) return null;
+
+      var keyCol = headerMap[keyHeader] + 1;
+      var ids = sheet.getRange(2, keyCol, lastRow - 1, 1).getValues();
+
+      for (var i = 0; i < ids.length; i++) {
+        if (String(ids[i][0]) === String(keyValue)) {
+          var numCols = sheet.getLastColumn();
+          var row = sheet.getRange(i + 2, 1, 1, numCols).getValues()[0];
+          var obj = {};
+          for (var h in headerMap) obj[h] = row[headerMap[h]];
+          return obj;
+        }
+      }
+    } catch (e) {
+      Logger.log('[ProjectionEngine] _getRowByKey_ error (' + sheetName + ', ' + keyValue + '): ' + e.message);
+    }
+    return null;
+  }
+
+  return {
+    dispatch:     dispatch,
+    _getRowByKey: _getRowByKey_
+  };
+})();
