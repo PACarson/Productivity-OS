@@ -1,32 +1,37 @@
 /**
  * 09_IdempotencyManager.gs
- * Productivity OS v4.0 — 幂等性管理器（Task）
+ * Productivity OS v4.2 — 幂等性管理器（Task）
  *
  * 职责：确保每个创建操作恰好执行一次（Exactly-Once Semantics）。
  * 所有模块创建 Task 必须经过本层，禁止直接 EventBus.publish('TASK_CREATED')。
  *
+ * 【V4.2 修复 HIGH RISK 1：Webhook 超时与 GAS 并发限制级联失效】
+ * 原来 lock.waitLock(10000) 最多等 10 秒。Telegram Webhook 通常要求
+ * 2~5 秒内返回响应，一旦某次执行因为等锁排到快 10 秒才拿到/超时，
+ * Telegram 会判定这次投递超时，发起重试——重试请求又要重新排队等锁，
+ * 越堆越多，很容易在高并发（多用户同时发消息，或 Telegram 密集重试）下
+ * 把 GAS 每用户 30 并发执行线程的上限耗尽，导致整个项目（不只是这一个
+ * chatId）级联失效。
+ *
+ * 修复：
+ *   1. 锁等待时间从 10000ms 降到 LOCK_WAIT_MS=3000ms——3 秒内拿不到锁，
+ *      说明确实在高并发排队，与其继续占着这条 Webhook 执行通道死等，
+ *      不如立刻 fail-fast 放弃，把执行通道让出来。
+ *   2. 拿锁失败（waitLock 抛错）跟"拿到锁之后业务逻辑抛错"现在是两条
+ *      分支：前者包装成一个能被上游识别的 "SYSTEM_BUSY:" 前缀错误，
+ *      上游（06_TaskIntentParser.gs）会捕获它并给用户回一句"系统繁忙，
+ *      请重试"，而不是让整个 Webhook 调用链挂起等待或裸抛 500。
+ *
  * 【V4 修复 LOW RISK 2】原来调用裸全局函数 _createTaskDirect_，现在改成调用
- * TaskEngine.createTaskDirect_（20_TaskEngine.gs 的 IIFE 内部方法）。行为
- * 完全不变，只是把"裸全局函数耦合"换成"显式命名空间方法调用"，消除了
- * "任何文件都能不小心碰到/覆盖 _createTaskDirect_"的风险面。见
- * 00_Project_State.gs"已知Bug"第1条。
- *
- * v3.1 历史（保留，逻辑不变）：
- *
- * 原问题：去重校验（读 Read Model）和创建写入（写 Events + 更新 Read Model）
- * 是两个分离的步骤，之间没有锁保护。当 Telegram Webhook 并发重试（或用户
- * 快速连按）触发两个执行实例同时跑时，两个实例会同时读到"任务不存在"，
- * 然后都走创建路径，导致 Tasks Sheet 出现两行完全相同的任务（幂等机制失效）。
- *
- * 修复：在"读取-校验-写入"全程用 LockService.getScriptLock() 包住，
- * 强制串行化。第一个执行完毕、锁释放后，第二个进来时 DeduplicationEngine
- * 已经能在 Read Model 里找到了，直接走"已存在"路径返回。
+ * TaskEngine.createTaskDirect_（20_TaskEngine.gs 的 IIFE 内部方法）。
  *
  * ⚠️ 锁说明：
  *  - getScriptLock() 是进程级（Script）锁，同一个 GAS 部署（本项目）下所有
  *    并发执行共用，只保护本项目自己的并发执行，不跨项目。
- *  - waitLock(10000) = 最多等 10 秒，超时则抛 "Could not obtain lock" 并向上传播。
- *  - 锁统一在 finally 块释放，保证不论成功/失败/异常都不死锁。
+ *  - LOCK_WAIT_MS = 3000：最多等 3 秒，超时立刻 fail-fast（见上方修复说明）。
+ *  - 锁只在"确实拿到"之后才会进 finally 释放；waitLock 本身抛错时锁根本
+ *    没拿到，不需要也不能 releaseLock（否则会因为释放一把不属于当前调用的
+ *    锁而抛 "Lock not held" 错误）。
  *  - GAS LockService 锁不可重入。TaskEngine.createTaskDirect_ 不尝试再获取
  *    ScriptLock，所以安全。
  *
@@ -37,6 +42,8 @@
 
 var IdempotencyManager = (function () {
 
+  var LOCK_WAIT_MS = 3000; // V4.2：原 10000，见文件头 HIGH RISK 1 修复说明
+
   // ============ Task ============
 
   /**
@@ -46,6 +53,10 @@ var IdempotencyManager = (function () {
    * @param {object} meta   { category, priority, due_date, recurring, context, budget, notes, description, tags }
    * @param {string} chatId
    * @returns {{ task: object, created: boolean }}
+   * @throws {Error}  message 以 "SYSTEM_BUSY:" 开头 —— 3 秒内没拿到锁，
+   *                   调用方（尤其是 Telegram 指令路径）应该捕获这个错误，
+   *                   给用户一个"稍后重试"的友好提示，不要让它裸传播成
+   *                   未处理异常。
    */
   function createTaskIfNotExists(title, meta, chatId) {
     meta = meta || {};
@@ -60,25 +71,29 @@ var IdempotencyManager = (function () {
     );
 
     var lock = LockService.getScriptLock();
-    var lockAcquired = false;
-    try {
-      lock.waitLock(10000); // 最多等10秒；超时会抛 "Could not obtain lock"
-      lockAcquired = true;
 
-      // 锁范围内：读-校验-写 原子化
+    // ── 第一阶段：只负责拿锁，拿不到就 fail-fast，不进入下面的业务逻辑 ──────
+    try {
+      lock.waitLock(LOCK_WAIT_MS);
+    } catch (lockErr) {
+      Logger.log('[IdempotencyManager] ' + LOCK_WAIT_MS + 'ms 内没拿到锁，fail-fast 放弃本次创建' +
+        '（避免继续占用 Webhook 执行通道引发级联超时）: identity=' + identity.slice(0, 12) + '... ' + lockErr.message);
+      throw new Error('SYSTEM_BUSY: 系统繁忙（当前并发写入较多），请几秒后重试。');
+    }
+
+    // ── 第二阶段：锁已经拿到，读-校验-写 原子化 ────────────────────────────
+    try {
       var existing = DeduplicationEngine.findExistingTask(identity);
       if (existing) {
         Logger.log('[IdempotencyManager] 任务已存在（并发安全），跳过创建: identity=' + identity.slice(0, 12) + '... task_id=' + existing.task_id);
         return { task: existing, created: false };
       }
 
-      var task = TaskEngine.createTaskDirect_(title, meta, chatId, identity); // V4: 命名空间调用
+      var task = TaskEngine.createTaskDirect_(title, meta, chatId, identity);
       return { task: task, created: true };
 
     } finally {
-      if (lockAcquired) {
-        lock.releaseLock();
-      }
+      lock.releaseLock(); // 走到这里锁必然已经拿到，直接释放，不需要 lockAcquired 标志位
     }
   }
 
@@ -107,16 +122,26 @@ var IdempotencyManager = (function () {
   function testConcurrentExecution() {
     Logger.log('=== IdempotencyManager.testConcurrentExecution ===');
     Logger.log('三层总防线：');
-    Logger.log('  防线1：ScriptLock             → 并发执行串行化（最强）');
+    Logger.log('  防线1：ScriptLock（' + LOCK_WAIT_MS + 'ms fail-fast） → 并发执行串行化（最强）');
     Logger.log('  防线2：EventBus._inExecIdentityCache_ → 同次执行内双写（补充）');
     Logger.log('  防线3：DeduplicationEngine.findExistingTask → 跨执行跨实例去重（兜底）');
     Logger.log('如需压力测试，手动在 GAS 编辑器同时触发两个执行，检查 Tasks Sheet 行数。');
     Logger.log('=== testConcurrentExecution DONE ===');
   }
 
+  function testLockTimeout() {
+    Logger.log('=== IdempotencyManager.testLockTimeout ===');
+    Logger.log('本函数不模拟真实并发（GAS 编辑器手动运行是单线程），只做文档性说明：');
+    Logger.log('LOCK_WAIT_MS=' + LOCK_WAIT_MS + '，超过这个时间拿不到锁会抛 "SYSTEM_BUSY:" 开头的 Error。');
+    Logger.log('06_TaskIntentParser.gs 的 TASK_CREATE 分支已经 catch 这个错误并转成友好提示，');
+    Logger.log('请人工触发高并发（比如短时间内连续发很多条建任务的消息）来验证真实表现。');
+    Logger.log('=== testLockTimeout DONE ===');
+  }
+
   return {
     createTaskIfNotExists:   createTaskIfNotExists,
     testWebhookRetry:        testWebhookRetry,
-    testConcurrentExecution: testConcurrentExecution
+    testConcurrentExecution: testConcurrentExecution,
+    testLockTimeout:         testLockTimeout
   };
 })();
