@@ -1,0 +1,148 @@
+/**
+ * 00_Roadmap.gs
+ * Productivity OS v4.3 — Roadmap（长期规划）
+ *
+ * ⚠️ 本文件只谈"接下来要往哪走"，不记录历史、不记录 Bug、不记录架构决策——
+ * 那三类内容分别属于 00_Project_State.gs（当前状态快照）、
+ * 00_Project_State.gs"已知Bug"、00_ADR.gs（决策记录）。本文件跟
+ * 00_Project_State.gs 一样是"快照"，每次更新覆盖旧内容，不是日志。
+ */
+
+// ============================================================
+// 一、Current Version
+// ============================================================
+
+/**
+ * V4.3——Architecture / Governance Upgrade。
+ *
+ * 本 OS 现状一句话概括：9 个 Engine（Task/Recurring/Priority/Search/View/
+ * Dashboard/Analytics/Query + Archive），严格 CQRS（Events 唯一 Write
+ * Model，Tasks/ActiveTasks/TaskStatistics/TaskFilters 四张 Projection 表，
+ * View/Dashboard 按需生成不落盘），治理文档齐备（Constitution/State/
+ * File Map/ADR/Roadmap 五份），Telegram 是唯一呈现层但 Query/View/
+ * Dashboard 三层已经不依赖 Telegram 这个呈现介质本身。
+ */
+
+// ============================================================
+// 二、Completed（本版本达成的能力边界，非历史记录）
+// ============================================================
+
+/**
+ * 这里只说"现在能做什么"，不重复 00_Project_State.gs"已完成"里的逐条
+ * 修复过程——那些是历史，这里是能力边界快照：
+ *
+ *   - Task 生命周期：create / update / complete / cancel 四件套，
+ *     identity 在影响去重的字段变更时自动重算。
+ *   - Recurring：完成时按 Daily/Weekly/Monthly/Yearly 自动续期一次。
+ *   - 查询能力：Today/Week/Month/Overdue/Upcoming/Recurring/Priority/
+ *     Search/Dashboard/Statistics 十种查询，全部经 TaskQueryEngine 单一
+ *     入口，单次批量读 Sheet。
+ *   - 并发安全：创建路径有幂等去重 + 3 秒 fail-fast 锁；Projection 失败
+ *     有一次性安全兜底写入（不再无条件双写）。
+ *   - 可重建性：Tasks/ActiveTasks/TaskStatistics/TaskFilters 四张表全部
+ *     可以从 Events 全量重建。
+ *   - 治理完整度：Architecture Principles / Engine Contract Standard /
+ *     Dependency Rules / Event Definition Standard 四份正式规则都已建立
+ *     并且用现有代码逐项核对过一遍（不是纸面标准，是标准+核对表）。
+ */
+
+// ============================================================
+// 三、Next Version（V4.4 候选，尚未开始）
+// ============================================================
+
+/**
+ * 按优先级排列，供下一次升级会话参考，实际做哪个由到时候的具体需求决定：
+ *
+ *   1. Recurring lifecycle 补全：目前只有"完成后自动续期"一种生命周期
+ *      事件，没有"暂停/恢复某条 recurring 规则"的能力（见
+ *      00_Project_State.gs"下一步"）。如果这个需求变得具体，V4.4 应该
+ *      优先做这个，因为它是现有 Engine（21_RecurringEngine.gs）的能力
+ *      补全，不涉及新架构。
+ *
+ *   2. TaskPriority 缓存表：如果观察到 22_PriorityEngine.computePriorityScore
+ *      现算变贵（目前没有观察到），按 ADR-2026-07-06 Consequences 里
+ *      记录的方案加一张 Projection 表，由 TASK_CREATED/TASK_UPDATED/
+ *      REMINDER_SENT 增量维护。
+ *
+ *   3. Health Check 独立函数：目前健康检查依附在 15_Setup.runDiagnostics()
+ *      里（见 00_Project_Constitution.gs P4 4.5 Operations），如果需要
+ *      更轻量、可以被定时触发器频繁调用的健康检查，应该拆出独立函数，
+ *      不跟"跑一遍完整诊断"耦合在一起。
+ *
+ *   4. 04_EventDefinitions.gs 独立文件：目前 Event 定义按
+ *      00_Project_Constitution.gs 零之五的标准记录在 Constitution 里，
+ *      如果事件类型数量显著增加（比如超过 10 个），应该拆出独立文件，
+ *      判断标准参照 ADR-2026-07-06-002 Schema Authority 里"何时该拆"
+ *      的同一套思路（数量阈值 + 变化频率 + 消费方数量）。
+ */
+
+// ============================================================
+// 四、Future（方向明确但暂无具体计划）
+// ============================================================
+
+/**
+ *   - Web / App / 语音助手前端：ADR-2026-07-06 已经把 ViewEngine/
+ *     DashboardEngine 设计成不依赖 Telegram 这个呈现介质，理论上换前端
+ *     只需要新写一层呈现逻辑替换 06_TaskIntentParser.gs。目前没有具体的
+ *     第二前端需求，暂不启动。
+ *
+ *   - Domain OS 间的 Bridge：如果未来某个 Domain OS（比如 Property OS）
+ *     需要在自己完成某个操作后顺手建一个 Task，按 Personal AI Core 项目
+ *     Constitution 的 Domain OS↔Domain OS Bridge 模式接（对应本项目
+ *     Blueprint 的 Integration.Bridge，目前是"暂无"，见
+ *     00_Project_Constitution.gs P4 第4层）。
+ *
+ *   - Monitoring（主动监控）：目前是被动告警
+ *     （02_EventBus._alertAdminProjectionFailure_），如果 Projection
+ *     失败频率变得不可忽视，应该考虑主动监控而不是等失败发生再告警。
+ */
+
+// ============================================================
+// 五、Long Term Vision
+// ============================================================
+
+/**
+ * Productivity OS 是 Universal Domain OS Blueprint 的第一个完整落地样本
+ * （Personal AI Core 项目最早规划这份 Blueprint 时，本项目是第一个拿来
+ * 验证"这套分层在真实代码里跑不跑得通"的 Domain OS）。长期看，本项目的
+ * 价值有两条：
+ *
+ *   1. 作为 Task 这个业务领域本身的系统——继续把 Task 生命周期管理做深
+ *      （更好的 Recurring 规则、更准的 Priority 建议、更快的 Search）。
+ *
+ *   2. 作为 Blueprint 落地范式的参考实现——以后任何新 Domain OS（
+ *      Property OS/Finance OS/Shopping OS 从 External System 升级成
+ *      真正的 Domain OS 等）在设计阶段，应该直接参照本项目的
+ *      00_Project_Constitution.gs / 00_ADR.gs / 00_File_Map.gs 三份文件
+ *      的写法，而不是从零开始摸索"这套 Blueprint 具体落地是什么样子"。
+ *      这意味着本项目的治理文档质量本身就是一种交付物，不只是给自己看。
+ */
+
+// ============================================================
+// 六、Architecture Evolution
+// ============================================================
+
+/**
+ * 记录"架构层面"的演进方向（不是功能层面，功能层面见「三、Next Version」
+ * 和「四、Future」）：
+ *
+ *   - Dependency Rules（00_Project_Constitution.gs 零之四）目前只有一个
+ *     已知例外（21_RecurringEngine.gs → 09_IdempotencyManager.gs）。
+ *     长期目标是"例外数量不再增加"——如果未来有第二个类似的越层依赖需求
+ *     出现，应该优先考虑能不能通过调整 Engine 职责边界避免它，而不是
+ *     默认接受"再记一个例外"。
+ *
+ *   - Schema Authority（00_ADR.gs ADR-2026-07-06-002）现在明确写了拆分
+ *     04_Schema.gs 的触发条件。长期看，这是"先记录标准、按条件触发再
+ *     拆分代码"这套治理模式的第一个应用案例——如果这次实践下来效果好
+ *     （既避免了过早拆分的开销，触发条件出现时又确实能顺利拆分），
+ *     以后类似的"现在没必要但未来可能需要拆"的判断，应该复用同一个模式
+ *     （写清楚触发条件 + 暂不动代码），而不是每次重新论证一遍。
+ *
+ *   - Engine Contract Standard（00_Project_Constitution.gs 零之三）目前
+ *     是文档层面的标准 + 手工维护的速查表，没有任何自动化校验（比如没有
+ *     脚本检查"这个 Engine 文件头是否真的填了 Forbidden Dependencies"）。
+ *     长期方向是这类标准最终应该有轻量的自动化校验，但目前 GAS 环境下
+ *     实现成本较高（没有现成的静态分析工具链），暂不作为具体计划，只
+ *     记录方向。
+ */
