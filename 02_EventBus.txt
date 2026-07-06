@@ -1,6 +1,6 @@
 /**
  * 02_EventBus.gs
- * Productivity OS v3.1 — 事件总线（Events 表唯一写入口，本项目内）
+ * Productivity OS v4.2 — 事件总线（Events 表唯一写入口，本项目内）
  *
  * ⚠️ 2026-07-03 拆分说明：这是 Personal AI Core 的 02_EventBus.gs 的本地副本，
  * 唯一改动是 _sheet_()——Core 是 container-bound 脚本，用
@@ -31,6 +31,16 @@
  *    - EventBus 维护一个「本次执行内 identity 缓存」（_inExecIdentityCache_）
  *    - 同一次脚本执行内，相同 identity 的 CREATE 事件只会写入一次
  *    - 不跨执行持久化，不是「第二套状态」
+ *
+ * 【V4.2 修复 HIGH RISK 3：频繁同步 Sheet 读写导致的 I/O 性能瓶颈】
+ * 返回的 event 对象新增 projection_ok 字段（true/false）。之前
+ * 20_TaskEngine.gs 的 completeTask/cancelTask/updateTask 不管
+ * ProjectionEngine.dispatch 有没有成功，都无条件再调一次
+ * materializeTaskRow_ 做"安全兜底"写入——等于每次操作稳定写两遍 Sheet。
+ * 现在 dispatch 成功与否会同步反映在 event.projection_ok 上，调用方只有在
+ * 看到 false（Projection 真的失败了）时才需要触发那次额外写入，正常路径
+ * 下只有 dispatch 那一次 I/O。这是纯粹的新增字段（additive），不影响任何
+ * 已有调用方读取 event.event_id/type/chat_id/payload/source 等原有字段。
  *
  * 架构铁律（保持不变）：
  *  - 这是（本项目负责的那部分）Events 表唯一的写入者
@@ -82,7 +92,9 @@ var EventBus = (function () {
    * @param {string} chatId
    * @param {string} source    哪个模块发的，比如 'ProductivityModule'
    * @param {string} [identity]  可选：业务身份 SHA-256。传入时启用执行内去重。
-   * @returns {object|null}  写入的 event 对象，或 null（被执行内去重拦截时）
+   * @returns {object|null}  写入的 event 对象（含 V4.2 新增的
+   *                          projection_ok: boolean 字段），或 null
+   *                          （被执行内去重拦截时）
    */
   function publish(type, payload, chatId, source, identity) {
 
@@ -115,10 +127,14 @@ var EventBus = (function () {
     _cachedEvents = null; // 写入新事件，缓存失效
 
     // ── 同步触发 Projection，更新 Read Model ────────────────────────────────
+    // V4.2：projection_ok 默认 true，dispatch 抛错时置 false，供调用方
+    // （20_TaskEngine.gs）决定要不要做一次性的安全兜底写入（HIGH RISK 3 修复）。
+    event.projection_ok = true;
     if (typeof ProjectionEngine !== 'undefined' && typeof ProjectionEngine.dispatch === 'function') {
       try {
         ProjectionEngine.dispatch(event);
       } catch (projErr) {
+        event.projection_ok = false;
         Logger.log('[EventBus] Projection 失败（非致命）: ' + projErr.message + '。运行 rebuildAllProjections() 修复 Read Model。');
         _alertAdminProjectionFailure_(event, projErr);
       }
