@@ -1,6 +1,6 @@
 /**
  * 12_TaskQueryEngine.gs
- * Productivity OS v4.0 — Task Query Engine（V4 改名+中心化）
+ * Productivity OS v4.3 — Task Query Engine（V4 改名+中心化）
  *
  * 【V4】原 12_QueryEngine.gs。规格书要求的"centralized query API"：
  * getTask / getTasks / getTodayTasks / getWeekTasks / getMonthTasks /
@@ -19,6 +19,45 @@
  *    读 Sheet。
  *
  * 依赖：05_SheetUtils（getSheet_, getHeaderMap_）
+ */
+
+/**
+ * ── Engine Contract（V4.3，按 00_Project_Constitution.gs 零之三标准补全）──
+ *   Responsibilities      : 本 OS 唯一的查询入口——批量读 Read Model，
+ *                           分发给下游纯函数 Engine 做过滤/排序/组合
+ *   Owns                  : "怎么把 Sheet 行读成 task 对象数组"这件事
+ *                           （_readAllRows_/_readAllTasks_），以及"哪个
+ *                           查询该调用哪个下游 Engine"的路由表
+ *   Reads                 : Tasks Sheet（唯一直接读取方，其余四张只读表
+ *                           由对应 Engine 各自的职责覆盖，本身不重复读）
+ *   Writes                : none
+ *   Public API            : getTask, getTasks, getPendingTasks,
+ *                           getCompletedTasks, getTodayTasks,
+ *                           getTomorrowTasks, getWeekTasks, getMonthTasks,
+ *                           getUpcomingTasks, getOverdueTasks,
+ *                           getRecurringTasks, getCancelledTasks,
+ *                           getArchivedTasksInline, getArchivedTasks,
+ *                           getPriorityTasks, searchTasks, getDashboard,
+ *                           getStatistics
+ *   Dependencies          : 05_SheetUtils.gs（getSheet_/getHeaderMap_）、
+ *                           22_PriorityEngine / 23_SearchEngine /
+ *                           24_ViewEngine / 25_DashboardEngine /
+ *                           26_AnalyticsEngine（全部 Domain 层）、
+ *                           13_ActiveTasksEngine（冷归档查询转发）
+ *   Forbidden Dependencies: 02_EventBus.gs（getAllEvents/deriveTaskState_
+ *                           一律禁止调用，见 00_Project_Constitution.gs
+ *                           P6 铁律3）
+ *   Pure Function         : NO（直接读 Sheet）
+ *   Replay Events         : NO（本 OS 除 26_AnalyticsEngine 的
+ *                           replayCompletionTrend_ 外唯一可能被误用来"顺手
+ *                           重放"的地方，必须保持 NO）
+ *   Projection            : NO
+ *   Thread Safety         : 只读操作，不需要加锁
+ *   Side Effects          : NO
+ *   Notes                 : 本模块是 00_ADR.gs ADR-2026-07-06 定义的
+ *                           "Query Layer"，属于四层模型
+ *                           （Write Model→Projection→Query Layer→
+ *                           View Layer）的第三层。
  */
 
 var TaskQueryEngine = (function () {
