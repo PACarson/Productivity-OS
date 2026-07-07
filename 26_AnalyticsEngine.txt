@@ -1,6 +1,6 @@
 /**
  * 26_AnalyticsEngine.gs
- * Productivity OS v4.0 — Analytics Engine（V4 新增）
+ * Productivity OS v4.3 — Analytics Engine（V4 新增）
  *
  * 职责：completion rate / overdue rate / reminder statistics / recurring
  * statistics / workload。
@@ -14,6 +14,42 @@
  * 这是 00_Project_Constitution.gs P6 铁律4 明确写的例外，且仅限于这一个
  * 函数、明确标注、不在任何 Telegram 指令路径上（12_TaskQueryEngine.
  * getStatistics 不调用它，需要历史趋势的场景请在 GAS 编辑器手动调用）。
+ */
+
+/**
+ * ── Engine Contract（V4.3，按 00_Project_Constitution.gs 零之三标准补全）──
+ * 本文件两个公开函数的 Contract 不同，分开写：
+ *
+ *   computeStatistics(tasks)
+ *     Responsibilities      : completion rate / overdue rate / reminder
+ *                             statistics / recurring statistics / workload
+ *     Owns                  : 各项统计指标的计算公式
+ *     Reads                 : task[]（由调用方传入）
+ *     Writes                : none
+ *     Dependencies          : 05_SheetUtils.gs（isOverdue_/round1_/round2_，
+ *                             纯计算工具）
+ *     Forbidden Dependencies: Sheet, Events, Telegram/Output
+ *     Pure Function         : YES
+ *     Replay Events         : NO
+ *     Projection            : NO
+ *     Thread Safety         : 不需要
+ *     Side Effects          : NO
+ *
+ *   replayCompletionTrend_(chatId, weeks?)
+ *     Responsibilities      : 历史完成趋势（过去 N 周每周完成几个任务）
+ *     Owns                  : 按周分桶的时间序列计算
+ *     Reads                 : Events（全量，通过 EventBus.getAllEvents）
+ *     Writes                : none
+ *     Dependencies          : 02_EventBus.gs（getAllEvents）
+ *     Forbidden Dependencies: 不得被 Telegram 指令路径调用（见
+ *                             00_Project_Constitution.gs P6 铁律4）
+ *     Pure Function         : NO（依赖当前时间做分桶起点）
+ *     Replay Events         : YES（本 OS 唯一允许重放 Events 的函数）
+ *     Projection            : NO
+ *     Thread Safety         : 不需要（只读）
+ *     Side Effects          : NO
+ *     Notes                 : 仅供 GAS 编辑器手动调用做深度分析/debug，
+ *                             12_TaskQueryEngine.getStatistics 不调用它。
  */
 
 var AnalyticsEngine = (function () {
