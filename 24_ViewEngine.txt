@@ -1,6 +1,6 @@
 /**
  * 24_ViewEngine.gs
- * Productivity OS v4.0 — View Engine（V4 新增）
+ * Productivity OS v4.3 — View Engine（V4 新增）
  *
  * 职责：对一批已经在内存里的 task 对象做"这属于哪个视图"的过滤。纯函数——
  * 不读 Sheet，不读 Events。输入永远是 12_TaskQueryEngine.gs 已经批量读出
@@ -13,6 +13,33 @@
  * "今天/本周/本月/逾期/即将到来"全都是"以查询发生的这一刻为参照点"的日历
  * 相对计算——跟 05_SheetUtils.isOverdue_ 的判断逻辑同源（同样要处理"纯日期
  * 字符串按本地时区午夜算"的时区坑）。
+ */
+
+/**
+ * ── Engine Contract（V4.3，按 00_Project_Constitution.gs 零之三标准补全）──
+ *   Responsibilities      : 十一种"这个任务属于哪个视图"的过滤规则
+ *   Owns                  : Today/Tomorrow/This Week/This Month 等日历相对
+ *                           边界的计算方式（_startOfDay_/_endOfDay_/
+ *                           _addDays_）
+ *   Reads                 : task[]（由调用方传入）
+ *   Writes                : none
+ *   Public API            : today, tomorrow, thisWeek, thisMonth, upcoming,
+ *                           overdue, recurring, highPriority, completed,
+ *                           cancelled, archived（均为 (tasks, now?) 签名，
+ *                           archived 除外只需 tasks）
+ *   Dependencies          : 05_SheetUtils.gs（parseDueDate_/isOverdue_，
+ *                           纯计算工具）
+ *   Forbidden Dependencies: Sheet, Events, Telegram/Output
+ *   Pure Function         : YES（除依赖 `now` 参数默认值为 `new Date()`
+ *                           外，不依赖任何隐藏的全局可变状态；传入固定
+ *                           `now` 时结果完全确定，可测试）
+ *   Replay Events         : NO
+ *   Projection            : NO
+ *   Thread Safety         : 不需要（无共享可变状态）
+ *   Side Effects          : NO
+ *   Notes                 : 本 Engine 是 00_ADR.gs ADR-2026-07-06 定义的
+ *                           "View/Presentation Layer"的一部分，不落盘，
+ *                           永远按需生成（Architecture Principles 第6条）。
  */
 
 var ViewEngine = (function () {
