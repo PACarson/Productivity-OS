@@ -13,6 +13,35 @@
  * 依赖：07_IdentityEngine（外部调用方生成 identity），05_SheetUtils（Sheet 工具）
  */
 
+/**
+ * ── Engine Contract（V4.3，按 00_Project_Constitution.gs 零之三标准补全）──
+ *   Responsibilities      : 判断某个 identity 对应的业务对象是否已存在于
+ *                           Read Model
+ *   Owns                  : "已存在"的判定规则（只有 PENDING 状态算重复；
+ *                           库存按同名判重）
+ *   Reads                 : Tasks Sheet（本项目实际只用到这部分；Inventory
+ *                           Sheet 逻辑是跟 Core 项目共用同一份代码副本时
+ *                           保留的，本项目 Task 域用不到）
+ *   Writes                : none
+ *   Public API            : findExistingTask(identity)
+ *   Dependencies          : 05_SheetUtils.gs（getSheet_/getHeaderMap_）
+ *   Forbidden Dependencies: Events, Telegram/Output，Application 层以上
+ *                           （09_IdempotencyManager/20_TaskEngine/
+ *                           06_TaskIntentParser）
+ *   Pure Function         : NO（直接读 Sheet，故归类 Application 层而非
+ *                           Domain 层，见 00_File_Map.gs Architecture
+ *                           Layer Map 的分类理由说明）
+ *   Replay Events         : NO
+ *   Projection            : NO（只读，不写任何 Read Model）
+ *   Thread Safety         : 由调用方 09_IdempotencyManager 的 ScriptLock
+ *                           保证串行，本模块自身不加锁
+ *   Side Effects          : NO
+ *   Notes                 : 归类为 Application 而不是 Domain 层是本次
+ *                           V4.3 治理升级的一个明确判断——"直接读 Sheet"
+ *                           跟 Domain 层"不摸 Sheet"的铁律冲突，详见
+ *                           00_Project_Constitution.gs 零之四。
+ */
+
 var DeduplicationEngine = (function () {
 
   var TASKS_SHEET     = 'Tasks';
