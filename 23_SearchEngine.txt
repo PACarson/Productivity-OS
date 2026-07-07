@@ -1,6 +1,6 @@
 /**
  * 23_SearchEngine.gs
- * Productivity OS v4.0 — Search Engine（V4 新增）
+ * Productivity OS v4.3 — Search Engine（V4 新增）
  *
  * 职责：在一批已经在内存里的 task 对象上做多维度过滤/全文搜索。纯函数——
  * 不读 Sheet，不读 Events。输入永远是 12_TaskQueryEngine.gs 已经批量读出
@@ -12,6 +12,27 @@
  *
  * 支持维度：title / description / category / priority / status / date /
  * date range / recurring / tags / full text。
+ */
+
+/**
+ * ── Engine Contract（V4.3，按 00_Project_Constitution.gs 零之三标准补全）──
+ *   Responsibilities      : 多维度过滤 / 全文搜索
+ *   Owns                  : 全文匹配规则（title+description+notes+tags+
+ *                           category 拼接后小写匹配）、tag 精确匹配规则
+ *   Reads                 : task[]（由调用方传入）
+ *   Writes                : none
+ *   Public API            : search(tasks, query), searchByKeyword(tasks, keyword)
+ *   Dependencies          : 05_SheetUtils.gs（parseDueDate_，纯计算工具）
+ *   Forbidden Dependencies: Sheet, Events, Telegram/Output
+ *   Pure Function         : YES
+ *   Replay Events         : NO
+ *   Projection            : NO
+ *   Thread Safety         : 不需要（无共享可变状态）
+ *   Side Effects          : NO
+ *   Notes                 : TaskFilters 表（10_ProjectionEngine 维护）目前
+ *                           不被本 Engine 读取——当前数据量级下直接在
+ *                           Tasks 行上过滤已经够快，TaskFilters 是面向
+ *                           未来更大数据量的预留投影，见文件头说明。
  */
 
 var SearchEngine = (function () {
