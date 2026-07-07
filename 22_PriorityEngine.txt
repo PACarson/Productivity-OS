@@ -1,6 +1,6 @@
 /**
  * 22_PriorityEngine.gs
- * Productivity OS v4.0 — Priority Engine（V4 新增）
+ * Productivity OS v4.3 — Priority Engine（V4 新增）
  *
  * 职责：给一批已经在内存里的 task 对象算 Priority Score / Urgency Score，
  * 并给出优先级建议。纯函数——不读 Sheet，不读 Events，不写任何东西。
@@ -18,6 +18,29 @@
  *   - Reminder Count（提醒过越多次，说明一直没处理，适度加权）
  *   - Recurring（recurring 任务通常是常规事务，适度降权，避免长期占据
  *     "高优先级"位置挤占真正紧急的一次性任务）
+ */
+
+/**
+ * ── Engine Contract（与 00_Project_Constitution.gs 零之三给出的示例一致）──
+ *   Responsibilities      : Priority Score / Urgency Score / 优先级建议
+ *   Owns                  : 优先级打分公式（手动 priority 权重 + 时间紧迫度）
+ *   Reads                 : task[]（由调用方传入，不自己读 Sheet）
+ *   Writes                : none
+ *   Public API            : computeUrgencyScore(task, now?),
+ *                           computePriorityScore(task, now?),
+ *                           suggestPriority(task), rankByPriority(tasks)
+ *   Dependencies          : 05_SheetUtils.gs（parseDueDate_/round1_/
+ *                           shallowCopy_，纯计算工具，不是 Sheet I/O）
+ *   Forbidden Dependencies: Sheet, Events, Telegram/Output
+ *   Pure Function         : YES
+ *   Replay Events         : NO
+ *   Projection            : NO
+ *   Thread Safety         : 不需要（无共享可变状态）
+ *   Side Effects          : NO
+ *   Notes                 : 见 Architecture Principles 第5条（Decision
+ *                           Never Executes）——本 Engine 任何函数都不写
+ *                           任务，只返回分数/建议字符串；采纳建议必须由
+ *                           调用方另外调用 20_TaskEngine.updateTask()。
  */
 
 var PriorityEngine = (function () {
