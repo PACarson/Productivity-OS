@@ -1,19 +1,36 @@
 /**
  * 00_Project_State.gs
- * Productivity OS v4.3 — 项目状态快照
+ * Productivity OS v4.3.1 — 项目状态快照
  *
  * ⚠️ 快照，不是日志。每次更新覆盖旧状态。
- * LAST_UPDATED: 2026-07-06 — V4.3（第二部分）：把 Engine Contract Standard
- * 实际写入 12 个 Engine 文件的文件头（07/08/10/12/13/20/21/22/23/24/25/26），
- * 只加注释，不改任何函数行为。V4.3（第一部分）：Architecture / Governance
- * Upgrade 纯文档升级。V4.2：修复第二轮外部审计发现的 3 项 HIGH RISK +
- * 3 项 MEDIUM RISK + 1 项 LOW RISK（完整清单见"三、已知Bug"）。
+ * LAST_UPDATED: 2026-07-06 — V4.3.1：修复 setupSheets() 完全忽略 Events 表
+ * 的 bug（实测复现：全新 Spreadsheet 上只跑本项目 setupSheets() 后，
+ * createTask 必现 "Events sheet 不存在" 报错）。V4.3（第二部分）：把
+ * Engine Contract Standard 实际写入 12 个 Engine 文件的文件头。V4.3
+ * （第一部分）：Architecture / Governance Upgrade 纯文档升级。V4.2：
+ * 修复第二轮外部审计发现的 3 项 HIGH RISK + 3 项 MEDIUM RISK + 1 项
+ * LOW RISK（完整清单见"三、已知Bug"）。
  */
 
 // ============================================================
 // 一、已完成
 // ============================================================
 
+/**
+ * - 2026-07-06（V4.3.1，本次）：修复 15_Setup.gs 的 setupSheets() 完全
+ *   忽略 Events 表的 bug——日志之前写着"Events 由 Core 项目建"，这个假设
+ *   只在"先跑过 Core 项目初始化"的前提下成立；如果先对一张全新
+ *   Spreadsheet 只跑本项目的 setupSheets()（比如独立诊断/测试本项目时），
+ *   Events 表根本不存在，createTask 会在 02_EventBus._sheet_() 处必现
+ *   报错。修复：setupSheets() 新增 Events 表的 _ensureSheet_()调用（表头
+ *   跟 02_EventBus.gs 的 COLS 数组逐字一致），因为 _ensureSheet_() 只在
+ *   表完全为空时才写表头，这个修复对"Core 项目已经建过 Events 表"的正常
+ *   场景是无操作的安全探测，不会覆盖已有数据。同步更新了
+ *   repairSheetHeaders() 和 runDiagnostics() 的检查列表，把 Events 加进去
+ *   （之前 runDiagnostics 的 Sheet 存在性检查列表里也没有 Events，所以
+ *   这个问题不会在诊断的第一步就被发现，而是等到后面调 createTask 才报错，
+ *   这次一并修了）。
+ *
 /**
  * - 2026-07-06（V4.3 第二部分，本次）：把 00_Project_Constitution.gs
  *   零之三定义的 Engine Contract Standard 实际落地到 12 个 Engine 文件的

@@ -1,6 +1,25 @@
 /**
  * 15_Setup.gs
- * Productivity OS v4.2 — 一键初始化
+ * Productivity OS v4.3.1 — 一键初始化
+ *
+ * 【V4.3 修复】setupSheets() 之前完全没有创建 Events 表，日志里还写着
+ * "Events 由 Core 项目建"——这个假设在"先跑过 Core 项目的 setupSheets()
+ * 或等价初始化"的前提下成立，但如果有人（比如本项目自己独立诊断/测试时）
+ * 先对着一张全新的 Spreadsheet 只跑本项目的 setupSheets()，Events 表根本
+ * 不存在，后续任何 createTask 都会在 02_EventBus._sheet_() 里直接抛错
+ * "Events sheet 不存在"（实测复现：runDiagnostics → createTask →
+ * IdempotencyManager.createTaskIfNotExists → TaskEngine.createTaskDirect_ →
+ * EventBus.publish → _sheet_ 抛错）。
+ *
+ * 修复方式：setupSheets() 现在也会确保 Events 表存在（表头跟
+ * 02_EventBus.gs 的 COLS 数组完全一致：event_id/timestamp/type/chat_id/
+ * payload/source）。这不违反"Events 是跟 Core/Reminder OS 共享的表"这个
+ * 架构事实——_ensureSheet_() 只在表完全是空的（getLastRow()===0）时才写
+ * 表头，如果 Core 项目已经先建好了 Events 表（哪怕只有表头没有数据），
+ * 本项目的 setupSheets() 对它是完全无操作的只读探测，不会覆盖或弄乱
+ * 已有数据；反过来，如果本项目先跑，也能正确把 Events 表建起来，不需要
+ * 强制要求"必须先跑 Core 项目的初始化"这个前置顺序。repairSheetHeaders()
+ * 和 runDiagnostics() 的检查列表同步加入了 Events。
  *
  * 【V4.2 审计修复】MEDIUM RISK 3：_repairOneSheetHeader_ 原来只比对第一
  * 格是否等于 headers[0]，改成对整行做完全比对（见函数头注释）。
@@ -14,8 +33,8 @@
  * 使用顺序（重要，顺序不能反）：
  *   1. 先确认本项目 Script Properties 里的 SPREADSHEET_ID 已经设置成跟
  *      Personal AI Core 项目【同一张】Spreadsheet 的 ID。
- *   2. 跑一次 setupSheets() —— 建好全部五张表（幂等，已存在的表/列不会
- *      被破坏）。
+ *   2. 跑一次 setupSheets() —— 建好全部六张表（幂等，已存在的表/列不会
+ *      被破坏；Events 表如果 Core 项目已经建过，这里对它只读探测不改动）。
  *   3. （仅从 V3 或更早版本迁移时需要）跑一次 migrateSchemaV4()（在
  *      11_ProjectionRebuilder.gs 里）。
  *   4. 本项目【不需要】单独 Deploy as Web App——它是被 Personal AI Core
@@ -34,6 +53,13 @@ function setupSheets() {
     return;
   }
   var ss = SpreadsheetApp.openById(id);
+
+  // 【V4.3 修复】Events 表之前被 setupSheets() 完全忽略——见文件头修复说明。
+  // 表头必须跟 02_EventBus.gs 的 COLS 数组逐字一致，这是本项目/Core 项目/
+  // Reminder OS 三方共享同一张 Events 表时唯一需要保持同步的地方。
+  _ensureSheet_(ss, 'Events', [
+    'event_id', 'timestamp', 'type', 'chat_id', 'payload', 'source'
+  ]);
 
   _ensureSheet_(ss, 'Tasks', [
     'task_id', 'timestamp', 'title', 'category', 'status', 'due_date',
@@ -64,7 +90,8 @@ function setupSheets() {
     'task_id', 'chat_id', 'searchable_text', 'tags_csv'
   ]);
 
-  Logger.log('✅ Sheets 就位: Tasks, ActiveTasks, ArchiveTasks, TaskStatistics, TaskFilters（Events 由 Core 项目建）');
+  Logger.log('✅ Sheets 就位: Events, Tasks, ActiveTasks, ArchiveTasks, TaskStatistics, TaskFilters');
+  Logger.log('   （Events 表如果 Core 项目已经建过，上面这行只是确认存在，不会动它的数据）');
   Logger.log('下一步: 如果 Tasks 已有旧数据（V3 或更早） → migrateSchemaV4()；然后 createTriggers()');
 }
 
@@ -106,6 +133,9 @@ function createTriggers() {
 // ============ 修复：表头被污染 ============
 
 function repairSheetHeaders() {
+  _repairOneSheetHeader_('Events', [
+    'event_id', 'timestamp', 'type', 'chat_id', 'payload', 'source'
+  ]);
   _repairOneSheetHeader_('Tasks', [
     'task_id', 'timestamp', 'title', 'category', 'status', 'due_date',
     'recurring', 'priority', 'context', 'budget', 'notes', 'description',
@@ -211,11 +241,12 @@ function runDiagnostics() {
   }
   var ss = id ? SpreadsheetApp.openById(id) : null;
 
-  ['Tasks', 'ActiveTasks', 'ArchiveTasks', 'TaskStatistics', 'TaskFilters'].forEach(function (name) {
+  ['Events', 'Tasks', 'ActiveTasks', 'ArchiveTasks', 'TaskStatistics', 'TaskFilters'].forEach(function (name) {
     if (!ss) return;
     var sheet = ss.getSheetByName(name);
     if (!sheet) {
-      Logger.log('❌ Sheet "' + name + '" 不存在！先跑 setupSheets()');
+      Logger.log('❌ Sheet "' + name + '" 不存在！先跑 setupSheets()' +
+        (name === 'Events' ? '（V4.3 起 setupSheets() 也会建 Events 表了，见文件头修复说明）' : ''));
     } else {
       Logger.log('✅ Sheet "' + name + '" 存在，表头: ' + JSON.stringify(sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0]));
       Logger.log('   当前行数（含表头）: ' + sheet.getLastRow());
