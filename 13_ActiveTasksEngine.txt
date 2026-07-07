@@ -32,6 +32,17 @@
  * setValue()——归档行数一多就是N次独立的Sheet单格写入请求，容易触发执行
  * 超时/配额问题（跟 HIGH RISK 1 同一类问题）。改成：收集阶段就地把内存里
  * 的 row 引用打上标记，最后对整个 archived 列做一次 setValues() 批量写回。
+ *
+ * v3.3 变更（V4.4，2026-07-06，外部审计 MEDIUM RISK 2，核实属实后采纳）：
+ * runDailyArchive() 是"先追加 ArchiveTasks，再整列覆写 Tasks 的 archived
+ * 标记"两步操作，不具备事务原子性。如果第一步成功后、第二步执行前 GAS
+ * 中断（超时/异常/触发器被中途停掉），下次运行时这些行的 archived 标记
+ * 仍是 false，会被重新判定为"待归档"并再次追加进 ArchiveTasks，产生重复
+ * 归档行。修复：追加前先读一次 ArchiveTasks 现有 task_id 集合做排重校验，
+ * 已经在 ArchiveTasks 里但 Tasks 侧标记没写成功的行，不再重复追加，只
+ * 补写标记（自愈上次中断留下的半完成状态）。选择"排重校验"而不是审计
+ * 建议的另一方案"先标记再追加"——后者如果在标记后、追加前中断，任务会
+ * 从"未归档"直接消失又没真的进 ArchiveTasks，是更糟的数据丢失。
  */
 
 /**
@@ -118,12 +129,37 @@ var ActiveTasksEngine = (function () {
       return 0;
     }
 
+    // 【MEDIUM RISK 2 修复，外部审计，核实属实后采纳】runDailyArchive 之前
+    // 是"先追加 ArchiveTasks，再整列覆写 Tasks 的 archived 标记"——如果
+    // GAS 恰好在第一步成功、第二步执行前被打断（超时/异常/触发器被中途
+    // 停掉），下次触发器运行时，这些行的 archived 标记仍然是 false，会
+    // 被再次判定为"待归档"，重复追加进 ArchiveTasks，产生重复归档行。
+    //
+    // 修复：追加前先读一次 ArchiveTasks 现有的 task_id 集合，遇到"已经在
+    // ArchiveTasks 里、但 Tasks 这边 archived 标记因为上次中断没写成功"的
+    // 行，不再重复追加，只补写 archived 标记（等于自愈上次中断遗留的
+    // 半完成状态）。这不需要改变"先追加再标记"的顺序（审计建议的另一个
+    // 方案是"先标记再追加"，但那样如果在标记后、追加前中断，任务会从
+    // "未归档"直接消失又没真的进 ArchiveTasks，是更糟的数据丢失，所以
+    // 选排重校验而不是换顺序）。
+    var existingArchivedIds = {};
+    var archiveLastRow = archiveSheet.getLastRow();
+    if (archiveLastRow >= 2 && archiveHeaderMap.hasOwnProperty('task_id')) {
+      var archiveTaskIdCol = archiveHeaderMap['task_id'] + 1;
+      var archiveIds = archiveSheet.getRange(2, archiveTaskIdCol, archiveLastRow - 1, 1).getValues();
+      archiveIds.forEach(function (r) {
+        var id = String(r[0] || '');
+        if (id) existingArchivedIds[id] = true;
+      });
+    }
+
     var cutoff     = Date.now() - days * 24 * 60 * 60 * 1000;
     var doneStatuses = { 'DONE': true, 'CANCELLED': true };
     var archiveNowTimestamp = new Date().toISOString();
 
     var rowsToArchive    = []; // { rowArray, rowIndex (2-based) }
     var archiveRowArrays = []; // 要 setValues 到 ArchiveTasks 的行数组
+    var recoveredCount   = 0;  // 只补标记、没有重复追加的行数（上次中断的自愈）
 
     allRows.forEach(function (row, idx) {
       var status     = String(row[statusIdx] || '').toUpperCase();
@@ -140,19 +176,30 @@ var ActiveTasksEngine = (function () {
 
       rowsToArchive.push({ rowArray: row, rowIndex: idx + 2 });
 
-      // 构建 ArchiveTasks 行（在标记 archived 之前构建，archived 本身不是
-      // ArchiveTasks 的字段，顺序其实不影响正确性，但这样写更清楚：
-      // "先原样拷贝这一行的数据去archive，再改这一行在Tasks里的归档标记"）
-      var archiveRow = new Array(archiveSheet.getLastColumn()).fill('');
-      for (var h in tasksHeaderMap) {
-        if (archiveHeaderMap.hasOwnProperty(h)) {
-          archiveRow[archiveHeaderMap[h]] = row[tasksHeaderMap[h]];
+      var thisTaskId = String(row[taskIdIdx] || '');
+      var alreadyInArchiveSheet = thisTaskId && existingArchivedIds[thisTaskId];
+
+      if (!alreadyInArchiveSheet) {
+        // 构建 ArchiveTasks 行（在标记 archived 之前构建，archived 本身不是
+        // ArchiveTasks 的字段，顺序其实不影响正确性，但这样写更清楚：
+        // "先原样拷贝这一行的数据去archive，再改这一行在Tasks里的归档标记"）
+        var archiveRow = new Array(archiveSheet.getLastColumn()).fill('');
+        for (var h in tasksHeaderMap) {
+          if (archiveHeaderMap.hasOwnProperty(h)) {
+            archiveRow[archiveHeaderMap[h]] = row[tasksHeaderMap[h]];
+          }
         }
+        if (archiveHeaderMap.hasOwnProperty('archived_at')) {
+          archiveRow[archiveHeaderMap['archived_at']] = archiveNowTimestamp;
+        }
+        archiveRowArrays.push(archiveRow);
+      } else {
+        // 上次运行已经把这行写进 ArchiveTasks 了，只是中断在"标记 Tasks"
+        // 这一步之前——不重复追加，只补标记（见上方修复说明）。
+        recoveredCount++;
+        Logger.log('[ActiveTasksEngine] task_id=' + thisTaskId +
+          ' 已存在于 ArchiveTasks（上次运行中断的自愈），跳过重复追加，仅补标记');
       }
-      if (archiveHeaderMap.hasOwnProperty('archived_at')) {
-        archiveRow[archiveHeaderMap['archived_at']] = archiveNowTimestamp;
-      }
-      archiveRowArrays.push(archiveRow);
 
       // HIGH RISK 3 修复（外部审计，核实属实后采纳）：不在这里单独对 Sheet
       // 发 setValue() 请求。row 是 allRows[idx] 的同一个数组引用（JS数组存的
@@ -170,10 +217,12 @@ var ActiveTasksEngine = (function () {
       return 0;
     }
 
-    // 批量写入 ArchiveTasks
-    var archiveStartRow = archiveSheet.getLastRow() + 1;
-    archiveSheet.getRange(archiveStartRow, 1, archiveRowArrays.length, archiveSheet.getLastColumn())
-                .setValues(archiveRowArrays);
+    // 批量写入 ArchiveTasks（只写真正需要新追加的行，见上方排重校验）
+    if (archiveRowArrays.length > 0) {
+      var archiveStartRow = archiveSheet.getLastRow() + 1;
+      archiveSheet.getRange(archiveStartRow, 1, archiveRowArrays.length, archiveSheet.getLastColumn())
+                  .setValues(archiveRowArrays);
+    }
 
     // 在 Tasks 里标记 archived=true（如果有 archived 列）
     // HIGH RISK 3 修复：allRows 在上面收集阶段已经就地把被归档行的
@@ -191,7 +240,9 @@ var ActiveTasksEngine = (function () {
       tasksSheet.getRange(2, archivedIdx + 1, archivedColumnValues.length, 1).setValues(archivedColumnValues);
     }
 
-    Logger.log('✅ 归档完成：' + rowsToArchive.length + ' 条任务移至 ArchiveTasks');
+    Logger.log('✅ 归档完成：新追加 ' + archiveRowArrays.length + ' 条到 ArchiveTasks' +
+      (recoveredCount > 0 ? '，另有 ' + recoveredCount + ' 条是补标记（上次中断自愈，未重复追加）' : '') +
+      '，Tasks 侧共标记 ' + rowsToArchive.length + ' 条');
     return rowsToArchive.length;
   }
 
