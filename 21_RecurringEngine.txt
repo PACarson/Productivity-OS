@@ -1,6 +1,6 @@
 /**
  * 21_RecurringEngine.gs
- * Productivity OS v4.0 — Recurring Engine（V4 新增）
+ * Productivity OS v4.3 — Recurring Engine（V4 新增）
  *
  * 职责：recurring rules（包装 09_TemporalParser.gs 的重复规则解析）/
  * next occurrence（下一次到期日计算）/ recurrence lifecycle（完成后自动
@@ -15,6 +15,43 @@
  *
  * 依赖：09_TemporalParser.gs（computeNextDueDateFromLabel）、
  * 09_IdempotencyManager.gs（createTaskIfNotExists）
+ */
+
+/**
+ * ── Engine Contract（V4.3，按 00_Project_Constitution.gs 零之三标准补全）──
+ *   Responsibilities      : 重复规则解析包装 / 下一次到期日计算 / 完成后
+ *                           自动续期
+ *   Owns                  : legacy 重复字符串 ⇄ 09_TemporalParser 规则对象
+ *                           的转换规则、"什么情况下该生成下一次实例"的判断
+ *   Reads                 : 单个 task 快照（由调用方 20_TaskEngine.completeTask
+ *                           传入）
+ *   Writes                : none（生成下一次实例是委托
+ *                           09_IdempotencyManager.createTaskIfNotExists 做的，
+ *                           本模块自己不直接写任何东西）
+ *   Public API            : ruleToLegacyString(rule), computeNextDueDate
+ *                           (prevDueDateStr, recurringLabel),
+ *                           describeRule(recurringLabel),
+ *                           spawnNextIfNeeded(task, chatId)
+ *   Dependencies          : 09_TemporalParser.gs（computeNextDueDateFromLabel）、
+ *                           09_IdempotencyManager.gs（createTaskIfNotExists）
+ *   Forbidden Dependencies: Sheet 直接读写、Events 直接发布、Telegram/Output
+ *   Pure Function         : NO（spawnNextIfNeeded 间接触发写入；
+ *                           ruleToLegacyString/computeNextDueDate/
+ *                           describeRule 三个是纯函数）
+ *   Replay Events         : NO
+ *   Projection            : NO
+ *   Thread Safety         : 依赖 09_IdempotencyManager 内部的 ScriptLock，
+ *                           本模块自身不加锁
+ *   Side Effects          : spawnNextIfNeeded 有（间接创建新任务）；其余
+ *                           三个公开函数无
+ *   Notes                 : 本模块是 00_Project_Constitution.gs 零之四
+ *                           「已知例外」里唯一记录在案的 Domain→Application
+ *                           越层依赖（spawnNextIfNeeded → IdempotencyManager），
+ *                           刻意选择复用幂等路径而不是自己重新实现一遍去重。
+ *                           spawnNextIfNeeded 内部 try/catch 吞掉所有异常，
+ *                           保证"续期失败"不会波及调用方 completeTask 的
+ *                           主流程（"完成这一次"必须成功，"生成下一次"是
+ *                           锦上添花）。
  */
 
 var RecurringEngine = (function () {
