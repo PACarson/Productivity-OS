@@ -1,6 +1,6 @@
 /**
  * 20_TaskEngine.gs
- * Productivity OS v4.2 — Task Engine（create / update / complete / cancel）
+ * Productivity OS v4.3 — Task Engine（create / update / complete / cancel）
  *
  * 【V4.2 审计修复】（2026-07-06 第二轮外部审计，完整记录见
  * 00_Project_State.gs"已知Bug"）：
@@ -49,6 +49,50 @@
  *  - 只有 EventBus.publish 能写 Events
  *  - createTaskDirect_ 只允许 09_IdempotencyManager 调用，外部代码一律走
  *    createTask()（内部会经过幂等+锁）
+ */
+
+/**
+ * ── Engine Contract（V4.3，按 00_Project_Constitution.gs 零之三标准补全）──
+ *   Responsibilities      : Task 业务对象的四个核心生命周期操作
+ *                           （create/update/complete/cancel）
+ *   Owns                  : Task 字段校验规则（category/priority/recurring
+ *                           白名单）、identity 何时需要重算的判断
+ *                           （IDENTITY_AFFECTING_FIELDS）、Projection 失败
+ *                           时的一次性安全兜底写入
+ *   Reads                 : 单个 task（通过 TaskQueryEngine.getTask 校验
+ *                           存在性/取快照）
+ *   Writes                : Events（通过 EventBus.publish）；仅在
+ *                           event.projection_ok===false 时额外写一次
+ *                           Tasks/ActiveTasks（materializeTaskRow_ 安全兜底）
+ *   Public API            : createTask, updateTask, completeTask,
+ *                           cancelTask, getPendingTasks（另有
+ *                           createTaskDirect_ 仅供 09_IdempotencyManager
+ *                           调用，deriveFromEvent/deriveTaskState_/
+ *                           materializeTaskRow_/rebuildTasksSheet_ 仅供
+ *                           11_ProjectionRebuilder 调用）
+ *   Dependencies          : 09_IdempotencyManager.gs（创建路径）、
+ *                           12_TaskQueryEngine.gs（存在性校验/取快照）、
+ *                           21_RecurringEngine.gs（完成后续期）、
+ *                           02_EventBus.gs（发布事件）、05_SheetUtils.gs
+ *                           （安全兜底写入、shallowCopy_）、
+ *                           07_IdentityEngine.gs（updateTask 重算 identity）
+ *   Forbidden Dependencies: 06_TaskIntentParser.gs（不得反向依赖呈现层）
+ *   Pure Function         : NO（发布 Event，属于有副作用的 Application
+ *                           层操作，见 00_File_Map.gs Architecture
+ *                           Layer Map）
+ *   Replay Events         : NO（deriveTaskState_ 虽然重放 Events，但只
+ *                           供 11_ProjectionRebuilder 在离线场景调用，不
+ *                           在任何正常业务路径上）
+ *   Projection            : NO（本身不是 Projection 权威写入方，
+ *                           materializeTaskRow_ 只是失败兜底，见
+ *                           00_Project_Constitution.gs P6 铁律2/3）
+ *   Thread Safety         : 依赖 09_IdempotencyManager 的 ScriptLock
+ *                           （仅创建路径需要；update/complete/cancel 本身
+ *                           不加锁，因为都是针对已存在 task_id 的幂等操作）
+ *   Side Effects          : YES（Event 发布 + 偶发 Sheet 写入）
+ *   Notes                 : V4.2 修复了 identity 未随 update 重算、
+ *                           无条件双写、幽灵行三个问题，详见
+ *                           00_Project_State.gs"已知Bug"。
  */
 
 var ProductivityConfig = Object.freeze({
