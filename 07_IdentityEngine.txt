@@ -13,6 +13,28 @@
  * 依赖：无（最底层工具模块，零外部依赖）
  */
 
+/**
+ * ── Engine Contract（V4.3，按 00_Project_Constitution.gs 零之三标准补全）──
+ *   Responsibilities      : 为业务对象生成确定性 SHA-256 身份标识（Identity）
+ *   Owns                  : Identity 哈希算法本身（字段拼接顺序 + SHA-256）
+ *   Reads                 : 若干原始字段（chatId/title/dueDate/recurring/
+ *                           priority/category 等，按调用方传入的参数）
+ *   Writes                : none
+ *   Public API            : generateTaskIdentity(chatId, title, dueDate,
+ *                           recurring, priority, category)
+ *   Dependencies          : 无（GAS 内建 Utilities.computeDigest 除外）
+ *   Forbidden Dependencies: Sheet, Events, Telegram/Output，任何其他 Engine
+ *   Pure Function         : YES
+ *   Replay Events         : NO
+ *   Projection            : NO
+ *   Thread Safety         : 天然安全（纯函数，无共享可变状态）
+ *   Side Effects          : NO
+ *   Notes                 : 本模块被 08_DeduplicationEngine（Application 层）
+ *                           和 20_TaskEngine（Application 层）调用，自身
+ *                           属于 Domain 层最底层的纯计算工具，不依赖任何
+ *                           其他 Engine（00_File_Map.gs Architecture Layer Map）。
+ */
+
 var IdentityEngine = (function () {
 
   // ============ SHA-256 ============
