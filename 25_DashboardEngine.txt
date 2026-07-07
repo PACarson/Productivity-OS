@@ -1,6 +1,6 @@
 /**
  * 25_DashboardEngine.gs
- * Productivity OS v4.0 — Dashboard Engine（V4 新增）
+ * Productivity OS v4.3 — Dashboard Engine（V4 新增）
  *
  * 职责：组合 24_ViewEngine.gs + 26_AnalyticsEngine.gs 的输出，拼成规格书
  * 里 Today / Weekly / Monthly / Statistics 四种 Dashboard 的展示文案。
@@ -8,6 +8,36 @@
  * 不额外落盘（不建物理 Dashboard Sheet）——架构决策见
  * 00_Project_Constitution.gs P7。本 Engine 仍然是纯函数：输入是
  * 12_TaskQueryEngine.gs 已经批量读出来的 task 数组，自己不读 Sheet。
+ */
+
+/**
+ * ── Engine Contract（V4.3，按 00_Project_Constitution.gs 零之三标准补全）──
+ *   Responsibilities      : 组合多个逻辑视图 + 统计数字，拼成 Today/
+ *                           Weekly/Monthly/Statistics 四种 Dashboard 文案
+ *   Owns                  : Dashboard 展示格式本身（分区顺序、图标、按
+ *                           category 动态生成补充板块的规则）
+ *   Reads                 : task[]（由调用方传入）
+ *   Writes                : none
+ *   Public API            : build(type, allTasks), buildTodayDashboard,
+ *                           buildWeeklyDashboard, buildMonthlyDashboard,
+ *                           buildStatisticsDashboard
+ *   Dependencies          : 24_ViewEngine.gs（今日/本周/逾期等视图过滤）、
+ *                           22_PriorityEngine.gs（Today Dashboard 内的
+ *                           排序）、26_AnalyticsEngine.gs（统计数字）
+ *   Forbidden Dependencies: Sheet, Events, Telegram/Output（返回值是纯
+ *                           文本字符串，不是 Telegram 消息格式，呼应
+ *                           ADR-2026-07-06 关于"不知道 Telegram 是什么"
+ *                           的正式条款）
+ *   Pure Function         : YES
+ *   Replay Events         : NO
+ *   Projection            : NO
+ *   Thread Safety         : 不需要（无共享可变状态）
+ *   Side Effects          : NO
+ *   Notes                 : 完整架构论证见 00_ADR.gs ADR-2026-07-06——
+ *                           Dashboard 不满足 Projection 的基本性质（同一份
+ *                           Events 历史在不同时刻重放结果应该相同），所以
+ *                           属于 View/Presentation Layer 而不是 Projection
+ *                           Layer，SHALL 永远按需生成、不得落盘。
  */
 
 var DashboardEngine = (function () {
