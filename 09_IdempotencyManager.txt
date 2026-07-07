@@ -1,39 +1,50 @@
 /**
  * 09_IdempotencyManager.gs
- * Productivity OS v4.2 — 幂等性管理器（Task）
+ * Productivity OS v4.4 — 幂等性管理器（Task）
  *
  * 职责：确保每个创建操作恰好执行一次（Exactly-Once Semantics）。
  * 所有模块创建 Task 必须经过本层，禁止直接 EventBus.publish('TASK_CREATED')。
  *
- * 【V4.2 修复 HIGH RISK 1：Webhook 超时与 GAS 并发限制级联失效】
- * 原来 lock.waitLock(10000) 最多等 10 秒。Telegram Webhook 通常要求
- * 2~5 秒内返回响应，一旦某次执行因为等锁排到快 10 秒才拿到/超时，
- * Telegram 会判定这次投递超时，发起重试——重试请求又要重新排队等锁，
- * 越堆越多，很容易在高并发（多用户同时发消息，或 Telegram 密集重试）下
- * 把 GAS 每用户 30 并发执行线程的上限耗尽，导致整个项目（不只是这一个
- * chatId）级联失效。
+ * 【V4.4 修复 MEDIUM RISK 1：全局脚本锁引发的多用户并发排队】
+ * 原来用 LockService.getScriptLock() 包住"读-校验-写"整段逻辑。这把锁的
+ * 作用域是整个部署级别（跨所有用户），User B 的创建请求会被 User A 完全
+ * 无关的写入请求无差别锁住，被迫排队——哪怕 User A 和 User B 要创建的是
+ * 八竿子打不着的任务。锁等待时间在 V4.2 已经从 10s 降到 3s（HIGH RISK 1
+ * 修复），但那只解决了"排队排太久导致 Webhook 超时"的问题，没解决"不同
+ * 用户之间根本不该互相排队"这个更本质的问题——User B 依然会频繁遇到跟
+ * 自己完全无关的 SYSTEM_BUSY。
  *
- * 修复：
- *   1. 锁等待时间从 10000ms 降到 LOCK_WAIT_MS=3000ms——3 秒内拿不到锁，
- *      说明确实在高并发排队，与其继续占着这条 Webhook 执行通道死等，
- *      不如立刻 fail-fast 放弃，把执行通道让出来。
- *   2. 拿锁失败（waitLock 抛错）跟"拿到锁之后业务逻辑抛错"现在是两条
- *      分支：前者包装成一个能被上游识别的 "SYSTEM_BUSY:" 前缀错误，
- *      上游（06_TaskIntentParser.gs）会捕获它并给用户回一句"系统繁忙，
- *      请重试"，而不是让整个 Webhook 调用链挂起等待或裸抛 500。
+ * 修复：改成"每用户软锁"（per-chatId soft lock），分两层：
  *
- * 【V4 修复 LOW RISK 2】原来调用裸全局函数 _createTaskDirect_，现在改成调用
- * TaskEngine.createTaskDirect_（20_TaskEngine.gs 的 IIFE 内部方法）。
+ *   1. Gate（瞬时全局锁，GATE_WAIT_MS=500ms）：只用来保护"读 CacheService+
+ *      写 CacheService"这一步本身的原子性（CacheService 本身没有原子的
+ *      compare-and-set，需要一把锁包住"检查+占位"这一下才能避免竞态）。
+ *      这一步通常几毫秒就结束，不会像原来那样把整个"读 Sheet 判重 + 写
+ *      Sheet 建任务"的耗时操作都锁在里面，所以不同用户之间几乎不会再
+ *      互相阻塞——即使 User A 的创建流程要跑几百毫秒，User B 排队等的
+ *      只是 User A 那次"检查+占位"的几毫秒，不是 User A 的整个流程。
+ *   2. Soft Lock（每 chatId 一把，CacheService，LOCK_TTL_SECONDS=15s 安全
+ *      过期兜底）：真正防止"同一个用户"并发重试的是这把锁——只锁自己，
+ *      不锁别人。
  *
- * ⚠️ 锁说明：
- *  - getScriptLock() 是进程级（Script）锁，同一个 GAS 部署（本项目）下所有
- *    并发执行共用，只保护本项目自己的并发执行，不跨项目。
- *  - LOCK_WAIT_MS = 3000：最多等 3 秒，超时立刻 fail-fast（见上方修复说明）。
- *  - 锁只在"确实拿到"之后才会进 finally 释放；waitLock 本身抛错时锁根本
- *    没拿到，不需要也不能 releaseLock（否则会因为释放一把不属于当前调用的
- *    锁而抛 "Lock not held" 错误）。
- *  - GAS LockService 锁不可重入。TaskEngine.createTaskDirect_ 不尝试再获取
- *    ScriptLock，所以安全。
+ * ⚠️ 诚实说明这个方案的取舍（不回避）：Gate 本身解决了"检查+占位"这一步
+ * 的原子性，但如果 GAS 执行在 Gate 释放之后、finally 释放 Soft Lock 之前
+ * 被平台强制中断（比如 6 分钟硬上限，正常创建任务的耗时不可能碰到这个
+ * 上限，只是理论上存在），Soft Lock 会一直占着直到 LOCK_TTL_SECONDS 过期
+ * 才自动释放——这是"最终会自愈"而不是"绝对不会发生"，比原来的 ScriptLock
+ * （进程结束必然释放）弱一点，用这一点点弱化换来"不同用户不再互相排队"，
+ * 认为是值得的取舍。DeduplicationEngine.findExistingTask（防线3）作为最终
+ * 兜底不变——就算两个真正意义上的竞态请求都侥幸拿到了各自的判断窗口，
+ * 最后写入前的 identity 判重仍然是最后一道防线。
+ *
+ * 【V4.2 修复 HIGH RISK 1：Webhook 超时与 GAS 并发限制级联失效】（历史，
+ * 部分内容被本次 V4.4 取代，完整对照见 00_Project_State.gs）：
+ * 原来 lock.waitLock(10000) 最多等 10 秒，V4.2 降到 3 秒 fail-fast。V4.4
+ * 的 Soft Lock 沿用同一个"fail-fast、抛 SYSTEM_BUSY: 前缀错误"的对外契约，
+ * 06_TaskIntentParser.gs 的 catch 逻辑不用改一行。
+ *
+ * 【V4 修复 LOW RISK 2】调用 TaskEngine.createTaskDirect_（IIFE 内部方法），
+ * 不再是裸全局函数 _createTaskDirect_。
  *
  * 依赖：
  *   07_IdentityEngine, 08_DeduplicationEngine, 20_TaskEngine.gs
@@ -42,21 +53,70 @@
 
 var IdempotencyManager = (function () {
 
-  var LOCK_WAIT_MS = 3000; // V4.2：原 10000，见文件头 HIGH RISK 1 修复说明
+  var GATE_WAIT_MS      = 500;  // Gate 只保护"检查+占位"这一下，等待时间可以很短
+  var LOCK_TTL_SECONDS  = 15;   // Soft Lock 安全过期兜底（正常释放远快于这个时间）
+
+  // ============ 内部：per-chatId Soft Lock ============
+
+  function _softLockKey_(chatId) {
+    return 'idem_lock:' + (chatId || 'unknown_chat');
+  }
+
+  /**
+   * 尝试获取某个 chatId 的软锁。
+   * @returns {boolean} true=拿到了；false=这个 chatId 当前已经有请求在处理
+   * @throws {Error} message 以 "SYSTEM_BUSY:" 开头 —— 连"检查+占位"这个
+   *                 瞬时 Gate 都排不上，说明全站范围内正处于极端并发，
+   *                 直接判定繁忙（这种情况应该极其罕见，Gate 等待窗口
+   *                 通常几毫秒就能轮到）。
+   */
+  function _acquireSoftLock_(chatId) {
+    var cache = CacheService.getScriptCache();
+    var key = _softLockKey_(chatId);
+
+    var gate = LockService.getScriptLock();
+    try {
+      gate.waitLock(GATE_WAIT_MS);
+    } catch (gateErr) {
+      Logger.log('[IdempotencyManager] Gate（瞬时锁）在 ' + GATE_WAIT_MS +
+        'ms 内没拿到——全站并发极高，fail-fast: ' + gateErr.message);
+      throw new Error('SYSTEM_BUSY: 系统繁忙（当前并发写入极多），请几秒后重试。');
+    }
+
+    try {
+      if (cache.get(key)) {
+        return false; // 这个 chatId 已经有一个请求在处理中
+      }
+      cache.put(key, '1', LOCK_TTL_SECONDS);
+      return true;
+    } finally {
+      gate.releaseLock(); // Gate 只保护这一小段，立刻释放，不等到业务逻辑跑完
+    }
+  }
+
+  function _releaseSoftLock_(chatId) {
+    try {
+      CacheService.getScriptCache().remove(_softLockKey_(chatId));
+    } catch (e) {
+      // Soft Lock 释放失败不影响主流程——LOCK_TTL_SECONDS 会兜底自动过期
+      Logger.log('[IdempotencyManager] Soft Lock 释放失败（不影响本次结果，会在 ' +
+        LOCK_TTL_SECONDS + '秒后自动过期）: ' + e.message);
+    }
+  }
 
   // ============ Task ============
 
   /**
-   * 创建任务（幂等，并发安全）
+   * 创建任务（幂等，并发安全——同一 chatId 严格串行，不同 chatId 互不阻塞）
    *
    * @param {string} title
    * @param {object} meta   { category, priority, due_date, recurring, context, budget, notes, description, tags }
    * @param {string} chatId
    * @returns {{ task: object, created: boolean }}
-   * @throws {Error}  message 以 "SYSTEM_BUSY:" 开头 —— 3 秒内没拿到锁，
-   *                   调用方（尤其是 Telegram 指令路径）应该捕获这个错误，
-   *                   给用户一个"稍后重试"的友好提示，不要让它裸传播成
-   *                   未处理异常。
+   * @throws {Error}  message 以 "SYSTEM_BUSY:" 开头 —— 同一个 chatId 已经
+   *                   有一个创建请求在处理中，调用方（尤其是 Telegram 指令
+   *                   路径）应该捕获这个错误，给用户一个"稍后重试"的友好
+   *                   提示，不要让它裸传播成未处理异常。
    */
   function createTaskIfNotExists(title, meta, chatId) {
     meta = meta || {};
@@ -70,18 +130,13 @@ var IdempotencyManager = (function () {
       meta.category   || 'GENERAL'
     );
 
-    var lock = LockService.getScriptLock();
-
-    // ── 第一阶段：只负责拿锁，拿不到就 fail-fast，不进入下面的业务逻辑 ──────
-    try {
-      lock.waitLock(LOCK_WAIT_MS);
-    } catch (lockErr) {
-      Logger.log('[IdempotencyManager] ' + LOCK_WAIT_MS + 'ms 内没拿到锁，fail-fast 放弃本次创建' +
-        '（避免继续占用 Webhook 执行通道引发级联超时）: identity=' + identity.slice(0, 12) + '... ' + lockErr.message);
-      throw new Error('SYSTEM_BUSY: 系统繁忙（当前并发写入较多），请几秒后重试。');
+    var acquired = _acquireSoftLock_(chatId);
+    if (!acquired) {
+      Logger.log('[IdempotencyManager] chatId=' + chatId + ' 已有请求在处理中，fail-fast 放弃本次创建' +
+        '（只影响这一个用户，不影响其他用户）: identity=' + identity.slice(0, 12) + '...');
+      throw new Error('SYSTEM_BUSY: 你刚才的请求还在处理中，请稍等几秒再试一次。');
     }
 
-    // ── 第二阶段：锁已经拿到，读-校验-写 原子化 ────────────────────────────
     try {
       var existing = DeduplicationEngine.findExistingTask(identity);
       if (existing) {
@@ -93,7 +148,7 @@ var IdempotencyManager = (function () {
       return { task: task, created: true };
 
     } finally {
-      lock.releaseLock(); // 走到这里锁必然已经拿到，直接释放，不需要 lockAcquired 标志位
+      _releaseSoftLock_(chatId);
     }
   }
 
@@ -108,7 +163,7 @@ var IdempotencyManager = (function () {
     var r1 = createTaskIfNotExists(title, { priority: 'LOW', category: 'GENERAL' }, chatId);
     Logger.log('结果1: created=' + r1.created + ' task_id=' + r1.task.task_id);
 
-    Logger.log('第二次创建（模拟 Telegram Webhook 重试）...');
+    Logger.log('第二次创建（模拟 Telegram Webhook 重试，同一个 chatId）...');
     var r2 = createTaskIfNotExists(title, { priority: 'LOW', category: 'GENERAL' }, chatId);
     Logger.log('结果2: created=' + r2.created + ' task_id=' + r2.task.task_id);
 
@@ -119,29 +174,41 @@ var IdempotencyManager = (function () {
     Logger.log('=== testWebhookRetry ' + (ok1 && ok2 ? 'PASS ✅' : 'FAIL ❌') + ' ===');
   }
 
+  /**
+   * 【V4.4 新增】验证不同 chatId 之间不会因为软锁互相拖累。
+   * ⚠️ 局限：GAS 编辑器手动运行是单线程顺序执行，没法真正模拟"两个用户
+   * 同一毫秒并发请求"——这个测试只能确认"不同 chatId 依次调用时，任何一个
+   * 都不会因为另一个 chatId 曾经拿过锁而被拒绝"，真正的并发表现需要用
+   * 多个真实 Telegram 用户同时发消息来验证。
+   */
+  function testDifferentChatsDontBlock() {
+    Logger.log('=== IdempotencyManager.testDifferentChatsDontBlock ===');
+    var chatA = 'test_chat_A_' + new Date().getTime();
+    var chatB = 'test_chat_B_' + new Date().getTime();
+
+    var rA = createTaskIfNotExists('用户A的任务', { priority: 'LOW' }, chatA);
+    var rB = createTaskIfNotExists('用户B的任务', { priority: 'LOW' }, chatB);
+
+    var ok = rA.created && rB.created && rA.task.task_id !== rB.task.task_id;
+    Logger.log('两个不同 chatId 都成功创建且互不干扰？ ' + ok + '  (expected: true)');
+    Logger.log('=== testDifferentChatsDontBlock ' + (ok ? 'PASS ✅' : 'FAIL ❌') + ' ===');
+  }
+
   function testConcurrentExecution() {
     Logger.log('=== IdempotencyManager.testConcurrentExecution ===');
-    Logger.log('三层总防线：');
-    Logger.log('  防线1：ScriptLock（' + LOCK_WAIT_MS + 'ms fail-fast） → 并发执行串行化（最强）');
+    Logger.log('四层总防线（V4.4 起，原"防线1 ScriptLock"拆成 Gate+Soft Lock 两层）：');
+    Logger.log('  防线1a：Gate（' + GATE_WAIT_MS + 'ms 全局瞬时锁）→ 只保护"检查+占位"这一下的原子性');
+    Logger.log('  防线1b：Soft Lock（每 chatId 一把，CacheService，' + LOCK_TTL_SECONDS + 's 过期兜底）→ 同用户严格串行，不同用户互不阻塞');
     Logger.log('  防线2：EventBus._inExecIdentityCache_ → 同次执行内双写（补充）');
-    Logger.log('  防线3：DeduplicationEngine.findExistingTask → 跨执行跨实例去重（兜底）');
+    Logger.log('  防线3：DeduplicationEngine.findExistingTask → 跨执行跨实例去重（最终兜底）');
     Logger.log('如需压力测试，手动在 GAS 编辑器同时触发两个执行，检查 Tasks Sheet 行数。');
     Logger.log('=== testConcurrentExecution DONE ===');
   }
 
-  function testLockTimeout() {
-    Logger.log('=== IdempotencyManager.testLockTimeout ===');
-    Logger.log('本函数不模拟真实并发（GAS 编辑器手动运行是单线程），只做文档性说明：');
-    Logger.log('LOCK_WAIT_MS=' + LOCK_WAIT_MS + '，超过这个时间拿不到锁会抛 "SYSTEM_BUSY:" 开头的 Error。');
-    Logger.log('06_TaskIntentParser.gs 的 TASK_CREATE 分支已经 catch 这个错误并转成友好提示，');
-    Logger.log('请人工触发高并发（比如短时间内连续发很多条建任务的消息）来验证真实表现。');
-    Logger.log('=== testLockTimeout DONE ===');
-  }
-
   return {
-    createTaskIfNotExists:   createTaskIfNotExists,
-    testWebhookRetry:        testWebhookRetry,
-    testConcurrentExecution: testConcurrentExecution,
-    testLockTimeout:         testLockTimeout
+    createTaskIfNotExists:       createTaskIfNotExists,
+    testWebhookRetry:            testWebhookRetry,
+    testDifferentChatsDontBlock: testDifferentChatsDontBlock,
+    testConcurrentExecution:     testConcurrentExecution
   };
 })();
