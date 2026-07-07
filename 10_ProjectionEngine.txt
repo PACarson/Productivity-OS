@@ -1,6 +1,6 @@
 /**
  * 10_ProjectionEngine.gs
- * Productivity OS v4.2 — Projection Engine（Read Model 实时更新器）
+ * Productivity OS v4.3 — Projection Engine（Read Model 实时更新器）
  *
  * 职责：EventBus.publish() 写完 Event 后立即调用本模块，将变更增量写入
  * Read Model（Tasks / ActiveTasks / TaskStatistics / TaskFilters）。
@@ -51,6 +51,41 @@
  * 获取锁（防止与 IdempotencyManager 的锁形成重入死锁）。
  *
  * 依赖：05_SheetUtils（upsertRowByKey_, deleteRowByKey_, getSheet_, getHeaderMap_）
+ */
+
+/**
+ * ── Engine Contract（V4.3，按 00_Project_Constitution.gs 零之三标准补全）──
+ *   Responsibilities      : 把 Event 增量投影成 Read Model（Tasks/
+ *                           ActiveTasks/TaskStatistics/TaskFilters）
+ *   Owns                  : 本 OS 唯一的 Projection 写入逻辑（"一个 Event
+ *                           该怎么变成 Read Model 的变化"这条规则只有这里
+ *                           实现一次）
+ *   Reads                 : 单个 event 对象（由 02_EventBus.publish 传入）；
+ *                           必要时读取单行 Tasks 记录做增量计算的基准
+ *                           （_getRowByKey_）
+ *   Writes                : Tasks / ActiveTasks / TaskStatistics /
+ *                           TaskFilters 四张 Sheet
+ *   Public API            : dispatch(event)
+ *   Dependencies          : 05_SheetUtils.gs（upsertRowByKey_/
+ *                           deleteRowByKey_/getSheet_/getHeaderMap_/
+ *                           shallowCopy_）
+ *   Forbidden Dependencies: 02_EventBus.gs（不得反向调用，dispatch 是被
+ *                           EventBus.publish 调用的，不能反过来）、
+ *                           Application/Presentation 任何模块
+ *   Pure Function         : NO（直接写 Sheet）
+ *   Replay Events         : NO（只处理单个 event，不重放历史；全量重放是
+ *                           11_ProjectionRebuilder.gs 的职责）
+ *   Projection            : YES（本 OS 唯一权威的 Projection 写入方，见
+ *                           00_Project_Constitution.gs P6 铁律2）
+ *   Thread Safety         : 依赖上游 09_IdempotencyManager 持有的
+ *                           ScriptLock，本模块自身不加锁（重复加锁会跟
+ *                           上游锁形成重入死锁，见文件头注释）
+ *   Side Effects          : YES（Sheet 写入是本模块存在的意义）
+ *   Notes                 : dispatch() 内部的每个 project*_ 函数失败时只
+ *                           记录日志、不抛错（02_EventBus.gs 会捕获并将
+ *                           event.projection_ok 置 false），保证一个
+ *                           Projection 步骤失败不会波及 Event 已经成功
+ *                           写入这个事实。
  */
 
 var ProjectionEngine = (function () {
