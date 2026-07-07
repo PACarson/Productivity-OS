@@ -1,6 +1,6 @@
 /**
  * 00_ADR.gs
- * Productivity OS v4.3 — Architecture Decision Records
+ * Productivity OS v4.4 — Architecture Decision Records
  *
  * 本文件收录本项目"影响后续所有开发判断"的重大架构决策，格式固定为
  * Metadata（V4.3 新增，见下方字段定义） + Context / Decision /
@@ -12,6 +12,9 @@
  * 本文件对应 Universal Domain OS Blueprint「0. Governance → ADR (Optional)」
  * 这一格（00_Project_Constitution.gs P4 之前原本写"暂无"，V4.1 起改为
  * 指向本文件）。
+ *
+ * 【V4.4 新增】ADR-2026-07-06-003（Per-User Soft Lock 取代全局 ScriptLock，
+ * 第二轮外部审计 MEDIUM RISK 1 的正式记录）。
  *
  * 【V4.3 变更】
  *   1. 所有 ADR 统一补充 Metadata 区块（字段：ADR Number/Status/
@@ -219,4 +222,77 @@
  *     同步，理论上还是有"改了一处忘了改另一处"的风险——这个风险目前
  *     被认为可以接受（表结构变化频率低，且 15_Setup.gs 本身不大，两处
  *     字面量在同一个文件里，review 时容易发现不一致）。
+ */
+
+// ============================================================
+// ADR-2026-07-06-003：Per-User Soft Lock 取代全局 ScriptLock
+// ============================================================
+
+/**
+ * ── Metadata ──────────────────────────────────────────────────────────────
+ *   ADR Number      : ADR-2026-07-06-003
+ *   Status          : Accepted
+ *   Decision Date   : 2026-07-06
+ *   Supersedes      : （无——V4.2 的"锁等待时间 10s→3s"修复不算被取代，
+ *                     那次解决的是"等太久"，这次解决的是"不该等别人"，
+ *                     是两个不同维度的问题，见 Context）
+ *   Superseded By   : （无，仍然生效）
+ *   Affected Modules: 09_IdempotencyManager.gs
+ *   Related ADR     : （无）
+ *   Consequences    : 见下方正文
+ *   Notes           : 本 ADR 是第二轮外部审计 MEDIUM RISK 1 的正式记录。
+ *
+ * ── Context ──────────────────────────────────────────────────────────────
+ *
+ * 09_IdempotencyManager.createTaskIfNotExists 用 LockService.getScriptLock()
+ * 包住"读 Read Model 判重 + 写 Events + 写 Sheet"整段逻辑。GAS 的
+ * ScriptLock 作用域是整个部署级别——跨所有用户、跨所有并发执行。V4.2 把
+ * 等待时间从 10 秒降到 3 秒（HIGH RISK 1 修复），解决的是"排队排太久导致
+ * Webhook 超时"，但没有解决更本质的问题：User B 的创建请求会被 User A
+ * 完全无关的写入请求无差别锁住——哪怕两人要创建的是八竿子打不着的任务，
+ * 也要排队。系统用户数一多，这种无谓排队会频繁触发 SYSTEM_BUSY，且报错
+ * 的原因（"有一个陌生人也在建任务"）对被拒绝的用户来说完全不可理解。
+ *
+ * ── Decision ──────────────────────────────────────────────────────────────
+ *
+ * 用"每 chatId 一把的软锁"取代全局 ScriptLock，分两层：
+ *
+ *   1. Gate：一把作用域仍然是全局的 ScriptLock，但只用来保护"读
+ *      CacheService + 写 CacheService"这一步本身的原子性（CacheService
+ *      没有原生的 compare-and-set，需要靠这把锁補上"检查+占位"这一下的
+ *      原子性）。这一步是内存级操作，耗时几毫秒，等待窗口设得很短
+ *      （GATE_WAIT_MS=500ms）。
+ *   2. Soft Lock：真正的业务锁，键是 chatId，存在 CacheService 里，只锁
+ *      同一个用户，不同用户之间的 Soft Lock 是不同的 key，天然不冲突。
+ *      设 LOCK_TTL_SECONDS=15s 作为安全过期兜底。
+ *
+ * 效果：不同用户之间不再因为"抢同一把全局锁"而互相排队——Gate 持有时间
+ * 短到可以忽略，User B 实质上只会在"跟 User A 恰好在同一毫秒抢同一个
+ * Gate"这种极小概率场景下才会有感知得到的等待，且等待时间是毫秒级而不是
+ * 整个创建流程的耗时。同一个用户内部的并发请求（双击/Telegram 重试）仍然
+ * 被 Soft Lock 严格拦截，行为跟原来一致。
+ *
+ * ── Consequences ──────────────────────────────────────────────────────────
+ *
+ * 正面：
+ *   - 不同用户之间的创建请求不再互相阻塞，解决了"系统用户越多、
+ *     SYSTEM_BUSY 越频繁"这个原来会随用户规模变差的问题
+ *   - 对外契约不变：拿不到锁仍然抛 "SYSTEM_BUSY:" 前缀的 Error，
+ *     06_TaskIntentParser.gs 的 catch 逻辑不用改一行
+ *
+ * 需要接受的代价（不回避）：
+ *   - CacheService 本身不提供原子操作，Gate 解决的是"检查+占位"这一步的
+ *     原子性，但如果 GAS 执行在 Gate 释放之后、finally 释放 Soft Lock
+ *     之前被平台强制中断（理论上只有撞到 6 分钟硬上限这种极端情况才会
+ *     发生，正常创建任务的耗时远远够不到），Soft Lock 会一直占用到
+ *     LOCK_TTL_SECONDS 过期才自动释放——这是"最终会自愈"而不是"绝对
+ *     不会发生"，比原来 ScriptLock"进程结束必然释放"的保证弱一点。
+ *   - DeduplicationEngine.findExistingTask（防线3）作为最终兜底的角色不变，
+ *     仍然是即使前两层软锁都侥幸被绕过时的最后一道防线；这次修复没有
+ *     让系统变得"完全不可能重复创建"，只是把"绝大多数情况下靠强互斥锁
+ *     保证"换成了"绝大多数情况下靠软锁保证，极端情况下靠 identity 判重
+ *     兜底"，用一点点理论上的严谨性换取实际的并发表现。
+ *   - 单元测试层面这个改动几乎无法在 GAS 编辑器里做真正的并发验证（见
+ *     09_IdempotencyManager.gs 的 testDifferentChatsDontBlock 函数头注释），
+ *     真实并发表现需要用多个真实 Telegram 用户同时发消息验证。
  */

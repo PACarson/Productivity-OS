@@ -1,6 +1,6 @@
 /**
  * 26_AnalyticsEngine.gs
- * Productivity OS v4.3 — Analytics Engine（V4 新增）
+ * Productivity OS v4.4 — Analytics Engine（V4 新增）
  *
  * 职责：completion rate / overdue rate / reminder statistics / recurring
  * statistics / workload。
@@ -14,6 +14,14 @@
  * 这是 00_Project_Constitution.gs P6 铁律4 明确写的例外，且仅限于这一个
  * 函数、明确标注、不在任何 Telegram 指令路径上（12_TaskQueryEngine.
  * getStatistics 不调用它，需要历史趋势的场景请在 GAS 编辑器手动调用）。
+ *
+ * 【V4.4 澄清 HIGH RISK 3】外部审计提到"普通用户通过 Telegram 触发
+ * /insights 指令会调用 replayCompletionTrend_"——核实后本项目没有 /insights
+ * 或任何等价指令接到这个函数上（06_TaskIntentParser.gs 的指令列表里
+ * 不存在），这条风险描述在本项目里不成立。但"Events 表全量扫描"这个
+ * 底层风险本身是真实的（Events 只增不减，迟早会大），已经在
+ * 02_EventBus.gs 的 getAllEvents() 里加了行数警告——本函数调用
+ * getAllEvents() 时会自动带上这层保护，不需要在这里重复实现。
  */
 
 /**

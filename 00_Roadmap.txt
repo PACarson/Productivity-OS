@@ -1,6 +1,6 @@
 /**
  * 00_Roadmap.gs
- * Productivity OS v4.3 — Roadmap（长期规划）
+ * Productivity OS v4.4 — Roadmap（长期规划）
  *
  * ⚠️ 本文件只谈"接下来要往哪走"，不记录历史、不记录 Bug、不记录架构决策——
  * 那三类内容分别属于 00_Project_State.gs（当前状态快照）、
@@ -13,14 +13,17 @@
 // ============================================================
 
 /**
- * V4.3——Architecture / Governance Upgrade。
+ * V4.4——第三轮外部审计修复（连续点击幂等化、跨用户软锁、归档排重、
+ * Events 规模可见性、命名空间收敛）。
  *
  * 本 OS 现状一句话概括：9 个 Engine（Task/Recurring/Priority/Search/View/
  * Dashboard/Analytics/Query + Archive），严格 CQRS（Events 唯一 Write
  * Model，Tasks/ActiveTasks/TaskStatistics/TaskFilters 四张 Projection 表，
  * View/Dashboard 按需生成不落盘），治理文档齐备（Constitution/State/
  * File Map/ADR/Roadmap 五份），Telegram 是唯一呈现层但 Query/View/
- * Dashboard 三层已经不依赖 Telegram 这个呈现介质本身。
+ * Dashboard 三层已经不依赖 Telegram 这个呈现介质本身。跨项目遗留问题
+ * （04_Main.gs/80_RiderConnector.gs 相关，见 00_Project_State.gs"下一步"
+ * P1）不在本 OS 范围内，需要另外在对应项目里处理。
  */
 
 // ============================================================
@@ -95,6 +98,14 @@
  *   - Monitoring（主动监控）：目前是被动告警
  *     （02_EventBus._alertAdminProjectionFailure_），如果 Projection
  *     失败频率变得不可忽视，应该考虑主动监控而不是等失败发生再告警。
+ *
+ *   - 移除 20_TaskEngine.gs 的裸全局 wrapper 函数（createTask/updateTask/
+ *     completeTask/cancelTask/getPendingTasks 等，V4.4 第三轮审计
+ *     LOW RISK 2）：V4.4 起已经加了 @deprecated 标注，指向
+ *     ProductivityOS.TaskEngine.xxx 命名空间路径，但没有移除任何一个——
+ *     移除的前提是先确认 Core 项目 04_Main.gs 等全部消费端都已经切换
+ *     完毕，这需要跨项目协调（见 00_Project_State.gs"下一步"P1），本项目
+ *     单方面无法判断"是否已经没人在用旧接口"，暂不启动移除。
  */
 
 // ============================================================

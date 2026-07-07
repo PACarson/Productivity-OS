@@ -2,6 +2,12 @@
  * 09_TemporalParser.gs
  * Personal AI Core — V3 共用日期/时间/重复规则解析层
  *
+ * 【V4.4 修复 LOW RISK 1，本项目独有改动，Core 项目副本不受影响】
+ * RECURRENCE_TYPES / WEEKDAY_CHAR_MAP / WEEKDAY_NUM_TO_CHAR 三个裸全局
+ * 常量收进了 TemporalConfig 命名空间（见"重复规则解析"小节的完整说明）。
+ * 除此之外的函数逻辑跟 Core 项目版本逐字一致，这是本文件跟 Core 项目
+ * 副本之间唯一的差异。
+ *
  * 来源：从 06_TaskIntentParser.gs 里抽出来的 _extractDateTime_() 及其内部
  * 依赖函数，改名 extractDateTime()（去掉下划线，明确是公开给06/22共用的
  * 函数，跟93_MemoryEngine.gs定的命名习惯一致），并新增重复规则
@@ -175,7 +181,27 @@ function extractDateTime(rawText) {
 
 // ============ 重复规则解析（新） ============
 
-var RECURRENCE_TYPES = ['DAILY', 'WEEKLY', 'MONTHLY', 'YEARLY', 'ND', 'NW'];
+/**
+ * 【V4.4 修复 LOW RISK 1：扁平全局变量污染命名空间】原来这里和文件末尾
+ * （"星期计算"小节）分别声明了 RECURRENCE_TYPES / WEEKDAY_CHAR_MAP /
+ * WEEKDAY_NUM_TO_CHAR 三个裸全局变量。GAS 的全局作用域是扁平的，这类
+ * 通用名字如果被 Core 项目或引入本 Library 的其他项目意外声明了同名
+ * 变量，会被静默覆盖——不仅会破坏本文件自己的日期解析，还可能反过来
+ * 污染依赖这个 Library 的 Core 项目。
+ *
+ * 修复：把三个常量收进一个冻结的命名空间对象 TemporalConfig。本文件的
+ * 其他函数（extractDateTime/computeNextDueDateFromLabel 等）仍然保持
+ * 裸全局——它们是本文件对外的公开 API，被 06_TaskIntentParser.gs /
+ * 21_RecurringEngine.gs 等多个文件直接调用，这次审计明确要求"不改变
+ * 架构、不重构代码"，把这些函数也包进 IIFE 需要同步改掉所有调用方，
+ * 属于会改变调用方式的重构，超出本次"消除裸全局常量碰撞风险"这个
+ * 具体问题的范围，不在这次一并做。
+ */
+var TemporalConfig = Object.freeze({
+  RECURRENCE_TYPES:   ['DAILY', 'WEEKLY', 'MONTHLY', 'YEARLY', 'ND', 'NW'],
+  WEEKDAY_CHAR_MAP:   { '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '日': 0, '天': 0 },
+  WEEKDAY_NUM_TO_CHAR: { 0: '日', 1: '一', 2: '二', 3: '三', 4: '四', 5: '五', 6: '六' }
+});
 
 /**
  * 从文字里抓重复规则。按"先抓带数字的，再抓裸的"顺序——其实两者literal
@@ -231,7 +257,7 @@ function _extractRecurrence_(text) {
   // WEEKLY：每周 / 每星期 / 每个星期 + 可选星期X
   var weeklyMatch = text.match(/每个?(?:周|星期)([一二三四五六日天])?/);
   if (weeklyMatch) {
-    var anchorWeekday = weeklyMatch[1] ? WEEKDAY_CHAR_MAP[weeklyMatch[1]] : null;
+    var anchorWeekday = weeklyMatch[1] ? TemporalConfig.WEEKDAY_CHAR_MAP[weeklyMatch[1]] : null;
     return {
       rule: { type: 'WEEKLY', interval: 1, anchor_weekday: anchorWeekday, anchor_day_of_month: null, anchor_month: null },
       matchedStr: weeklyMatch[0]
@@ -289,7 +315,7 @@ function _computeNextOccurrenceFromRule_(rule, now) {
       return _addDays_(now, rule.interval);
     case 'WEEKLY':
       if (rule.anchor_weekday != null) {
-        return _upcomingWeekday_(now, WEEKDAY_NUM_TO_CHAR[rule.anchor_weekday]);
+        return _upcomingWeekday_(now, TemporalConfig.WEEKDAY_NUM_TO_CHAR[rule.anchor_weekday]);
       }
       return _addDays_(now, 7); // 没指定星期几，默认从现在起7天后
     case 'NW':
@@ -427,12 +453,11 @@ function _buildTimeInfo_(period, hourStr, minuteStr, matchedStr) {
 }
 
 // ============ 星期计算（原06逻辑，原样搬过来） ============
-
-var WEEKDAY_CHAR_MAP = { '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '日': 0, '天': 0 };
-var WEEKDAY_NUM_TO_CHAR = { 0: '日', 1: '一', 2: '二', 3: '三', 4: '四', 5: '五', 6: '六' };
+// WEEKDAY_CHAR_MAP / WEEKDAY_NUM_TO_CHAR 已移到文件头的 TemporalConfig
+// 命名空间对象里（V4.4 LOW RISK 1 修复），这里不再重复声明。
 
 function _upcomingWeekday_(now, ch) {
-  var target = WEEKDAY_CHAR_MAP[ch];
+  var target = TemporalConfig.WEEKDAY_CHAR_MAP[ch];
   var cur = now.getDay();
   var diff = (target - cur + 7) % 7; // 今天就是这一天 → diff=0，算今天
   return _addDays_(now, diff);
@@ -444,7 +469,7 @@ function _nextWeekWeekday_(now, ch) {
   if (daysUntilNextMonday === 0) daysUntilNextMonday = 7;
   var nextMonday = _addDays_(now, daysUntilNextMonday);
 
-  var target = WEEKDAY_CHAR_MAP[ch];
+  var target = TemporalConfig.WEEKDAY_CHAR_MAP[ch];
   var offsetFromMonday = (target === 0) ? 6 : (target - 1); // 周一=0偏移，周日=6偏移
   return _addDays_(nextMonday, offsetFromMonday);
 }

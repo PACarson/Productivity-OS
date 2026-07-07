@@ -1,6 +1,14 @@
 /**
  * 11_ProjectionRebuilder.gs
- * Productivity OS v4.0 — Projection Rebuilder（从 Events 全量重建 Read Model）
+ * Productivity OS v4.4 — Projection Rebuilder（从 Events 全量重建 Read Model）
+ *
+ * 【V4.4 配套修复 HIGH RISK 3：Events 全表扫描风险】rebuildAllProjections()
+ * 开始前新增一行日志，用 EventBus.getEventCount_()（轻量，只读行数）报一下
+ * Events 表规模——本文件的 rebuild／verify／compare 系列函数全部是"人工手动
+ * 触发的 Operations 层操作"，允许全量扫描 Events（这本来就是它们存在的
+ * 意义：从 Write Model 重建 Read Model），风险点在于"Events 表大了以后
+ * 这些操作可能跑很久甚至超时"，完整的风险说明和范围界定见
+ * 02_EventBus.gs 的 getAllEvents() 文件头注释。
  *
  * 使用场景（仅以下情况才运行，正常用户路径绝不调用）：
  *  - 首次上线迁移
@@ -295,9 +303,15 @@ function rebuildTaskFiltersProjection() {
 /**
  * 重建全部 Read Models。
  * 【V4修复】不再调用已删除的 rebuildInventoryProjection()（见文件头注释）。
+ * 【V4.4 配套 HIGH RISK 3 修复】开始前先用 EventBus.getEventCount_()（轻量，
+ * 只读行数不解析内容）报一下 Events 表当前规模——下面四个 rebuild* 函数
+ * 各自都会完整读取一遍 Events（EventBus.getAllEvents() 内部超过阈值会
+ * 自动打警告日志，见 02_EventBus.gs），这里提前给个总览，方便判断这次
+ * 手动重建大概要花多久。
  */
 function rebuildAllProjections() {
   Logger.log('=== rebuildAllProjections ===');
+  Logger.log('Events 表当前共 ' + EventBus.getEventCount_() + ' 行（下面每个 rebuild* 函数都会各自完整读一遍）');
   rebuildTasksProjection();
   rebuildActiveTasksProjection();
   rebuildStatisticsProjection();  // V4新增

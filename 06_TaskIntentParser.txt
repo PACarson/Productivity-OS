@@ -1,6 +1,12 @@
 /**
  * 06_TaskIntentParser.gs
- * Productivity OS v4.2 — 任务意图解析器
+ * Productivity OS v4.4 — 任务意图解析器
+ *
+ * 【V4.4 配套 HIGH RISK 1 修复】TASK_DONE/TASK_CANCEL 分支新增对
+ * completeTask/cancelTask 新返回信号（already_done/already_cancelled/
+ * invalid_state）的处理——20_TaskEngine.gs 现在会拦截"对已经是终态的
+ * 任务重复调用"，这里要如实回复"之前已经处理过"，不能再显示成好像这次
+ * 操作真的生效了一样。
  *
  * 【V4.2 审计修复】
  *
@@ -234,6 +240,23 @@ function handleTaskIntent(rawText, chatId) {
         };
       }
 
+      // 【V4.4 配套 HIGH RISK 1 修复】双击/Telegram 重试导致 completeTask
+      // 被调用两次时，第二次会命中 already_done——回复要如实说明"已经处理过"，
+      // 不能显示成好像这次操作真的生效了一样。
+      if (completeResult && completeResult.already_done) {
+        return {
+          matched: true, intent: 'TASK_DONE', data: { task_id: parsed.task_id },
+          replyText: '✅ 任务 ' + parsed.task_id + ' 之前已经完成过了（这次点击没有重复处理）。'
+        };
+      }
+      if (completeResult && completeResult.invalid_state) {
+        return {
+          matched: true, intent: 'TASK_DONE', data: { task_id: parsed.task_id },
+          replyText: '⚠️ 任务 ' + parsed.task_id + ' 当前状态是 ' + completeResult.current_status +
+            '，不能标记完成。'
+        };
+      }
+
       var doneReply = '✅ 完成: ' + parsed.task_id;
       if (completeResult && completeResult.next_task) {
         doneReply += '\n🔁 已自动创建下一次: ' + completeResult.next_task.task_id +
@@ -250,6 +273,21 @@ function handleTaskIntent(rawText, chatId) {
         return {
           matched: true, intent: 'TASK_CANCEL', data: { task_id: parsed.task_id },
           replyText: '❓ 找不到任务 ' + parsed.task_id + '，请检查 ID 是否正确（可以用 /mytasks 查看当前任务）。'
+        };
+      }
+
+      // 【V4.4 配套 HIGH RISK 1 同类修复】双击"取消"是同一类问题。
+      if (cancelResult && cancelResult.already_cancelled) {
+        return {
+          matched: true, intent: 'TASK_CANCEL', data: { task_id: parsed.task_id },
+          replyText: '🗑️ 任务 ' + parsed.task_id + ' 之前已经取消过了（这次点击没有重复处理）。'
+        };
+      }
+      if (cancelResult && cancelResult.invalid_state) {
+        return {
+          matched: true, intent: 'TASK_CANCEL', data: { task_id: parsed.task_id },
+          replyText: '⚠️ 任务 ' + parsed.task_id + ' 当前状态是 ' + cancelResult.current_status +
+            '，不能取消。'
         };
       }
 

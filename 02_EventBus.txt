@@ -1,6 +1,6 @@
 /**
  * 02_EventBus.gs
- * Productivity OS v4.2 — 事件总线（Events 表唯一写入口，本项目内）
+ * Productivity OS v4.4 — 事件总线（Events 表唯一写入口，本项目内）
  *
  * ⚠️ 2026-07-03 拆分说明：这是 Personal AI Core 的 02_EventBus.gs 的本地副本，
  * 唯一改动是 _sheet_()——Core 是 container-bound 脚本，用
@@ -50,6 +50,7 @@
 var EventBus = (function () {
   var SHEET_NAME = 'Events';
   var COLS = ['event_id', 'timestamp', 'type', 'chat_id', 'payload', 'source'];
+  var LARGE_EVENTS_WARNING_THRESHOLD = 5000; // V4.4 HIGH RISK 3 修复：见 getAllEvents() 文件头注释
 
   var _cachedEvents = null;        // 运行期内存缓存
   var _inExecIdentityCache_ = {};  // 本次执行内的 identity 去重缓存
@@ -184,6 +185,32 @@ var EventBus = (function () {
    * Events 表）。deriveFromEvent/deriveTaskState_（20_ProductivityModule.gs）
    * 的 switch 只认 TASK_ 开头的几个 type 和 REMINDER_SENT，其余类型会落到 default
    * 分支被忽略，所以混在一起不影响 Task 状态推导，不需要在这里过滤。
+   *
+   * 【V4.4 修复 HIGH RISK 3：Events 全表扫描导致执行超时/内存风险】
+   * 本函数天然是 O(全部历史事件数) 的一次性全量读取——Events 表只会
+   * 持续追加、不会变小，理论上迟早会大到让一次 getAllEvents() 逼近 GAS
+   * 30 秒/6 分钟执行上限。审计本身要求"不改变架构、不重构优化代码"
+   * （见外部审计报告原文），真正的架构级修复（按时间分片/增量加载/把
+   * 分析结果持久化成 Read Model）属于会改变 Events 表结构或读取方式的
+   * 改动，不在本次修复范围内（已记录进 00_Roadmap.gs 供未来评估）。
+   * 本次只做"让风险可见"这一层：行数超过 LARGE_EVENTS_WARNING_THRESHOLD
+   * 时打一条警告日志，让手动运行 11_ProjectionRebuilder.gs 全量重建/校验
+   * 的人至少能提前知道"这次可能会跑很久"，而不是莫名其妙地超时失败。
+   *
+   * 本项目实际会调用 getAllEvents() 的地方目前只有：
+   *   - 20_TaskEngine.deriveTaskState_()（正常运行路径下不会被触发——
+   *     materializeTaskRow_ 的所有调用点都显式传了 knownTask，deriveTaskState_
+   *     只在 knownTask 缺失时才会被调用，目前只有 11_ProjectionRebuilder.gs
+   *     手动运行时才会真正触发）
+   *   - 11_ProjectionRebuilder.gs 的全部 rebuild／verify／compare 系列函数
+   *     （Operations 层，人工手动触发，不在任何 Telegram 指令路径上）
+   *   - 26_AnalyticsEngine.replayCompletionTrend_()（明确标注仅供 GAS
+   *     编辑器手动调用，12_TaskQueryEngine.getStatistics 不调用它——本项目
+   *     没有任何 /insights 或类似指令会触发它，这点已核实）
+   * 也就是说，本项目当前所有会全表扫描 Events 的路径都不在用户可以从
+   * Telegram 直接触发的位置上，只是 Operations 层操作——风险确实存在
+   * （表大了以后这些操作会变慢/可能超时），但不是"普通用户日常操作就会
+   * 触发"这个严重程度，见 00_Project_State.gs 对本条修复范围的说明。
    */
   function getAllEvents() {
     if (_cachedEvents !== null) return _cachedEvents;
@@ -193,6 +220,16 @@ var EventBus = (function () {
     if (lastRow < 2) {
       _cachedEvents = [];
       return _cachedEvents;
+    }
+
+    var rowCount = lastRow - 1;
+    if (rowCount > LARGE_EVENTS_WARNING_THRESHOLD) {
+      Logger.log('⚠️ [EventBus] Events 表已有 ' + rowCount + ' 行（超过警戒值 ' +
+        LARGE_EVENTS_WARNING_THRESHOLD + '），getAllEvents() 全量读取可能较慢，' +
+        '大量调用或跟其他重操作叠加时有触及 GAS 执行时间上限的风险。' +
+        '如果是在跑 11_ProjectionRebuilder.gs 的重建/校验函数，属于预期内的' +
+        '一次性操作；如果这条警告频繁出现在非 Operations 场景，说明有代码' +
+        '在正常路径上意外触发了全表扫描，需要排查。');
     }
 
     var rows = sheet.getRange(2, 1, lastRow - 1, COLS.length).getValues();
@@ -215,6 +252,19 @@ var EventBus = (function () {
     return _cachedEvents;
   }
 
+  /**
+   * 【V4.4 新增】只读行数，不读取/解析任何实际内容——供调用方（比如
+   * 11_ProjectionRebuilder.gs）在决定要不要跑一次全量操作之前，用一次
+   * 极轻量的调用先看看"这次大概要扫多少行"，不需要为了看一眼行数就
+   * 付出一次完整 getAllEvents() 的 I/O + JSON.parse 开销。
+   * @returns {number}
+   */
+  function getEventCount_() {
+    var sheet = _sheet_();
+    var lastRow = sheet.getLastRow();
+    return lastRow < 2 ? 0 : lastRow - 1;
+  }
+
   function getEventsByType(type) {
     return getAllEvents().filter(function (e) {
       return e.type === type;
@@ -224,6 +274,7 @@ var EventBus = (function () {
   return {
     publish:         publish,
     getAllEvents:    getAllEvents,
-    getEventsByType: getEventsByType
+    getEventsByType: getEventsByType,
+    getEventCount_:  getEventCount_
   };
 })();

@@ -1,9 +1,12 @@
 /**
  * 00_File_Map.gs
- * Productivity OS v4.3 — 文件地图
+ * Productivity OS v4.4 — 文件地图
  *
  * 本文件只放两类内容：文件职责 / 模块关系。
- * LAST_UPDATED: 2026-07-06 — V4.3（第二部分，代码落地）：
+ * LAST_UPDATED: 2026-07-06 — V4.4：第二轮外部审计修复（3 HIGH + 1 MEDIUM
+ * 在本项目范围内可修，1 HIGH + 1 MEDIUM 涉及的文件不在本项目——见
+ * 00_Project_State.gs 完整清单和范围说明）。02_EventBus.gs / 09_TemporalParser.gs
+ * 不再是"逐字未改"，本文件对应描述已更新。V4.3（第二部分，代码落地）：
  *   1. 新增「三、Architecture Layer Map」，把全部 21 个可执行文件归类到
  *      Presentation/Application/Domain/Infrastructure 四层中的唯一一层，
  *      对应 00_Project_Constitution.gs「零之四、Dependency Rules」。
@@ -33,14 +36,22 @@
  *   这段注释不同，不影响任何函数行为。
  * 08_DeduplicationEngine.gs — 本地副本，业务逻辑逐字未改；V4.3 起文件头
  *   新增 Engine Contract 注释块，同上，只加注释不改行为。
- * 09_TemporalParser.gs — 本地副本，逐字未改（日期/时间/重复规则解析，
- *   21_RecurringEngine.gs 包装它的重复规则相关函数对外暴露）。
+ * 09_TemporalParser.gs — 【不再是"逐字未改"】日期/时间/重复规则解析，
+ *   21_RecurringEngine.gs 包装它的重复规则相关函数对外暴露。V4.4 起唯一
+ *   跟 Core 项目版本不同的地方：三个裸全局常量（RECURRENCE_TYPES/
+ *   WEEKDAY_CHAR_MAP/WEEKDAY_NUM_TO_CHAR）收进 TemporalConfig 命名空间
+ *   （LOW RISK 1 修复，见文件头注释）。所有函数签名/行为不变。
  *
  * ── Runtime ─────────────────────────────────────────────────────────────
  *
- * 02_EventBus.gs — 本地副本，逐字未改（Events 表唯一写入口，本项目负责
+ * 02_EventBus.gs — 【不再是"逐字未改"】Events 表唯一写入口，本项目负责
  *   的事件类型：TASK_CREATED / TASK_UPDATED（V4新增）/ TASK_COMPLETED /
- *   TASK_CANCELLED / REMINDER_SENT）。
+ *   TASK_CANCELLED / REMINDER_SENT。相比 Core 项目的原始版本，本项目副本
+ *   目前有三处实质差异：(1) _sheet_() 用 SpreadsheetApp.openById()（本项目
+ *   是 standalone 脚本，见文件头拆分说明）；(2) V4.2 起 publish() 返回的
+ *   event 新增 projection_ok 字段；(3) V4.4 起新增 getEventCount_() 和
+ *   Events 表过大时的警告（HIGH RISK 3 修复）。差异仅限这三处，其余逻辑
+ *   跟 Core 项目版本一致。
  * 03_Output.gs — 本地副本，逐字未改（本项目目前不直接调用，留着备用）。
  * 06_TaskIntentParser.gs — 【V4 重写】parseTaskIntent / handleTaskIntent。
  *   V4 变更：

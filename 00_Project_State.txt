@@ -1,15 +1,15 @@
 /**
  * 00_Project_State.gs
- * Productivity OS v4.3.1 — 项目状态快照
+ * Productivity OS v4.4 — 项目状态快照
  *
  * ⚠️ 快照，不是日志。每次更新覆盖旧状态。
- * LAST_UPDATED: 2026-07-06 — V4.3.1：修复 setupSheets() 完全忽略 Events 表
- * 的 bug（实测复现：全新 Spreadsheet 上只跑本项目 setupSheets() 后，
- * createTask 必现 "Events sheet 不存在" 报错）。V4.3（第二部分）：把
- * Engine Contract Standard 实际写入 12 个 Engine 文件的文件头。V4.3
- * （第一部分）：Architecture / Governance Upgrade 纯文档升级。V4.2：
- * 修复第二轮外部审计发现的 3 项 HIGH RISK + 3 项 MEDIUM RISK + 1 项
- * LOW RISK（完整清单见"三、已知Bug"）。
+ * LAST_UPDATED: 2026-07-06 — V4.4：修复第三轮外部审计里落在本项目范围内
+ * 的全部问题（3 HIGH RISK 里的2项 + 3 MEDIUM RISK 里的2项 + 2 项 LOW
+ * RISK；另 1 HIGH + 1 MEDIUM 涉及的文件 04_Main.gs / 80_RiderConnector.gs
+ * 不属于本项目，未在本次改动范围内，见"三、已知Bug"里的范围说明）。
+ * V4.3.1：修复 setupSheets() 忽略 Events 表的 bug。V4.3：Architecture /
+ * Governance Upgrade + Engine Contract Standard 落地。V4.2：修复第二轮
+ * 外部审计发现的 3 HIGH + 3 MEDIUM + 1 LOW（完整清单见"三、已知Bug"）。
  */
 
 // ============================================================
@@ -17,7 +17,78 @@
 // ============================================================
 
 /**
- * - 2026-07-06（V4.3.1，本次）：修复 15_Setup.gs 的 setupSheets() 完全
+ * - 2026-07-06（V4.4，本次）：修复第三轮外部审计里落在本项目范围内的
+ *   全部问题：
+ *
+ *   【HIGH RISK 1】连续重复点击（双击 Telegram 内联键盘"完成"按钮，两次
+ *   update_id 不同，上游按 update_id 去重拦不住）导致 completeTask 被
+ *   调用两次，10_ProjectionEngine._bumpStatistics_ 对同一任务重复扣减
+ *   pending、重复累加 done，TaskStatistics 快照漂移。修复：
+ *   20_TaskEngine.completeTask/cancelTask 现在会先检查任务当前状态，
+ *   已经是终态（DONE/CANCELLED）时直接拦截返回（already_done/
+ *   already_cancelled/invalid_state 几种信号），不再二次发布 Event。
+ *   这让两个函数本身对重复调用天然幂等，不依赖上游 04_Main.gs 的
+ *   callback 去重是否完善（防御性纵深）。06_TaskIntentParser.gs 的
+ *   TASK_DONE/TASK_CANCEL 分支同步更新，如实回复"之前已经处理过"。
+ *   ⚠️ 范围说明：审计原文同时提到 04_Main.gs(_handleCallback_) 也是
+ *   问题的一部分——04_Main.gs 属于 Personal AI Core 项目，不在本项目
+ *   （Productivity OS）范围内，本次没有这个文件，无法在这里修改；
+ *   本项目侧的修复（completeTask/cancelTask 幂等化）已经能独立、完整
+ *   地防住"统计漂移"这个后果，不依赖 04_Main.gs 是否也修了。
+ *
+ *   【HIGH RISK 2】80_RiderConnector.gs 的检查点非事务性问题——这个文件
+ *   完全不属于本项目（Productivity OS 没有任何 RiderConnector 相关代码，
+ *   只在注释里提到过"RiderConnector 会调用本项目暴露的 createTask 等
+ *   接口"这种被调用方关系）。本次没有拿到这个文件，无法修复，需要在
+ *   80_RiderConnector.gs 实际所在的项目里处理。
+ *
+ *   【HIGH RISK 3】Events 全表扫描风险。核实后澄清：审计提到的"普通用户
+ *   通过 /insights 指令触发 replayCompletionTrend_"在本项目不成立——
+ *   本项目没有 /insights 或任何等价指令接到这个函数上（见
+ *   06_TaskIntentParser.gs 指令列表，12_TaskQueryEngine.getStatistics
+ *   也不调用它）。但"Events 只增不减、全量扫描迟早变慢"这个底层风险
+ *   是真实的，且审计本身要求"不改变架构"，所以没有做分片/增量加载这类
+ *   架构级改动，而是加了风险可见性：02_EventBus.getAllEvents() 超过
+ *   LARGE_EVENTS_WARNING_THRESHOLD=5000 行时打警告日志；新增轻量的
+ *   getEventCount_()（只读行数不解析内容）供 11_ProjectionRebuilder.gs
+ *   在开始全量重建前先报一下规模。
+ *
+ *   【MEDIUM RISK 1】09_IdempotencyManager.gs 用全局 ScriptLock，导致
+ *   User B 的创建请求会被 User A 完全无关的请求无差别锁住排队。修复：
+ *   改成"每 chatId 一把的软锁"（CacheService + 极短的全局 Gate 锁只
+ *   保护"检查+占位"这一下的原子性），不同用户之间不再互相阻塞。对外
+ *   契约不变（拿不到锁仍抛 SYSTEM_BUSY: 前缀错误）。完整架构论证见
+ *   00_ADR.gs ADR-2026-07-06-003。
+ *
+ *   【MEDIUM RISK 2】13_ActiveTasksEngine.runDailyArchive 非原子归档——
+ *   先追加 ArchiveTasks 再标记 Tasks 的 archived 列，中途中断会导致下次
+ *   运行重复追加。修复：追加前先读一次 ArchiveTasks 现有 task_id 集合
+ *   做排重校验，已经在 ArchiveTasks 里但 Tasks 侧标记没写成功的行，
+ *   只补标记，不重复追加。
+ *   ⚠️ 范围说明：审计原文同时提到 04_Main.gs(doPost) 的 CacheService
+ *   非原子去重竞态（MEDIUM RISK 3）——同上，04_Main.gs 不在本项目范围内，
+ *   本次未修改。
+ *
+ *   【LOW RISK 1】09_TemporalParser.gs 的 RECURRENCE_TYPES/WEEKDAY_CHAR_MAP/
+ *   WEEKDAY_NUM_TO_CHAR 三个裸全局常量收进 TemporalConfig 命名空间，
+ *   4 处内部引用同步更新，文件其余部分（尤其是所有函数）保持不变——
+ *   把函数也包进 IIFE 需要同步改掉 06/21 等多个调用方，属于会改变调用
+ *   方式的重构，审计本身要求不做这类改动，所以没有一并处理。
+ *
+ *   【LOW RISK 2】20_TaskEngine.gs 的裸全局 wrapper 函数（createTask 等）——
+ *   审计建议"未来逐步废弃"，不是"现在移除"（移除会破坏 Core 项目
+ *   04_Main.gs 现有调用）。采纳方式：给每个 wrapper 加 @deprecated 风格
+ *   JSDoc 标注推荐的命名空间路径，不删除任何一个，迁移列入
+ *   00_Roadmap.gs Future。
+ *
+ *   本轮修复过程中，用 node --check 对全部 26 个 .gs 文件做了语法校验，
+ *   额外发现并修复了 2 处自己在写注释时引入的问题（02_EventBus.gs 和
+ *   11_ProjectionRebuilder.gs 的注释里出现了字面的"rebuild"/"verify"/
+ *   "compare"三个词直接用斜杠相连的写法，其中的"星号+斜杠"被 JS 解析成
+ *   提前闭合了整个块注释，导致后面的中文说明被当成代码解析报语法
+ *   错误）——已改写措辞避免这个字符组合，修复后全部文件通过语法检查。
+ *
+ * - 2026-07-06（V4.3.1）：修复 15_Setup.gs 的 setupSheets() 完全
  *   忽略 Events 表的 bug——日志之前写着"Events 由 Core 项目建"，这个假设
  *   只在"先跑过 Core 项目初始化"的前提下成立；如果先对一张全新
  *   Spreadsheet 只跑本项目的 setupSheets()（比如独立诊断/测试本项目时），
@@ -31,7 +102,6 @@
  *   这个问题不会在诊断的第一步就被发现，而是等到后面调 createTask 才报错，
  *   这次一并修了）。
  *
-/**
  * - 2026-07-06（V4.3 第二部分，本次）：把 00_Project_Constitution.gs
  *   零之三定义的 Engine Contract Standard 实际落地到 12 个 Engine 文件的
  *   文件头（07_IdentityEngine / 08_DeduplicationEngine / 10_ProjectionEngine /
@@ -132,90 +202,108 @@
 // ============================================================
 
 /**
- * 全部已在本次（2026-07-06）V4.2 审计修复中处理，记录留存供交接参考：
+ * 全部已在本次（2026-07-06）V4.4 审计修复中处理（本项目范围内的部分），
+ * 记录留存供交接参考：
  *
  * HIGH RISK
  *
- * - HIGH RISK 1（Webhook 超时与 GAS 并发限制级联失效）：
- *   09_IdempotencyManager.gs.createTaskIfNotExists 原来 lock.waitLock(10000)
- *   最多等 10 秒。Telegram Webhook 通常要求 2~5 秒内返回，等锁排到接近
- *   10 秒会被 Telegram 判定超时重试，重试请求继续排队等锁，容易在高并发
- *   下耗尽 GAS 每用户 30 并发执行线程上限，引发级联失效。
- *   ✅ 修复：锁等待时间降到 LOCK_WAIT_MS=3000ms；拿锁失败（waitLock 抛错）
- *   与"拿到锁后业务逻辑抛错"拆成两条分支，前者立刻 fail-fast 抛
- *   "SYSTEM_BUSY:" 前缀错误，06_TaskIntentParser.gs 的 TASK_CREATE 分支
- *   接住这个错误并回复用户"系统繁忙请重试"，不再让异常裸传播。
+ * - HIGH RISK 1（连续重复点击导致统计模型漂移）：
+ *   Telegram 内联键盘快速双击"完成"按钮会产生两次 update_id 不同的
+ *   callback_query，上游（Core 项目 04_Main.gs）按 update_id 去重拦不住。
+ *   20_TaskEngine.completeTask 之前也没有校验"这个任务是不是已经是 DONE
+ *   了"，两次调用都会各发布一次 TASK_COMPLETED，
+ *   10_ProjectionEngine._bumpStatistics_ 对同一任务重复扣减 pending、
+ *   重复累加 done，TaskStatistics 快照漂移（pending 可能出现负数）。
+ *   ✅ 修复：completeTask/cancelTask 现在把"已经是终态"也当成拦截条件——
+ *   不只是"找不到"。返回值新增 already_done/already_cancelled/
+ *   invalid_state 几种信号，06_TaskIntentParser.gs 的 TASK_DONE/
+ *   TASK_CANCEL 分支据此如实回复"之前已经处理过"。
+ *   ⚠️ 范围说明：本条审计原文同时提到 04_Main.gs(_handleCallback_)，
+ *   该文件属于 Personal AI Core 项目，不在本项目范围内，本次未修改——
+ *   但本项目侧的幂等化修复已经能独立完整地防住"统计漂移"这个后果。
  *
- * - HIGH RISK 2（任务属性更新导致 Identity 失效及去重崩盘）：
- *   20_TaskEngine.gs.updateTask 修改 title/due_date/category/priority/
- *   recurring 任一字段时，没有重新计算 identity 也没有更新 Sheet 里的
- *   identity 列，导致去重系统（DeduplicationEngine.findExistingTask）
- *   继续认旧哈希——旧属性的新任务被误判"已存在"而拦截，新属性的重复
- *   任务却因为哈希对不上而漏判重复。
- *   ✅ 修复：updateTask 检测到 payload 命中
- *   ProductivityConfig.IDENTITY_AFFECTING_FIELDS（title/due_date/
- *   recurring/priority/category）任一个时，用"已有字段+本次改动"合并后
- *   的完整值重新调 IdentityEngine.generateTaskIdentity(...)，新 identity
- *   一并写入 TASK_UPDATED 事件 payload 和 Sheet。
+ * - HIGH RISK 2（80_RiderConnector.gs 检查点非事务性）：
+ *   【不在本项目范围内】80_RiderConnector.gs 不属于 Productivity OS，
+ *   本次没有拿到这个文件，无法修复，需要在该文件实际所在的项目里处理。
  *
- * - HIGH RISK 3（频繁同步 Sheet 读写导致 I/O 性能瓶颈）：
- *   completeTask/cancelTask/updateTask 无论 ProjectionEngine 有没有成功，
- *   都无条件再调一次 materializeTaskRow_ 做"安全兜底"写入，等于每次操作
- *   稳定写两遍 Sheet；projectTaskUpdated_ 对同一个 task_id 读了两次
- *   Tasks 行。在完成一个 recurring 任务的单次调用链里会触发数十次零碎
- *   同步 I/O，拖慢执行时间、逼近 GAS 30 秒执行上限。
- *   ✅ 修复：02_EventBus.gs 的 publish() 返回的 event 新增 projection_ok
- *   字段（dispatch 成功为 true，失败为 false）；TaskEngine 三个函数
- *   现在只在 event.projection_ok===false 时才调用 materializeTaskRow_，
- *   正常路径下只有 Projection 那一次 I/O。10_ProjectionEngine.gs 的
- *   projectTaskUpdated_ 把两次冗余读取合并成一次（before 变量复用给
- *   ActiveTasks 同步判断 / TaskFilters 刷新 / TaskStatistics 调整三处）。
+ * - HIGH RISK 3（Events 全表扫描导致执行超时/内存风险）：
+ *   getAllEvents() 无条件读取 Events 表全部行，随着表增长会逼近 GAS
+ *   30 秒/6 分钟执行上限。
+ *   ✅ 修复（风险可见性，非架构重构——审计本身要求不改架构）：
+ *   02_EventBus.getAllEvents() 超过 LARGE_EVENTS_WARNING_THRESHOLD=5000
+ *   行时打警告日志；新增轻量 getEventCount_()（只读行数）供
+ *   11_ProjectionRebuilder.gs 全量重建前先报一下规模。
+ *   ⚠️ 澄清：审计提到的"普通用户通过 /insights 指令触发
+ *   replayCompletionTrend_"核实后在本项目不成立——本项目没有 /insights
+ *   或任何等价指令接到这个函数上，12_TaskQueryEngine.getStatistics 也
+ *   不调用它，完整确认过程见 26_AnalyticsEngine.gs 文件头。
  *
  * MEDIUM RISK
  *
- * - MEDIUM RISK 1（完成/取消不存在的任务导致幽灵行）：
- *   completeTask/cancelTask 之前对 taskId 不存在的情况没有校验，直接
- *   发布 TASK_COMPLETED/TASK_CANCELLED 事件，materializeTaskRow_ 因为
- *   传入对象非 null，upsertRowByKey_ 找不到对应 task_id 就在 Tasks 表
- *   追加一行除 status/completed_at 外全为空的"幽灵行"。
- *   ✅ 修复：两个函数最前面都先用 TaskQueryEngine.getTask 校验任务存在，
- *   找不到直接返回 {not_found: true} 并拦截，不发布事件。
- *   06_TaskIntentParser.gs 的 TASK_DONE/TASK_CANCEL 分支相应处理这个
- *   返回值，回复"找不到任务"而不是"✅ 完成"。
+ * - MEDIUM RISK 1（全局脚本锁引发多用户并发排队）：
+ *   09_IdempotencyManager.gs 用 LockService.getScriptLock()（部署级全局
+ *   作用域）包住整段创建逻辑，User B 的请求会被 User A 完全无关的请求
+ *   无差别锁住排队。
+ *   ✅ 修复：改成"每 chatId 一把的软锁"——Gate（极短的全局 ScriptLock，
+ *   GATE_WAIT_MS=500ms，只保护"检查+占位"这一下的原子性）+ Soft Lock
+ *   （CacheService，每 chatId 一把，LOCK_TTL_SECONDS=15s 过期兜底）。
+ *   不同用户之间不再互相阻塞，对外契约不变（仍抛 SYSTEM_BUSY: 前缀
+ *   错误）。完整架构论证 + 诚实的代价说明见 00_ADR.gs ADR-2026-07-06-003。
  *
- * - MEDIUM RISK 2（任务属性更新未同步修正 TaskStatistics）：
- *   projectTaskUpdated_ 之前完全没有触发 _bumpStatistics_——把一个
- *   recurring 任务改成一次性的，或者把任务 chat_id 改到另一个用户名下，
- *   TaskStatistics 的 recurring_count/各项计数会随之漂移，且没有任何
- *   报错。
- *   ✅ 修复：新增 _adjustStatisticsForUpdate_(before, after)，比对
- *   更新前后的 recurring/chat_id，recurring 变化时对当前 chat_id 的
- *   recurring_count ±1；chat_id 变化时把该任务在 total/pending/done/
- *   cancelled/recurring/reminder 各项上的贡献整体从旧 chat_id 迁到
- *   新 chat_id。
+ * - MEDIUM RISK 2（非原子性归档流程导致归档记录重复追加）：
+ *   13_ActiveTasksEngine.runDailyArchive 先追加 ArchiveTasks、再整列
+ *   覆写 Tasks 的 archived 标记，两步操作不具备事务原子性——第一步成功
+ *   后、第二步执行前 GAS 中断，下次运行会重复追加进 ArchiveTasks。
+ *   ✅ 修复：追加前先读一次 ArchiveTasks 现有 task_id 集合做排重校验，
+ *   已经在 ArchiveTasks 里但 Tasks 侧标记没写成功的行，只补标记，不
+ *   重复追加（选择排重校验而不是"先标记再追加"，因为后者中断会导致
+ *   任务从"未归档"直接消失又没真的进 ArchiveTasks，是更糟的数据丢失）。
  *
- * - MEDIUM RISK 3（表头修复函数校验形同虚设）：
- *   15_Setup.gs._repairOneSheetHeader_ 之前只比对第一行第一格是否等于
- *   headers[0]，用户删掉右侧某一列（如 identity/tags/description）或
- *   打乱列顺序时，第一格照样对得上，函数误判"表头正确"直接跳过，缺失
- *   的列不会被自动补全，直到某次写入报错崩溃才会被发现。
- *   ✅ 修复：改成对第一行整行数组（长度取 headers.length 和当前表实际
- *   列数的较大值）跟标准 headers 做逐元素+顺序的完全比对。第一格仍然
- *   对的上但其余列有问题时，原地覆写第一行（不触碰数据行）；连第一格
- *   都不对时，沿用插入新表头行的做法。
+ * - MEDIUM RISK 3（Webhook 消息去重检测存在并发竞态）：
+ *   【不在本项目范围内】04_Main.gs(doPost) 属于 Personal AI Core 项目，
+ *   不在本项目范围内，本次未修改。
  *
  * LOW RISK
  *
- * - LOW RISK 1（全局变量冲突与命名空间污染）：
- *   20_TaskEngine.gs 文件尾部声明了 TASKS_SHEET_NAME/TASK_CATEGORIES/
- *   TASK_PRIORITIES/TASK_RECURRING 四个裸全局变量做向后兼容别名。GAS
- *   全局命名空间是扁平的，如果 Core 主项目或其他 Library 恰好声明了
- *   同名全局变量，会被静默覆盖，引发极难定位的运行时异常。
- *   ✅ 修复：检查确认本项目内除 20_TaskEngine.gs 自己外没有任何文件
- *   引用这四个裸全局名字，直接删除，统一改用 ProductivityConfig.xxx。
- *   函数级别的向后兼容 wrapper（createTask/updateTask/completeTask/
- *   cancelTask/getPendingTasks 等）风险性质不同（具名、语义明确，不是
- *   容易被误撞的短名词），继续保留。
+ * - LOW RISK 1（09_TemporalParser.gs 扁平全局变量污染命名空间）：
+ *   RECURRENCE_TYPES / WEEKDAY_CHAR_MAP / WEEKDAY_NUM_TO_CHAR 三个裸
+ *   全局常量。
+ *   ✅ 修复：收进 TemporalConfig 命名空间对象，4 处内部引用同步更新。
+ *   文件其余函数保持裸全局不变——它们是对外公开 API，被 06/21 等多个
+ *   文件直接调用，包进 IIFE 需要同步改调用方，属于会改变调用方式的
+ *   重构，超出"消除常量碰撞风险"这个具体问题的范围。
+ *
+ * - LOW RISK 2（20_TaskEngine.gs 扁平命名空间 Wrapper 函数暴露隐患）：
+ *   createTask/updateTask 等裸全局 wrapper 函数名字通用，有被消费端
+ *   同名函数覆盖的风险。审计原文建议"未来逐步废弃"，不是"现在移除"
+ *   （移除会破坏 Core 项目 04_Main.gs 现有调用）。
+ *   ✅ 采纳方式：给每个 wrapper 加 @deprecated 风格 JSDoc 标注推荐的
+ *   命名空间路径，不删除任何一个，迁移列入 00_Roadmap.gs Future。
+ *
+ * 附注：本轮修复过程中用 node --check 对全部 26 个 .gs 文件做了语法
+ * 校验，额外发现并修复了 2 处自己在写注释时引入的问题——注释里把
+ * "rebuild/verify/compare"几个词用星号加斜杠的写法连在一起时，那个
+ * 字符组合被 JS 解析成提前闭合了整个块注释，后面的中文说明被当成代码
+ * 解析报语法错误（02_EventBus.gs 和 11_ProjectionRebuilder.gs 各一处）。
+ * 已改写措辞避免这个字符组合，修复后全部文件通过语法检查。
+ *
+ * ── V4.2 审计（已修复，历史记录）────────────────────────────────────────
+ *
+ * - HIGH RISK 1：09_IdempotencyManager 锁等待 10s→3s，超时 fail-fast 抛
+ *   SYSTEM_BUSY:。
+ * - HIGH RISK 2：20_TaskEngine.updateTask 改动 identity 相关字段时重新
+ *   计算 identity。
+ * - HIGH RISK 3：completeTask/cancelTask/updateTask 的安全兜底写入从
+ *   "无条件"改成"只在 event.projection_ok===false 时"（02_EventBus.gs
+ *   新增 projection_ok 字段）；projectTaskUpdated_ 合并两次冗余读取。
+ * - MEDIUM RISK 1：completeTask/cancelTask 增加任务存在性校验，防止
+ *   幽灵行。
+ * - MEDIUM RISK 2：projectTaskUpdated_ 新增 _adjustStatisticsForUpdate_
+ *   修正 recurring/chat_id 变更时的统计漂移。
+ * - MEDIUM RISK 3：15_Setup._repairOneSheetHeader_ 从"只比对第一格"改成
+ *   "整行数组完全比对"。
+ * - LOW RISK 1：20_TaskEngine.gs 删除裸全局变量 TASKS_SHEET_NAME 等四个，
+ *   统一收进 ProductivityConfig。
  *
  * ── V4 初版审计（已修复，历史记录）──────────────────────────────────────
  *
@@ -235,6 +323,28 @@
 // ============================================================
 
 /**
+ * 优先级 P1（跨项目协调，本项目自己没法完成，需要在别的项目里配合修复）：
+ *   0a. 04_Main.gs(_handleCallback_) 的 callback_query 去重仍然只按
+ *       update_id，双击场景下拦不住重复回调——本项目这一侧已经通过
+ *       completeTask/cancelTask 幂等化独立解决了"统计漂移"这个后果（见
+ *       00_Project_State.gs V4.4 已完成记录），但 04_Main.gs 本身那层
+ *       去重缺口还在，理想情况下应该在 Core 项目里也补一层（比如按
+ *       message_id+callback_data 或者更短的时间窗口去重），降低无谓的
+ *       重复调用本身，不只是靠下游兜底。
+ *   0b. 04_Main.gs(doPost) 的 CacheService get/put 非原子操作导致的
+ *       Webhook 消息去重竞态（第三轮外部审计 MEDIUM RISK 3）——需要在
+ *       Core 项目里参照本项目 09_IdempotencyManager.gs 这次的 Gate+
+ *       Soft Lock 模式（00_ADR.gs ADR-2026-07-06-003）来修，本项目没有
+ *       04_Main.gs，无法代为修改。
+ *   0c. 80_RiderConnector.gs 的检查点非事务性问题（第三轮外部审计
+ *       HIGH RISK 2）——这个文件不属于本项目，需要找到它实际所在的项目
+ *       单独处理。
+ *   0d. 20_TaskEngine.gs 的裸全局 wrapper 函数（createTask 等，V4.4
+ *       LOW RISK 2）目前已加 @deprecated 标注但未移除。真正移除前提是
+ *       确认 Core 项目 04_Main.gs 等消费端都已经切换成
+ *       ProductivityOS.TaskEngine.xxx 这种命名空间调用——这一步同样需要
+ *       跨项目协调，本项目自己没法单方面判断"是否已经没人在用旧接口"。
+ *
  * 优先级 P3（架构演进，从 V3 State 沿用，仍未过期）：
  *   1. 给本项目补一套自己的 Foundation.Insights（现在暂时复用 Core 的
  *      93-96，如果以后需要 Task-specific 的行为分析/建议，考虑在本项目
