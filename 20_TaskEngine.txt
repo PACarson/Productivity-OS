@@ -244,17 +244,44 @@ var TaskEngine = (function () {
   /**
    * 标记任务完成。
    *
-   * 【MEDIUM RISK 1 修复】先用 TaskQueryEngine.getTask 校验任务存在；
+   * 【MEDIUM RISK 1 修复（V4.2）】先用 TaskQueryEngine.getTask 校验任务存在；
    * 找不到直接拦截返回，不发布事件——避免 materializeTaskRow_ 在 Tasks
    * 表追加一行除 status/completed_at 外全为空的"幽灵行"。
    *
-   * @returns {{next_task: (object|null), not_found: (boolean|undefined)}}
+   * 【HIGH RISK 1 修复（V4.4，连续重复点击导致统计模型漂移）】Telegram
+   * 内联键盘快速双击"完成"按钮会产生两次 update_id 不同的 callback_query，
+   * 上游（Core 项目 04_Main.gs）按 update_id 去重拦不住这种情况。之前
+   * completeTask 本身也没有校验"这个任务是不是已经是 DONE 了"，导致两次
+   * 调用都会各发布一次 TASK_COMPLETED，10_ProjectionEngine._bumpStatistics_
+   * 对同一个任务重复扣减 pending、重复累加 done，TaskStatistics 快照直接
+   * 漂移（pending 可能出现负数）。
+   * 修复：completeTask 现在把"已经是终态"也当成需要拦截的情况——不只是
+   * "找不到"。这让 completeTask 本身对重复调用天然幂等，不依赖上游是否
+   * 做好了去重（防御性纵深，即使以后 Core 项目的 callback 去重出现别的
+   * 漏洞，这里仍然兜得住）。
+   *
+   * @returns {{next_task: (object|null), not_found: (boolean|undefined),
+   *            already_done: (boolean|undefined)}}
+   *          already_done=true 表示这次调用是重复点击/重试，任务此前已经
+   *          是 DONE，本次是安全的无操作（不会二次发布 Event，也不会二次
+   *          触发 recurring 续期）。
    */
   function completeTask(taskId, chatId) {
     var taskBeforeComplete = TaskQueryEngine.getTask(taskId, chatId);
     if (!taskBeforeComplete) {
       Logger.log('[TaskEngine] completeTask: 找不到任务 ' + taskId + '，拦截（防止产生幽灵行）');
       return { next_task: null, not_found: true };
+    }
+
+    var currentStatus = String(taskBeforeComplete.status || '').toUpperCase();
+    if (currentStatus === 'DONE') {
+      Logger.log('[TaskEngine] completeTask: 任务 ' + taskId + ' 已经是 DONE，拦截重复调用' +
+        '（很可能是双击/Telegram重试），不再二次发布 TASK_COMPLETED');
+      return { next_task: null, already_done: true };
+    }
+    if (currentStatus === 'CANCELLED') {
+      Logger.log('[TaskEngine] completeTask: 任务 ' + taskId + ' 已经是 CANCELLED，拒绝标记完成');
+      return { next_task: null, invalid_state: true, current_status: 'CANCELLED' };
     }
 
     var event = EventBus.publish('TASK_COMPLETED', { task_id: taskId }, chatId, 'TaskEngine');
@@ -269,14 +296,30 @@ var TaskEngine = (function () {
   }
 
   /**
-   * 取消任务。【MEDIUM RISK 1 修复】同 completeTask，先校验任务存在。
-   * @returns {{not_found: (boolean|undefined)}}
+   * 取消任务。
+   *
+   * 【MEDIUM RISK 1 修复（V4.2）】同 completeTask，先校验任务存在。
+   * 【HIGH RISK 1 同类修复（V4.4）】双击"取消"按钮是跟双击"完成"按钮完全
+   * 同一类问题，一并处理：已经是终态的任务不再重复发布 TASK_CANCELLED。
+   *
+   * @returns {{not_found: (boolean|undefined), already_cancelled:
+   *            (boolean|undefined), invalid_state: (boolean|undefined)}}
    */
   function cancelTask(taskId, chatId) {
     var existing = TaskQueryEngine.getTask(taskId, chatId);
     if (!existing) {
       Logger.log('[TaskEngine] cancelTask: 找不到任务 ' + taskId + '，拦截（防止产生幽灵行）');
       return { not_found: true };
+    }
+
+    var currentStatus = String(existing.status || '').toUpperCase();
+    if (currentStatus === 'CANCELLED') {
+      Logger.log('[TaskEngine] cancelTask: 任务 ' + taskId + ' 已经是 CANCELLED，拦截重复调用（双击/重试）');
+      return { already_cancelled: true };
+    }
+    if (currentStatus === 'DONE') {
+      Logger.log('[TaskEngine] cancelTask: 任务 ' + taskId + ' 已经是 DONE，拒绝取消一个已完成的任务');
+      return { invalid_state: true, current_status: 'DONE' };
     }
 
     var event = EventBus.publish('TASK_CANCELLED', { task_id: taskId }, chatId, 'TaskEngine');
@@ -415,35 +458,56 @@ var TaskEngine = (function () {
 // 全局名字，直接删除，全部改用 ProductivityConfig.xxx。函数级别的向后
 // 兼容 wrapper（下面这几个）风险性质不同——它们是具名的、语义明确的函数，
 // 不是容易被误撞的短名词，继续保留。
+//
+// 【V4.4 审计 LOW RISK 2，采纳"标注但不移除"】外部审计指出
+// createTask/updateTask/completeTask/cancelTask/getPendingTasks 这几个
+// 裸全局函数名字足够通用，在复杂的 Library 依赖链里存在被消费端自定义
+// 同名函数覆盖的风险，建议"未来版本逐步废弃，引导消费端改用
+// ProductivityOS.TaskEngine.createTask 这种带命名空间的调用方式"——
+// 注意审计原文本身就是"建议未来逐步废弃"，不是"现在立刻改"：这次不删除
+// 任何一个 wrapper（删除会破坏 Core 项目 04_Main.gs 现有调用，违反本项目
+// "维持向后兼容"的既定原则），只在每个 wrapper 上加 @deprecated 风格的
+// JSDoc 标注，指向应该迁移到的命名空间路径，供以后有计划地做消费端迁移
+// 时参考。是否/何时真的移除这些 wrapper，属于跨项目协调的决定（需要先
+// 确认 Core 项目 04_Main.gs 等消费端都切到 ProductivityOS.TaskEngine.xxx
+// 之后才能安全删除），已记录进 00_Roadmap.gs 的 Future 小节。
 
+/** @deprecated 请改用 ProductivityOS.TaskEngine.createTask（本 wrapper 仍然完全可用，只是不再是推荐路径，见本文件 LOW RISK 2 说明） */
 function createTask(title, meta, chatId) {
   return TaskEngine.createTask(title, meta, chatId);
 }
 
+/** @deprecated 请改用 ProductivityOS.TaskEngine.updateTask */
 function updateTask(taskId, changes, chatId) {
   return TaskEngine.updateTask(taskId, changes, chatId);
 }
 
+/** @deprecated 请改用 ProductivityOS.TaskEngine.completeTask */
 function completeTask(taskId, chatId) {
   return TaskEngine.completeTask(taskId, chatId);
 }
 
+/** @deprecated 请改用 ProductivityOS.TaskEngine.cancelTask */
 function cancelTask(taskId, chatId) {
   return TaskEngine.cancelTask(taskId, chatId);
 }
 
+/** @deprecated 请改用 ProductivityOS.TaskEngine.getPendingTasks */
 function getPendingTasks(chatId) {
   return TaskEngine.getPendingTasks(chatId);
 }
 
+/** @deprecated 内部/调试用途，请改用 ProductivityOS.TaskEngine.deriveFromEvent */
 function deriveFromEvent(event, stateMap) {
   return TaskEngine.deriveFromEvent(event, stateMap);
 }
 
+/** @deprecated 内部/调试用途，请改用 ProductivityOS.TaskEngine.deriveTaskState_ */
 function deriveTaskState_() {
   return TaskEngine.deriveTaskState_();
 }
 
+/** @deprecated 内部/调试用途，请改用 ProductivityOS.TaskEngine.rebuildTasksSheet_ */
 function rebuildTasksSheet_() {
   return TaskEngine.rebuildTasksSheet_();
 }
