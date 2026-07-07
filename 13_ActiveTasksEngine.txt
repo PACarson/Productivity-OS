@@ -34,6 +34,38 @@
  * 的 row 引用打上标记，最后对整个 archived 列做一次 setValues() 批量写回。
  */
 
+/**
+ * ── Engine Contract（V4.3，按 00_Project_Constitution.gs 零之三标准补全）──
+ *   Responsibilities      : 冷归档生命周期管理（Blueprint 术语里对应
+ *                           Archive Engine：archive/retention）
+ *   Owns                  : "多少天算该归档"这条业务规则
+ *                           （DEFAULT_ARCHIVE_DAYS）、Tasks→ArchiveTasks
+ *                           的搬迁逻辑
+ *   Reads                 : Tasks Sheet（找出 DONE/CANCELLED 且超过
+ *                           retention 天数的行）、ArchiveTasks Sheet
+ *                           （getArchivedTasks 查询用）
+ *   Writes                : Tasks（打 archived=true 标记，不物理删除）、
+ *                           ArchiveTasks（追加归档行）
+ *   Public API            : runDailyArchive(), getArchivedTasks(chatId, limit)
+ *   Dependencies          : 05_SheetUtils.gs（getSheet_/getHeaderMap_）
+ *   Forbidden Dependencies: 02_EventBus.gs（归档不是由 Event 驱动的，是
+ *                           基于"现在几点"的定时任务，属于 Operations 范畴，
+ *                           见 00_Project_Constitution.gs P4 4.5 Operations）、
+ *                           Presentation 层
+ *   Pure Function         : NO（直接读写 Sheet）
+ *   Replay Events         : NO
+ *   Projection            : NO（写的是 ArchiveTasks 这张"冷存储"，不是
+ *                           实时 Projection——ActiveTasks 的实时投影由
+ *                           10_ProjectionEngine.gs 负责，两者是不同职责，
+ *                           见文件头"架构关系"）
+ *   Thread Safety         : 由每日定时触发器单次调度，不考虑并发
+ *   Side Effects          : YES（Sheet 写入 + 打标记）
+ *   Notes                 : 归类为 Infrastructure 而非 Domain（见
+ *                           00_File_Map.gs Architecture Layer Map）——
+ *                           归档本身是机械的"按天数搬行"，不含
+ *                           22_PriorityEngine 那种打分/排序类业务判断。
+ */
+
 var ActiveTasksEngine = (function () {
 
   var TASKS_SHEET   = 'Tasks';
