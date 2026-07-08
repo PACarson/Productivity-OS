@@ -1,12 +1,12 @@
 /**
  * 00_Project_State.gs
- * Productivity OS v4.4 — 项目状态快照
+ * Productivity OS v4.5 — 项目状态快照
  *
  * ⚠️ 快照，不是日志。每次更新覆盖旧状态。
- * LAST_UPDATED: 2026-07-06 — V4.4：修复第三轮外部审计里落在本项目范围内
- * 的全部问题（3 HIGH RISK 里的2项 + 3 MEDIUM RISK 里的2项 + 2 项 LOW
- * RISK；另 1 HIGH + 1 MEDIUM 涉及的文件 04_Main.gs / 80_RiderConnector.gs
- * 不属于本项目，未在本次改动范围内，见"三、已知Bug"里的范围说明）。
+ * LAST_UPDATED: 2026-07-06 — V4.5：修复第四轮外部审计发现的全部问题
+ * （3 HIGH + 2 MEDIUM + 2 LOW，本轮全部落在本项目范围内，没有跨项目
+ * 遗留项）。V4.4：修复第三轮外部审计里落在本项目范围内的问题（另有
+ * 04_Main.gs/80_RiderConnector.gs 相关的跨项目遗留项，见"三、已知Bug"）。
  * V4.3.1：修复 setupSheets() 忽略 Events 表的 bug。V4.3：Architecture /
  * Governance Upgrade + Engine Contract Standard 落地。V4.2：修复第二轮
  * 外部审计发现的 3 HIGH + 3 MEDIUM + 1 LOW（完整清单见"三、已知Bug"）。
@@ -17,7 +17,63 @@
 // ============================================================
 
 /**
- * - 2026-07-06（V4.4，本次）：修复第三轮外部审计里落在本项目范围内的
+ * - 2026-07-06（V4.5，本次）：修复第四轮外部审计发现的全部问题：
+ *
+ *   【HIGH RISK 1】并发状态下的统计数据漂移——V4.4 给 completeTask/
+ *   cancelTask 加的状态拦截没有配锁，真正并发时两次调用仍可能都读到
+ *   PENDING 快照、都发布终态事件，10_ProjectionEngine 对同一任务重复
+ *   bump 统计。✅ 修复：projectTaskCompleted_/projectTaskCancelled_
+ *   在增量更新 TaskStatistics 前，先判断事件发生前任务是否已经处于
+ *   同一个终态，是则跳过——让 Projection 消费端本身对重复事件保持幂等，
+ *   而不是只在生产端加锁降低概率。完整架构论证见 00_ADR.gs
+ *   ADR-2026-07-06-004（同时确立为本 OS 所有 Projection 消费函数的
+ *   通用规则，不只是这两个函数的一次性补丁）。
+ *
+ *   【HIGH RISK 2】Gate 门控在高并发下无差别阻塞——GATE_WAIT_MS 原来
+ *   500ms，高并发下无冲突用户也可能因排队超时被误判 SYSTEM_BUSY。
+ *   ✅ 修复：调大到 2000ms。安全性论证：Gate 只保护毫秒级的 CacheService
+ *   读写，不是原来那种锁住整个创建流程的锁，调大等待上限不会重蹈
+ *   V4.2 HIGH RISK 1 的覆辙。
+ *
+ *   【HIGH RISK 3】归档表无限膨胀引发的执行超时/内存风险——V4.4 新增的
+ *   ArchiveTasks 排重校验是全表扫描 task_id 列，随着归档表长期增长会
+ *   越来越慢。✅ 修复：改成只读最近 ARCHIVE_DEDUP_LOOKBACK_ROWS=2000 行
+ *   （有界扫描）——排重真正需要覆盖的只是"上次运行中断留下的半完成行"，
+ *   触发器每天跑一次，2000 行的窗口有几十倍安全余量，足够覆盖，不需要
+ *   扫描全部历史。
+ *
+ *   【MEDIUM RISK 1】PropertiesService 高频调用——getSheet_/_spreadsheet_
+ *   每次都重新读 SPREADSHEET_ID + 重新 openById，单次请求内可能被调用
+ *   好几次。✅ 修复：01_SecureConfig.getKey() 增加执行期内存缓存；
+ *   05_SheetUtils.getSheet_ 和 02_EventBus._spreadsheet_ 各自增加执行期
+ *   缓存的 Spreadsheet 对象，两层加起来单次执行最多只有一次 openById。
+ *
+ *   【MEDIUM RISK 2】锁冲突导致 Telegram 重试"假失败"——同一 chatId 的
+ *   Soft Lock 被占用时（很可能是 Telegram 重试同一条消息，原请求大概率
+ *   会成功），之前统一回复"没建成，请重发"，具有误导性。✅ 修复：
+ *   09_IdempotencyManager.gs 把 Gate 失败和 Soft Lock 被占用拆成两种
+ *   错误前缀（"SYSTEM_BUSY:" vs "SYSTEM_BUSY_RETRY_IN_PROGRESS:"），
+ *   06_TaskIntentParser.gs 对应给出不同回复——前者是真的没做成，后者是
+ *   "正在处理中，稍后再看"。
+ *
+ *   【LOW RISK 1】05_SheetUtils.gs/09_TemporalParser.gs 大量裸全局工具
+ *   函数存在被同名函数覆盖的风险——核实属实，但评估后判断本次不做：
+ *   落地建议需要把十几个函数包进命名空间并同步修改项目里几乎所有文件
+ *   的调用点，是一次牵动全项目的重构，跟这几轮审计"不改架构/不重构"
+ *   的前提冲突，且这是 LOW 级别的最低风险等级，投入产出不成比例。
+ *   完整评估记录在 05_SheetUtils.gs 文件头，留待以后有专门的重构窗口
+ *   时再处理，不是被遗漏。
+ *
+ *   【LOW RISK 2】03_Output.gs 的 UrlFetchApp 同步调用有额度/超时风险——
+ *   核实后澄清：00_File_Map.gs 之前写"本项目不直接调用"是错的，实际上
+ *   02_EventBus._alertAdminProjectionFailure_ 会在 Projection 失败时
+ *   调用它发告警，但这是唯一调用点，且只在这种本身应该很罕见的异常
+ *   路径上触发。已有的 try/catch + muteHttpExceptions + 长度截断防护
+ *   足够应对当前唯一的调用面，没有做批处理/异步化改造（对一个几乎不会
+ *   被触发的告警函数而言不成比例）；已更新 00_File_Map.gs 里对这个
+ *   文件调用情况的错误描述。
+ *
+ * - 2026-07-06（V4.4）：修复第三轮外部审计里落在本项目范围内的
  *   全部问题：
  *
  *   【HIGH RISK 1】连续重复点击（双击 Telegram 内联键盘"完成"按钮，两次
@@ -202,90 +258,91 @@
 // ============================================================
 
 /**
- * 全部已在本次（2026-07-06）V4.4 审计修复中处理（本项目范围内的部分），
- * 记录留存供交接参考：
+ * 全部已在本次（2026-07-06）V4.5 审计修复中处理，本轮全部落在本项目
+ * 范围内，没有跨项目遗留项，记录留存供交接参考：
  *
  * HIGH RISK
  *
- * - HIGH RISK 1（连续重复点击导致统计模型漂移）：
- *   Telegram 内联键盘快速双击"完成"按钮会产生两次 update_id 不同的
- *   callback_query，上游（Core 项目 04_Main.gs）按 update_id 去重拦不住。
- *   20_TaskEngine.completeTask 之前也没有校验"这个任务是不是已经是 DONE
- *   了"，两次调用都会各发布一次 TASK_COMPLETED，
- *   10_ProjectionEngine._bumpStatistics_ 对同一任务重复扣减 pending、
- *   重复累加 done，TaskStatistics 快照漂移（pending 可能出现负数）。
- *   ✅ 修复：completeTask/cancelTask 现在把"已经是终态"也当成拦截条件——
- *   不只是"找不到"。返回值新增 already_done/already_cancelled/
- *   invalid_state 几种信号，06_TaskIntentParser.gs 的 TASK_DONE/
- *   TASK_CANCEL 分支据此如实回复"之前已经处理过"。
- *   ⚠️ 范围说明：本条审计原文同时提到 04_Main.gs(_handleCallback_)，
- *   该文件属于 Personal AI Core 项目，不在本项目范围内，本次未修改——
- *   但本项目侧的幂等化修复已经能独立完整地防住"统计漂移"这个后果。
+ * - HIGH RISK 1（并发状态下的统计数据漂移）：
+ *   V4.4 给 completeTask/cancelTask 加的"已经是终态就拦截"检查没有配锁，
+ *   真正并发（两个 GAS 执行几乎同时处理同一个 taskId）时两次调用仍可能
+ *   都读到 PENDING 快照、都通过检查、都发布终态事件，
+ *   projectTaskCompleted_/projectTaskCancelled_ 对每个到达的事件无条件
+ *   执行 _bumpStatistics_，重复事件导致统计重复扣减/累加。
+ *   ✅ 修复：两个 Projection 消费函数在 bump 统计前，先判断"事件发生前
+ *   任务是否已经处于同一个终态"，是则跳过——这不是给这两个函数的一次性
+ *   补丁，是本 OS 对所有 Projection 消费函数的通用要求（消费端幂等，而
+ *   不是只在生产端加锁降低概率），完整架构论证见 00_ADR.gs
+ *   ADR-2026-07-06-004。
  *
- * - HIGH RISK 2（80_RiderConnector.gs 检查点非事务性）：
- *   【不在本项目范围内】80_RiderConnector.gs 不属于 Productivity OS，
- *   本次没有拿到这个文件，无法修复，需要在该文件实际所在的项目里处理。
+ * - HIGH RISK 2（Gate 门控在高并发下无差别阻塞）：
+ *   09_IdempotencyManager._acquireSoftLock_ 的 GATE_WAIT_MS 只有 500ms，
+ *   高并发下即使完全不冲突的用户也可能因为排队超过这个窗口而被误判
+ *   SYSTEM_BUSY，遭无差别拒绝。
+ *   ✅ 修复：调大到 2000ms。安全性论证：Gate 只保护毫秒级的 CacheService
+ *   读写操作本身，不像 V4.2 那次锁住的是整个创建流程——调大等待上限
+ *   不会重新引入"锁住慢操作导致 Webhook 超时"的问题。
  *
- * - HIGH RISK 3（Events 全表扫描导致执行超时/内存风险）：
- *   getAllEvents() 无条件读取 Events 表全部行，随着表增长会逼近 GAS
- *   30 秒/6 分钟执行上限。
- *   ✅ 修复（风险可见性，非架构重构——审计本身要求不改架构）：
- *   02_EventBus.getAllEvents() 超过 LARGE_EVENTS_WARNING_THRESHOLD=5000
- *   行时打警告日志；新增轻量 getEventCount_()（只读行数）供
- *   11_ProjectionRebuilder.gs 全量重建前先报一下规模。
- *   ⚠️ 澄清：审计提到的"普通用户通过 /insights 指令触发
- *   replayCompletionTrend_"核实后在本项目不成立——本项目没有 /insights
- *   或任何等价指令接到这个函数上，12_TaskQueryEngine.getStatistics 也
- *   不调用它，完整确认过程见 26_AnalyticsEngine.gs 文件头。
+ * - HIGH RISK 3（归档表无限膨胀引发的执行超时/内存风险）：
+ *   V4.4 新增的 ArchiveTasks 排重校验是全表扫描 task_id 列，ArchiveTasks
+ *   只增不减，长期运行后这一列会越来越大，扫描越来越慢。
+ *   ✅ 修复：改成只读最近 ARCHIVE_DEDUP_LOOKBACK_ROWS=2000 行（有界扫描，
+ *   不随总行数增长）。排重真正需要覆盖的只是"上次运行中断留下的半完成
+ *   行"，触发器每天跑一次，2000 行的窗口有几十倍安全余量，足够覆盖。
  *
  * MEDIUM RISK
  *
- * - MEDIUM RISK 1（全局脚本锁引发多用户并发排队）：
- *   09_IdempotencyManager.gs 用 LockService.getScriptLock()（部署级全局
- *   作用域）包住整段创建逻辑，User B 的请求会被 User A 完全无关的请求
- *   无差别锁住排队。
- *   ✅ 修复：改成"每 chatId 一把的软锁"——Gate（极短的全局 ScriptLock，
- *   GATE_WAIT_MS=500ms，只保护"检查+占位"这一下的原子性）+ Soft Lock
- *   （CacheService，每 chatId 一把，LOCK_TTL_SECONDS=15s 过期兜底）。
- *   不同用户之间不再互相阻塞，对外契约不变（仍抛 SYSTEM_BUSY: 前缀
- *   错误）。完整架构论证 + 诚实的代价说明见 00_ADR.gs ADR-2026-07-06-003。
+ * - MEDIUM RISK 1（PropertiesService 高频调用导致的限额与延迟风险）：
+ *   05_SheetUtils.getSheet_ 和 02_EventBus._spreadsheet_ 每次调用都重新
+ *   SecureConfig.getKey('SPREADSHEET_ID') + SpreadsheetApp.openById(id)，
+ *   单次请求内可能被调用好几次。
+ *   ✅ 修复：01_SecureConfig.getKey() 增加执行期内存缓存（同一次执行内，
+ *   同一个 key 只读一次 PropertiesService）；05_SheetUtils.gs 和
+ *   02_EventBus.gs 各自再加一层，缓存已经打开的 Spreadsheet 对象本身——
+ *   两层加起来单次执行最多只有一次 openById 调用。
  *
- * - MEDIUM RISK 2（非原子性归档流程导致归档记录重复追加）：
- *   13_ActiveTasksEngine.runDailyArchive 先追加 ArchiveTasks、再整列
- *   覆写 Tasks 的 archived 标记，两步操作不具备事务原子性——第一步成功
- *   后、第二步执行前 GAS 中断，下次运行会重复追加进 ArchiveTasks。
- *   ✅ 修复：追加前先读一次 ArchiveTasks 现有 task_id 集合做排重校验，
- *   已经在 ArchiveTasks 里但 Tasks 侧标记没写成功的行，只补标记，不
- *   重复追加（选择排重校验而不是"先标记再追加"，因为后者中断会导致
- *   任务从"未归档"直接消失又没真的进 ArchiveTasks，是更糟的数据丢失）。
- *
- * - MEDIUM RISK 3（Webhook 消息去重检测存在并发竞态）：
- *   【不在本项目范围内】04_Main.gs(doPost) 属于 Personal AI Core 项目，
- *   不在本项目范围内，本次未修改。
+ * - MEDIUM RISK 2（锁冲突导致 Telegram 重试"假失败"）：
+ *   同一 chatId 的 Soft Lock 被占用时（典型场景：Telegram 因响应慢发起
+ *   重试，前一个请求其实还在正常处理、大概率会成功），之前统一回复
+ *   "系统繁忙，这个任务没建成，请重发"，对这种情况而言是误导性的。
+ *   ✅ 修复：09_IdempotencyManager.gs 把"Gate 都没排上"（真正的全站级
+ *   繁忙）和"这个 chatId 已经有请求在处理"拆成两种错误前缀
+ *   （"SYSTEM_BUSY:" vs "SYSTEM_BUSY_RETRY_IN_PROGRESS:"），
+ *   06_TaskIntentParser.gs 对应给出不同回复文案——后者回复"正在处理中，
+ *   稍后再看"而不是"没建成"。
  *
  * LOW RISK
  *
- * - LOW RISK 1（09_TemporalParser.gs 扁平全局变量污染命名空间）：
- *   RECURRENCE_TYPES / WEEKDAY_CHAR_MAP / WEEKDAY_NUM_TO_CHAR 三个裸
- *   全局常量。
- *   ✅ 修复：收进 TemporalConfig 命名空间对象，4 处内部引用同步更新。
- *   文件其余函数保持裸全局不变——它们是对外公开 API，被 06/21 等多个
- *   文件直接调用，包进 IIFE 需要同步改调用方，属于会改变调用方式的
- *   重构，超出"消除常量碰撞风险"这个具体问题的范围。
+ * - LOW RISK 1（05_SheetUtils.gs/09_TemporalParser.gs 裸全局工具函数）：
+ *   核实属实——评估后判断本次不做：把十几个函数收进命名空间需要同步
+ *   修改项目里几乎所有文件的调用点，是一次牵动全项目的重构，跟这几轮
+ *   审计"不改架构/不重构"的前提冲突，且是 LOW 级别的最低风险等级，
+ *   投入产出不成比例。完整评估记录在 05_SheetUtils.gs 文件头，不是
+ *   被遗漏，是记录在案的暂缓。
  *
- * - LOW RISK 2（20_TaskEngine.gs 扁平命名空间 Wrapper 函数暴露隐患）：
- *   createTask/updateTask 等裸全局 wrapper 函数名字通用，有被消费端
- *   同名函数覆盖的风险。审计原文建议"未来逐步废弃"，不是"现在移除"
- *   （移除会破坏 Core 项目 04_Main.gs 现有调用）。
- *   ✅ 采纳方式：给每个 wrapper 加 @deprecated 风格 JSDoc 标注推荐的
- *   命名空间路径，不删除任何一个，迁移列入 00_Roadmap.gs Future。
+ * - LOW RISK 2（03_Output.gs 的 UrlFetchApp 同步调用额度/超时风险）：
+ *   核实后澄清：00_File_Map.gs 之前写"本项目不直接调用"是错的——
+ *   02_EventBus._alertAdminProjectionFailure_ 会在 Projection 失败时
+ *   调它发管理员告警，是唯一调用点，且只在这种本应罕见的异常路径上
+ *   触发。已有的 try/catch + muteHttpExceptions + 长度截断防护足够
+ *   应对当前唯一的调用面，没有做批处理/异步化改造；已更正
+ *   00_File_Map.gs 里的错误描述。
  *
- * 附注：本轮修复过程中用 node --check 对全部 26 个 .gs 文件做了语法
- * 校验，额外发现并修复了 2 处自己在写注释时引入的问题——注释里把
- * "rebuild/verify/compare"几个词用星号加斜杠的写法连在一起时，那个
- * 字符组合被 JS 解析成提前闭合了整个块注释，后面的中文说明被当成代码
- * 解析报语法错误（02_EventBus.gs 和 11_ProjectionRebuilder.gs 各一处）。
- * 已改写措辞避免这个字符组合，修复后全部文件通过语法检查。
+ * ── V4.4 审计（已修复，历史记录）────────────────────────────────────────
+ *
+ * - HIGH RISK 1：completeTask/cancelTask 增加"已经是终态就拦截"的状态
+ *   校验（本条在 V4.5 发现该校验没配锁、并发下仍可能失效，已在
+ *   V4.5 用 Projection 消费端幂等的方式补强，见上方）。
+ * - HIGH RISK 2（80_RiderConnector.gs）/ MEDIUM RISK 3（04_Main.gs）：
+ *   不在本项目范围内，未修改。
+ * - HIGH RISK 3：02_EventBus.getAllEvents() 超过阈值打警告日志 +
+ *   新增 getEventCount_()。
+ * - MEDIUM RISK 1：09_IdempotencyManager 全局 ScriptLock 改成
+ *   Gate+per-chatId Soft Lock（ADR-2026-07-06-003）。
+ * - MEDIUM RISK 2：13_ActiveTasksEngine.runDailyArchive 归档前排重校验
+ *   （V4.5 发现这个排重校验本身是全表扫描，已改成有界扫描，见上方）。
+ * - LOW RISK 1：09_TemporalParser.gs 三个裸全局常量收进 TemporalConfig。
+ * - LOW RISK 2：20_TaskEngine.gs 全局 wrapper 函数加 @deprecated 标注。
  *
  * ── V4.2 审计（已修复，历史记录）────────────────────────────────────────
  *

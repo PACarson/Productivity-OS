@@ -1,6 +1,6 @@
 /**
  * 10_ProjectionEngine.gs
- * Productivity OS v4.3 — Projection Engine（Read Model 实时更新器）
+ * Productivity OS v4.5 — Projection Engine（Read Model 实时更新器）
  *
  * 职责：EventBus.publish() 写完 Event 后立即调用本模块，将变更增量写入
  * Read Model（Tasks / ActiveTasks / TaskStatistics / TaskFilters）。
@@ -13,6 +13,13 @@
  *  - 非阻断：Projection 失败时记录日志但不抛错（Event 已经写入是真相，
  *    Read Model 偶尔 stale 可以通过 11_ProjectionRebuilder 修复）
  *  - 只写 Read Model，从不读 Events 表
+ *
+ * 【V4.5 审计修复】HIGH RISK 1（第四轮外部审计，并发状态下的统计数据
+ * 漂移）：projectTaskCompleted_/projectTaskCancelled_ 现在会在
+ * _bumpStatistics_ 之前检查"事件发生前，这个任务是不是已经处于同一个
+ * 终态"，是则跳过增量更新，避免并发场景下的重复事件导致统计漂移。这不是
+ * 一次性补丁，是本 OS 对 Projection 消费函数的通用要求，完整架构论证见
+ * 00_ADR.gs ADR-2026-07-06-004。
  *
  * 【V4.2 审计修复】：
  *   1. HIGH RISK 3（频繁同步 Sheet 读写）：projectTaskUpdated_ 之前对同一
@@ -236,12 +243,40 @@ var ProjectionEngine = (function () {
     });
   }
 
+  /**
+   * 【V4.5 修复 HIGH RISK 1：并发状态下的统计数据漂移】
+   * 20_TaskEngine.completeTask/cancelTask（V4.4 起）会在发布事件前检查
+   * 任务当前状态，已经是终态就拦截——但这个检查本身没有加锁：真正并发
+   * （两个 GAS 执行几乎同时跑）时，两次调用都可能在对方还没写回 Sheet
+   * 之前读到同一个 PENDING 快照，双双通过检查，各自发布一次
+   * TASK_COMPLETED/TASK_CANCELLED。这两个事件最终都会走到这里——
+   * ProjectionEngine 是本 OS 里唯一实际执行 _bumpStatistics_ 增量扣减的
+   * 地方，是修这个问题的正确位置：不管上游因为什么原因（并发竞态、未来
+   * 别的 bug、甚至手动重放 Events 时的失误）产生了重复的终态事件，
+   * Projection 消费端自己必须能扛住重复——这是事件溯源架构里"投影消费端
+   * 应该幂等"这条通用原则的具体应用，比在 completeTask/cancelTask 入口
+   * 再加一把 per-taskId 锁更根本：加锁只能降低重复事件出现的概率，
+   * 不能保证清零（跟 09_IdempotencyManager.gs 的 Soft Lock 是"尽力而为"
+   * 而非"绝对互斥"同一个道理，见 00_ADR.gs ADR-2026-07-06-003）；而让
+   * Projection 消费端幂等，则是不管重复事件有没有发生、发生了几次，
+   * 结果都保证正确——这是更强的保证，所以选它作为主要修复手段，不再
+   * 额外给 completeTask/cancelTask 加锁（那样只是徒增复杂度换一个本来
+   * 就能在这里更彻底解决的问题）。
+   *
+   * 做法：用 upsert 前读到的 current.status 判断"这次事件发生之前，
+   * 这个任务是不是已经处于同一个终态"——如果是，说明这是一次重复事件
+   * （不管什么原因产生的），跳过 _bumpStatistics_，避免重复扣减/累加。
+   * Tasks/ActiveTasks 的写入不受影响，继续照常执行——upsert 同样的
+   * status='DONE' 和 delete 一个已经不存在的 ActiveTasks 行本身就是
+   * 幂等操作，不会因为重复执行产生错误结果。
+   */
   function projectTaskCompleted_(event) {
     var p = event.payload || {};
     if (!p.task_id) return;
 
     var completedAt = event.timestamp || new Date().toISOString();
     var current = _getRowByKey_(TASKS_SHEET, 'task_id', p.task_id);
+    var wasAlreadyDone = !!(current && String(current.status || '').toUpperCase() === 'DONE');
 
     upsertRowByKey_(TASKS_SHEET, 'task_id', p.task_id, {
       status:       'DONE',
@@ -254,6 +289,12 @@ var ProjectionEngine = (function () {
       Logger.log('[ProjectionEngine] ActiveTasks 删除失败（Sheet 可能尚未建立）: ' + e.message);
     }
 
+    if (wasAlreadyDone) {
+      Logger.log('[ProjectionEngine] task_id=' + p.task_id + ' 在这次 TASK_COMPLETED 之前就已经是 DONE' +
+        '（重复事件，很可能是并发竞态产生的），跳过 TaskStatistics 增量扣减，避免统计漂移');
+      return;
+    }
+
     _bumpStatistics_(event.chat_id || (current && current.chat_id), { pending: -1, done: 1 });
   }
 
@@ -262,6 +303,7 @@ var ProjectionEngine = (function () {
     if (!p.task_id) return;
 
     var current = _getRowByKey_(TASKS_SHEET, 'task_id', p.task_id);
+    var wasAlreadyCancelled = !!(current && String(current.status || '').toUpperCase() === 'CANCELLED');
 
     upsertRowByKey_(TASKS_SHEET, 'task_id', p.task_id, {
       status: 'CANCELLED'
@@ -271,6 +313,12 @@ var ProjectionEngine = (function () {
       deleteRowByKey_(ACTIVE_TASKS_SHEET, 'task_id', p.task_id);
     } catch (e) {
       Logger.log('[ProjectionEngine] ActiveTasks 删除失败（Sheet 可能尚未建立）: ' + e.message);
+    }
+
+    if (wasAlreadyCancelled) {
+      Logger.log('[ProjectionEngine] task_id=' + p.task_id + ' 在这次 TASK_CANCELLED 之前就已经是 CANCELLED' +
+        '（重复事件，很可能是并发竞态产生的），跳过 TaskStatistics 增量扣减，避免统计漂移');
+      return;
     }
 
     _bumpStatistics_(event.chat_id || (current && current.chat_id), { pending: -1, cancelled: 1 });

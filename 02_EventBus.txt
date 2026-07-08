@@ -1,6 +1,6 @@
 /**
  * 02_EventBus.gs
- * Productivity OS v4.4 — 事件总线（Events 表唯一写入口，本项目内）
+ * Productivity OS v4.5 — 事件总线（Events 表唯一写入口，本项目内）
  *
  * ⚠️ 2026-07-03 拆分说明：这是 Personal AI Core 的 02_EventBus.gs 的本地副本，
  * 唯一改动是 _sheet_()——Core 是 container-bound 脚本，用
@@ -54,6 +54,7 @@ var EventBus = (function () {
 
   var _cachedEvents = null;        // 运行期内存缓存
   var _inExecIdentityCache_ = {};  // 本次执行内的 identity 去重缓存
+  var _cachedSpreadsheet_ = null;  // V4.5新增：执行期内缓存 Spreadsheet 对象，见 _spreadsheet_() 修复说明
 
   /**
    * 2026-07-03 拆分新增：跨项目共享同一个 Spreadsheet，用 openById 而不是
@@ -61,15 +62,25 @@ var EventBus = (function () {
    * SPREADSHEET_ID 要在本项目的 Script Properties 里设置成跟 Core 项目
    * 一样的值（跟 Core 那份 Spreadsheet 的 ID，去 Core 的
    * SecureConfig.getKey('SPREADSHEET_ID') 或者直接看那张表的 URL 抄）。
+   *
+   * 【V4.5 修复 MEDIUM RISK 1】原来每次调用都重新 openById——本文件是
+   * IIFE，直接加一个私有闭包变量缓存住打开过的 Spreadsheet 对象即可，
+   * 不需要像 05_SheetUtils.gs 那样纠结"没有 IIFE 怎么办"（那边额外加了
+   * 一个刻意命名的顶层变量，见那边的修复说明）。同一次执行内 publish()
+   * 可能被调用多次（比如 completeTask 触发的 recurring 续期又会走一次
+   * createTask），缓存后这些调用共享同一个已经打开的 Spreadsheet 对象。
    */
   function _spreadsheet_() {
-    var id = SecureConfig.getKey('SPREADSHEET_ID');
-    if (!id) {
-      throw new Error('缺少 SPREADSHEET_ID（Script Properties）。这是跟 Personal AI Core ' +
-        '共享的同一张 Spreadsheet 的 ID，去 Core 项目那边的表格 URL 复制，' +
-        '然后 SecureConfig.setKey("SPREADSHEET_ID", "你复制的ID")。');
+    if (!_cachedSpreadsheet_) {
+      var id = SecureConfig.getKey('SPREADSHEET_ID');
+      if (!id) {
+        throw new Error('缺少 SPREADSHEET_ID（Script Properties）。这是跟 Personal AI Core ' +
+          '共享的同一张 Spreadsheet 的 ID，去 Core 项目那边的表格 URL 复制，' +
+          '然后 SecureConfig.setKey("SPREADSHEET_ID", "你复制的ID")。');
+      }
+      _cachedSpreadsheet_ = SpreadsheetApp.openById(id);
     }
-    return SpreadsheetApp.openById(id);
+    return _cachedSpreadsheet_;
   }
 
   function _sheet_() {

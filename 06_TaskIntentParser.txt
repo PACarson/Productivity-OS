@@ -1,6 +1,6 @@
 /**
  * 06_TaskIntentParser.gs
- * Productivity OS v4.4 — 任务意图解析器
+ * Productivity OS v4.5 — 任务意图解析器
  *
  * 【V4.4 配套 HIGH RISK 1 修复】TASK_DONE/TASK_CANCEL 分支新增对
  * completeTask/cancelTask 新返回信号（already_done/already_cancelled/
@@ -141,11 +141,17 @@ function handleTaskIntent(rawText, chatId) {
     case 'TASK_CREATE': {
       var recurringLabel = RecurringEngine.ruleToLegacyString(parsed.recurrence_rule); // 21_RecurringEngine.gs
 
-      // 【V4.2 修复 HIGH RISK 1 的调用方那一半】09_IdempotencyManager.gs
-      // 把"3秒内没拿到锁"包装成 "SYSTEM_BUSY:" 开头的 Error 抛出来——这里
-      // 必须接住，给用户一句友好提示，不能让它从 handleTaskIntent 裸抛
-      // 出去（那样 Telegram Webhook 那头看到的就是一次失败的调用，用户
-      // 完全不知道发生了什么，还可能触发 Telegram 自己的重试）。
+      // 【V4.2 修复 HIGH RISK 1 的调用方那一半，V4.5 拆成两条分支】
+      // 09_IdempotencyManager.gs 现在会抛两种不同前缀的 SYSTEM_BUSY 错误
+      // （见该文件文件头 V4.5 修复说明）：
+      //   - "SYSTEM_BUSY_RETRY_IN_PROGRESS:" —— 这个 chatId 已经有一个
+      //     请求在处理中，大概率是 Telegram 对同一条消息的重试，原来的
+      //     请求很可能会成功。回复"没建成，请重发"是误导（V4.5 修复
+      //     MEDIUM RISK 2：锁冲突导致的"假失败"），应该回复"正在处理中"。
+      //   - "SYSTEM_BUSY:"（不带后缀）—— 连 Gate 都没排上，真正的全站级
+      //     繁忙，这次调用大概率什么都没做，"请重发"是准确的建议。
+      // 两个 if 分支顺序不能反：SYSTEM_BUSY_RETRY_IN_PROGRESS 本身也以
+      // "SYSTEM_BUSY"开头，必须先判断更具体的那个前缀。
       var result;
       try {
         result = IdempotencyManager.createTaskIfNotExists(
@@ -154,8 +160,18 @@ function handleTaskIntent(rawText, chatId) {
           chatId
         );
       } catch (e) {
-        if (String(e.message || '').indexOf('SYSTEM_BUSY') === 0) {
-          Logger.log('[TaskIntentParser] TASK_CREATE 遇到 SYSTEM_BUSY，回复用户稍后重试: ' + e.message);
+        var busyMsg = String(e.message || '');
+
+        if (busyMsg.indexOf('SYSTEM_BUSY_RETRY_IN_PROGRESS') === 0) {
+          Logger.log('[TaskIntentParser] TASK_CREATE 遇到 SYSTEM_BUSY_RETRY_IN_PROGRESS' +
+            '（同一 chatId 已有请求在处理，很可能是 Telegram 重试）: ' + busyMsg);
+          return {
+            matched: true, intent: 'TASK_CREATE', data: null,
+            replyText: '⏳ 你刚才的请求正在处理中（可能是重复发送触发的），请稍等几秒用 /mytasks 看看是否已经建好，不需要马上重发。'
+          };
+        }
+        if (busyMsg.indexOf('SYSTEM_BUSY') === 0) {
+          Logger.log('[TaskIntentParser] TASK_CREATE 遇到 SYSTEM_BUSY，回复用户稍后重试: ' + busyMsg);
           return {
             matched: true, intent: 'TASK_CREATE', data: null,
             replyText: '⏳ 系统当前写入较多，这个任务没建成，请几秒后重发一次。'

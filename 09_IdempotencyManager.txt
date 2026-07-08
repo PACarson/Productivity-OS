@@ -1,9 +1,31 @@
 /**
  * 09_IdempotencyManager.gs
- * Productivity OS v4.4 — 幂等性管理器（Task）
+ * Productivity OS v4.5 — 幂等性管理器（Task）
  *
  * 职责：确保每个创建操作恰好执行一次（Exactly-Once Semantics）。
  * 所有模块创建 Task 必须经过本层，禁止直接 EventBus.publish('TASK_CREATED')。
+ *
+ * 【V4.5 修复 HIGH RISK 2：Gate 门控在高并发下的无差别阻塞】
+ * GATE_WAIT_MS 从 500ms 调大到 2000ms——见下方变量声明处的完整说明。
+ *
+ * 【V4.5 修复 MEDIUM RISK 2：锁冲突导致的 Telegram 重试"假失败"】
+ * 之前不管是"Gate 都排不上"还是"这个 chatId 已经有请求在处理中"，抛出的
+ * 都是同一种 "SYSTEM_BUSY:" 前缀错误，06_TaskIntentParser.gs 统一回复
+ * "这个任务没建成，请重发"——但"这个 chatId 已经有请求在处理中"这种情况
+ * （典型场景：Telegram 因为响应慢发起重试，前一个请求其实还在正常处理、
+ * 大概率会成功）跟"这个任务没建成"完全不是一回事，告诉用户"没建成"是
+ * 误导。现在拆成两种错误前缀：
+ *   - "SYSTEM_BUSY:"（不带后缀）——Gate 都没排上，这次调用大概率真的
+ *     什么都没做，"请重发"是准确的建议。
+ *   - "SYSTEM_BUSY_RETRY_IN_PROGRESS:"——Gate 拿到了，但这个 chatId 的
+ *     Soft Lock 已经被占用，说明"你自己"有一个请求正在处理，回复应该是
+ *     "正在处理，稍后再看"而不是"没建成，请重发"。
+ * 06_TaskIntentParser.gs 的 TASK_CREATE 分支相应拆成两条 catch 分支。
+ * ⚠️ 对外契约变化说明：这是本次唯一一个不是"纯粹新增"的地方——原来的
+ * "SYSTEM_BUSY:"前缀这个大类不变（任何只检查这个前缀的旧代码依然能
+ * 识别出"这是个繁忙类错误"），但如果有代码依赖"所有繁忙错误消息都是
+ * 一模一样的文字"，则需要知道现在有两种文案。本项目内唯一的消费方
+ * 06_TaskIntentParser.gs 已经同步更新。
  *
  * 【V4.4 修复 MEDIUM RISK 1：全局脚本锁引发的多用户并发排队】
  * 原来用 LockService.getScriptLock() 包住"读-校验-写"整段逻辑。这把锁的
@@ -16,7 +38,8 @@
  *
  * 修复：改成"每用户软锁"（per-chatId soft lock），分两层：
  *
- *   1. Gate（瞬时全局锁，GATE_WAIT_MS=500ms）：只用来保护"读 CacheService+
+ *   1. Gate（瞬时全局锁，GATE_WAIT_MS=2000ms，V4.5 起从 500ms 调大，见下方
+ *      V4.5 修复说明）：只用来保护"读 CacheService+
  *      写 CacheService"这一步本身的原子性（CacheService 本身没有原子的
  *      compare-and-set，需要一把锁包住"检查+占位"这一下才能避免竞态）。
  *      这一步通常几毫秒就结束，不会像原来那样把整个"读 Sheet 判重 + 写
@@ -38,10 +61,11 @@
  * 最后写入前的 identity 判重仍然是最后一道防线。
  *
  * 【V4.2 修复 HIGH RISK 1：Webhook 超时与 GAS 并发限制级联失效】（历史，
- * 部分内容被本次 V4.4 取代，完整对照见 00_Project_State.gs）：
+ * 部分内容被 V4.4 取代，完整对照见 00_Project_State.gs）：
  * 原来 lock.waitLock(10000) 最多等 10 秒，V4.2 降到 3 秒 fail-fast。V4.4
- * 的 Soft Lock 沿用同一个"fail-fast、抛 SYSTEM_BUSY: 前缀错误"的对外契约，
- * 06_TaskIntentParser.gs 的 catch 逻辑不用改一行。
+ * 的 Soft Lock 沿用同一个"fail-fast、抛 SYSTEM_BUSY: 前缀错误"的对外契约
+ * （V4.5 起细分成两种前缀，06_TaskIntentParser.gs 的 catch 逻辑相应更新
+ * 了两条分支，见上方 V4.5 MEDIUM RISK 2 的说明）。
  *
  * 【V4 修复 LOW RISK 2】调用 TaskEngine.createTaskDirect_（IIFE 内部方法），
  * 不再是裸全局函数 _createTaskDirect_。
@@ -53,7 +77,21 @@
 
 var IdempotencyManager = (function () {
 
-  var GATE_WAIT_MS      = 500;  // Gate 只保护"检查+占位"这一下，等待时间可以很短
+  // 【V4.5 修复 HIGH RISK 2：Gate 在高并发下无差别阻塞】GATE_WAIT_MS 原来
+  // 是 500ms。Gate 本身只保护"读 CacheService + 写 CacheService"这一步
+  // （通常几十毫秒），但如果短时间内大量不同 chatId 的请求同时涌入，
+  // 大家都要排队抢同一把 Gate——请求数一多，排在后面的哪怕跟任何人都不
+  // 冲突，也可能因为纯粹排队耗时超过 500ms 而被误判 SYSTEM_BUSY，产生
+  // "完全不冲突的用户被无差别拒绝"的问题。
+  // 修复：延长到 2000ms。这是安全的——Gate 保护的操作本身耗时不变（还是
+  // 几十毫秒级别），延长的只是"愿意排多久队"的上限，不会让单个请求的
+  // 正常延迟变长；LockService.waitLock(ms) 内部本来就会在这个窗口内持续
+  // 尝试获取锁（不是只判一次），2000ms 相对 Telegram Webhook 的重试窗口
+  // （审计报告提到约7秒）仍然有充足余量，不会重新引入 V4.2 HIGH RISK 1
+  // 那种"锁住整个创建流程导致 Webhook 超时"的问题——那次的锁保护的是
+  // 几百毫秒到几秒的完整 Sheet 读写流程，这里的 Gate 保护的只是毫秒级的
+  // 内存操作，两者不是同一类锁，等待上限可以放得更宽松而不重蹈覆辙。
+  var GATE_WAIT_MS      = 2000;
   var LOCK_TTL_SECONDS  = 15;   // Soft Lock 安全过期兜底（正常释放远快于这个时间）
 
   // ============ 内部：per-chatId Soft Lock ============
@@ -113,10 +151,15 @@ var IdempotencyManager = (function () {
    * @param {object} meta   { category, priority, due_date, recurring, context, budget, notes, description, tags }
    * @param {string} chatId
    * @returns {{ task: object, created: boolean }}
-   * @throws {Error}  message 以 "SYSTEM_BUSY:" 开头 —— 同一个 chatId 已经
-   *                   有一个创建请求在处理中，调用方（尤其是 Telegram 指令
-   *                   路径）应该捕获这个错误，给用户一个"稍后重试"的友好
-   *                   提示，不要让它裸传播成未处理异常。
+   * @throws {Error}  message 以 "SYSTEM_BUSY" 开头，具体分两种（V4.5 修复
+   *                   MEDIUM RISK 2 新增区分，供调用方给出不同回复文案）：
+   *                   - "SYSTEM_BUSY:"（不带后缀）—— 连 Gate 都没排上，
+   *                     这是真正的全站级繁忙，这次调用大概率什么都没做。
+   *                   - "SYSTEM_BUSY_RETRY_IN_PROGRESS:" —— Gate 拿到了，
+   *                     但这个 chatId 已经有一个请求在处理中（很可能是
+   *                     Telegram 对同一条消息的重试）。这种情况下大概率
+   *                     那个"在处理中"的请求会成功，不应该告诉用户
+   *                     "没建成"，应该告诉用户"正在处理，稍后再看"。
    */
   function createTaskIfNotExists(title, meta, chatId) {
     meta = meta || {};
@@ -133,8 +176,9 @@ var IdempotencyManager = (function () {
     var acquired = _acquireSoftLock_(chatId);
     if (!acquired) {
       Logger.log('[IdempotencyManager] chatId=' + chatId + ' 已有请求在处理中，fail-fast 放弃本次创建' +
-        '（只影响这一个用户，不影响其他用户）: identity=' + identity.slice(0, 12) + '...');
-      throw new Error('SYSTEM_BUSY: 你刚才的请求还在处理中，请稍等几秒再试一次。');
+        '（只影响这一个用户，不影响其他用户，大概率是 Telegram 重试同一条消息）: identity=' +
+        identity.slice(0, 12) + '...');
+      throw new Error('SYSTEM_BUSY_RETRY_IN_PROGRESS: 你刚才的请求还在处理中，请稍等几秒再看看，不需要马上重发。');
     }
 
     try {

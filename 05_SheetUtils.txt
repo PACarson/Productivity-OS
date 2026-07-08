@@ -40,19 +40,65 @@
  * 任务一旦 DONE/CANCELLED 就要把整行从这张表物理删除（不是覆写状态）。
  * upsertRowByKey_ 只会"找到就覆写/找不到就append"，没有删除语义，
  * 所以单独加一个按主键删行的函数，跟 upsertRowByKey_ 配对使用。
+ *
+ * 本次修改（V4.5，2026-07-06，外部审计 MEDIUM RISK 1，核实属实后采纳）：
+ * getSheet_ 之前每次调用都会重新 SecureConfig.getKey('SPREADSHEET_ID') +
+ * SpreadsheetApp.openById(id)——单次请求内 getSheet_ 常常被调用好几次
+ * （比如一次 createTask 会经过 DeduplicationEngine 读 Tasks、
+ * ProjectionEngine.dispatch 读写 Tasks/ActiveTasks/TaskStatistics/
+ * TaskFilters），重复打开同一张 Spreadsheet 没有必要，还会撞
+ * PropertiesService 的限额（后者已经在 01_SecureConfig.gs 里加了缓存，
+ * 这里再加一层，把"打开 Spreadsheet 对象"这个动作本身也缓存住，两层
+ * 加起来同一次执行内最多只有一次 openById 调用）。
+ * 用 __ProductivityOS_cachedSpreadsheet__ 这个刻意带双下划线前缀+长
+ * 描述性名字的变量存缓存——本文件不是 IIFE（历史遗留，见文件头"扁平
+ * 命名空间"相关说明，这次没有把整个文件重构成 IIFE，见 LOW RISK 1 的
+ * 范围说明），要缓存东西就只能挂一个新的顶层变量，起一个足够独特、
+ * 不会被误用/误撞的名字，是这个约束下最小风险的做法。
+ *
+ * 本次修改（V4.5，2026-07-06，外部审计 LOW RISK 1，核实属实，评估后
+ * 决定暂不做大范围重构）：
+ * 审计指出本文件（以及 09_TemporalParser.gs）里 getSheet_/isOverdue_/
+ * shallowCopy_ 等大量函数是裸全局，存在被 Core 项目或其他 Library 同名
+ * 函数静默覆盖的风险，建议收拢进命名空间对象。这个判断本身是对的，但
+ * 落地这个建议意味着要把本文件十几个函数全部包进一个 IIFE/命名空间
+ * 对象，然后同步修改本项目里几乎每一个文件（TaskEngine/ProjectionEngine/
+ * ProjectionRebuilder/TaskQueryEngine/DeduplicationEngine/
+ * ActiveTasksEngine/Setup……）里对这些函数的调用点——这是一次会触及
+ * 项目里绝大多数文件的大范围重构，而这几轮审计本身反复要求"不改变
+ * 架构、不改变命名、不重构优化代码"。LOW RISK 是这几轮审计里最低的
+ * 风险等级，为了一个最低等级的发现去做一次牵动几乎全部文件的重构，
+ * 投入产出不成比例——这不是"忽略这个问题"，而是"确认了问题、评估了
+ * 修复成本、判断现在不是做这件事的时候"，留在这里明确记录，避免以后
+ * 交接的人以为这是被漏掉了。
+ * 如果未来真的要做，正确的模式是参照 20_TaskEngine.gs（IIFE 封装 +
+ * 保留同名全局 wrapper 函数做向后兼容）——但 20_TaskEngine.gs 当初这样
+ * 做，是因为它的全局 wrapper（createTask 等）需要被 Core 项目
+ * 04_Main.gs 跨项目调用，不得不保留裸全局兼容层；05_SheetUtils.gs/
+ * 09_TemporalParser.gs 的函数命名都带下划线后缀（如 getSheet_），按本
+ * 项目自己的命名约定这类后缀就是"内部实现细节，不对外暴露"的信号，
+ * 理论上可以在包进命名空间的同时把所有内部调用点一起改掉、不需要保留
+ * 兼容层——但"内部调用点有多少个"本身就是这次决定暂缓的原因（数量太
+ * 大，一次性改完风险高），等真的排上优先级时应该整体规划、分批验证，
+ * 不是现在顺手做掉。
  */
+
+var __ProductivityOS_cachedSpreadsheet__ = null; // 执行期内缓存，见上方修复说明，不跨执行持久化
 
 function getSheet_(sheetName) {
   // 2026-07-03 拆分说明：Productivity OS 是独立（standalone）脚本，没有
   // "容器"，不能用 getActiveSpreadsheet()。改用 openById 显式打开跟
   // Personal AI Core 共享的同一张 Spreadsheet（Script Properties 里的
   // SPREADSHEET_ID 要设成跟 Core 一样的值）。
-  var id = SecureConfig.getKey('SPREADSHEET_ID');
-  if (!id) {
-    throw new Error('缺少 SPREADSHEET_ID（Script Properties）。去 Personal AI Core 那张 ' +
-      'Spreadsheet 的 URL 复制 ID，然后 SecureConfig.setKey("SPREADSHEET_ID", "你复制的ID")。');
+  if (!__ProductivityOS_cachedSpreadsheet__) {
+    var id = SecureConfig.getKey('SPREADSHEET_ID');
+    if (!id) {
+      throw new Error('缺少 SPREADSHEET_ID（Script Properties）。去 Personal AI Core 那张 ' +
+        'Spreadsheet 的 URL 复制 ID，然后 SecureConfig.setKey("SPREADSHEET_ID", "你复制的ID")。');
+    }
+    __ProductivityOS_cachedSpreadsheet__ = SpreadsheetApp.openById(id);
   }
-  var sheet = SpreadsheetApp.openById(id).getSheetByName(sheetName);
+  var sheet = __ProductivityOS_cachedSpreadsheet__.getSheetByName(sheetName);
   if (!sheet) {
     throw new Error('Sheet not found: ' + sheetName + ' — 请确认分页名是否一致');
   }

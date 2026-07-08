@@ -43,6 +43,15 @@
  * 补写标记（自愈上次中断留下的半完成状态）。选择"排重校验"而不是审计
  * 建议的另一方案"先标记再追加"——后者如果在标记后、追加前中断，任务会
  * 从"未归档"直接消失又没真的进 ArchiveTasks，是更糟的数据丢失。
+ *
+ * v3.4 变更（V4.5，2026-07-06，外部审计 HIGH RISK 3，核实属实后采纳）：
+ * v3.3 新增的排重校验原来是读 ArchiveTasks【全表】的 task_id 列——这张
+ * 表只增不减，系统跑得越久这一列越大，每天的定时归档任务都要全量读一遍，
+ * 迟早会拖慢执行、逼近 GAS 6 分钟上限。修复：改成只读最近
+ * ARCHIVE_DEDUP_LOOKBACK_ROWS=2000 行（有界扫描，不随 ArchiveTasks 总
+ * 行数增长）——排重真正需要覆盖的只有"上一次运行中断留下的半完成行"，
+ * 触发器每天跑一次，这类行必然产生于最近一次运行，2000 行的窗口留了
+ * 几十倍的安全余量，足够覆盖，不需要扫描全部历史。
  */
 
 /**
@@ -129,8 +138,8 @@ var ActiveTasksEngine = (function () {
       return 0;
     }
 
-    // 【MEDIUM RISK 2 修复，外部审计，核实属实后采纳】runDailyArchive 之前
-    // 是"先追加 ArchiveTasks，再整列覆写 Tasks 的 archived 标记"——如果
+    // 【MEDIUM RISK 2 修复，V4.4，外部审计，核实属实后采纳】runDailyArchive
+    // 之前是"先追加 ArchiveTasks，再整列覆写 Tasks 的 archived 标记"——如果
     // GAS 恰好在第一步成功、第二步执行前被打断（超时/异常/触发器被中途
     // 停掉），下次触发器运行时，这些行的 archived 标记仍然是 false，会
     // 被再次判定为"待归档"，重复追加进 ArchiveTasks，产生重复归档行。
@@ -142,15 +151,41 @@ var ActiveTasksEngine = (function () {
     // 方案是"先标记再追加"，但那样如果在标记后、追加前中断，任务会从
     // "未归档"直接消失又没真的进 ArchiveTasks，是更糟的数据丢失，所以
     // 选排重校验而不是换顺序）。
+    //
+    // 【V4.5 修复 HIGH RISK 3：归档表无限膨胀引发的执行超时/内存风险】
+    // 上面这个排重校验原来是读 ArchiveTasks【全表】的 task_id 列——
+    // ArchiveTasks 只增不减，系统跑几个月/几年后这一列会变得很大，每天
+    // 定时任务都要全量读一遍，迟早会拖慢执行、逼近 GAS 6 分钟上限，这个
+    // 趋势本身不会随时间推移而好转，只会越来越接近临界点。
+    // 而这个排重校验真正需要覆盖的场景，只有"上一次运行到一半被中断"这
+    // 一种——触发器是每天跑一次，能够进入"半完成、等待自愈"状态的行，
+    // 必然是最近一次（至多前一天）运行时产生的，不可能是几个月前就已经
+    // 完整归档、标记也早就补上的旧行。所以排重只需要覆盖"最近一段时间
+    // 追加的行"，不需要覆盖 ArchiveTasks 的全部历史。
+    // 做法：只读最近 ARCHIVE_DEDUP_LOOKBACK_ROWS 行（而不是全表）的
+    // task_id 做排重——ArchiveTasks 是只追加（append-only）表，新行永远
+    // 加在最后，"最近 N 行"在物理上就是"最近归档的 N 条"，用一次有界的
+    // getRange 就能定位，读取量固定为常数，不随 ArchiveTasks 总行数增长。
+    // ARCHIVE_DEDUP_LOOKBACK_ROWS 取 2000——对个人任务系统而言，这远超
+    // "一天内可能归档的任务数"，留了几十倍的安全余量（哪怕连续多天
+    // 触发器没跑、积压了好几轮才重新执行，2000 行的余量也足够覆盖），
+    // 真正需要自愈的半完成行不可能落在这个窗口之外。
+    var ARCHIVE_DEDUP_LOOKBACK_ROWS = 2000;
     var existingArchivedIds = {};
     var archiveLastRow = archiveSheet.getLastRow();
     if (archiveLastRow >= 2 && archiveHeaderMap.hasOwnProperty('task_id')) {
       var archiveTaskIdCol = archiveHeaderMap['task_id'] + 1;
-      var archiveIds = archiveSheet.getRange(2, archiveTaskIdCol, archiveLastRow - 1, 1).getValues();
+      var lookbackStartRow = Math.max(2, archiveLastRow - ARCHIVE_DEDUP_LOOKBACK_ROWS + 1);
+      var lookbackRowCount = archiveLastRow - lookbackStartRow + 1;
+      var archiveIds = archiveSheet.getRange(lookbackStartRow, archiveTaskIdCol, lookbackRowCount, 1).getValues();
       archiveIds.forEach(function (r) {
         var id = String(r[0] || '');
         if (id) existingArchivedIds[id] = true;
       });
+      if (lookbackStartRow > 2) {
+        Logger.log('[ActiveTasksEngine] ArchiveTasks 共 ' + (archiveLastRow - 1) + ' 行，排重校验只读了最近 ' +
+          lookbackRowCount + ' 行（有界扫描，见 HIGH RISK 3 修复说明），不做全表扫描');
+      }
     }
 
     var cutoff     = Date.now() - days * 24 * 60 * 60 * 1000;

@@ -1,6 +1,6 @@
 /**
  * 00_ADR.gs
- * Productivity OS v4.4 — Architecture Decision Records
+ * Productivity OS v4.5 — Architecture Decision Records
  *
  * 本文件收录本项目"影响后续所有开发判断"的重大架构决策，格式固定为
  * Metadata（V4.3 新增，见下方字段定义） + Context / Decision /
@@ -12,6 +12,9 @@
  * 本文件对应 Universal Domain OS Blueprint「0. Governance → ADR (Optional)」
  * 这一格（00_Project_Constitution.gs P4 之前原本写"暂无"，V4.1 起改为
  * 指向本文件）。
+ *
+ * 【V4.5 新增】ADR-2026-07-06-004（Projection 消费端必须对重复事件保持
+ * 幂等，第四轮外部审计 HIGH RISK 1 的正式记录）。
  *
  * 【V4.4 新增】ADR-2026-07-06-003（Per-User Soft Lock 取代全局 ScriptLock，
  * 第二轮外部审计 MEDIUM RISK 1 的正式记录）。
@@ -295,4 +298,87 @@
  *   - 单元测试层面这个改动几乎无法在 GAS 编辑器里做真正的并发验证（见
  *     09_IdempotencyManager.gs 的 testDifferentChatsDontBlock 函数头注释），
  *     真实并发表现需要用多个真实 Telegram 用户同时发消息验证。
+ */
+
+// ============================================================
+// ADR-2026-07-06-004：Projection 消费端必须对重复事件保持幂等
+// ============================================================
+
+/**
+ * ── Metadata ──────────────────────────────────────────────────────────────
+ *   ADR Number      : ADR-2026-07-06-004
+ *   Status          : Accepted
+ *   Decision Date   : 2026-07-06
+ *   Supersedes      : （无）
+ *   Superseded By   : （无，仍然生效）
+ *   Affected Modules: 10_ProjectionEngine.gs（当前落地：projectTaskCompleted_/
+ *                     projectTaskCancelled_）
+ *   Related ADR     : ADR-2026-07-06-003（Per-User Soft Lock——两条 ADR
+ *                     一起构成"生产者尽力去重 + 消费者天然幂等"这套双重
+ *                     防线，见 Context）
+ *   Consequences    : 见下方正文
+ *   Notes           : 本 ADR 是第四轮外部审计 HIGH RISK 1 的正式记录，
+ *                     同时把这次修复背后的判断提升为本 OS 所有未来
+ *                     Projection 消费函数都要遵守的通用规则，不只是
+ *                     这两个函数的一次性 bugfix。
+ *
+ * ── Context ──────────────────────────────────────────────────────────────
+ *
+ * 20_TaskEngine.completeTask/cancelTask（V4.4 起）在发布事件前会检查任务
+ * 当前状态，已经是终态就拦截——但这个检查本身没有加锁。真正并发场景下
+ * （两个 GAS 执行几乎同时处理同一个 taskId 的完成/取消请求），两次调用
+ * 都可能在对方写回 Sheet 之前读到同一份 PENDING 快照，双双通过检查，
+ * 各自发布一次 TASK_COMPLETED/TASK_CANCELLED。10_ProjectionEngine.gs 的
+ * projectTaskCompleted_/projectTaskCancelled_ 之前对每个到达的事件都无
+ * 条件执行 _bumpStatistics_ 增量扣减/累加，两个重复事件到达后，
+ * TaskStatistics 会被扣减/累加两次，产生漂移（pending_count 可能变成
+ * 负数）。
+ *
+ * 摆在面前有两种修复思路：(a) 在 completeTask/cancelTask 入口加一把
+ * per-taskId 锁，降低重复事件被发布的概率；(b) 让 Projection 消费端自己
+ * 对"同一个任务收到两次终态事件"这件事保持幂等，不管重复事件因为什么
+ * 原因产生、产生了几次，结果都正确。
+ *
+ * ── Decision ──────────────────────────────────────────────────────────────
+ *
+ * 选择 (b)，作为本 OS 的通用规则，而不是只给这两个函数打个补丁：
+ *
+ *   Projection 消费函数（10_ProjectionEngine.gs 里 dispatch() 分发到的
+ *   每一个 project*_ 函数）在对 TaskStatistics 这类增量计数器做
+ *   _bumpStatistics_ 之前，必须先判断"这次事件代表的状态变化，在事件
+ *   发生之前是不是已经生效过一次"——如果是，跳过增量更新这一步，只让
+ *   Tasks/ActiveTasks 这类"覆写为最终值"的操作照常执行（覆写同一个值/
+ *   删除已经不存在的行本身就是幂等的，不需要额外判断）。
+ *
+ * 理由：Events 是本 OS 唯一的事实来源（Architecture Principles 第1条
+ * Single Source of Truth），但"事实只会被写入一次"这个假设本身在分布式/
+ * 并发场景下没有办法被生产端 100% 保证——09_IdempotencyManager.gs 的
+ * Soft Lock（ADR-2026-07-06-003）已经明确写清楚了它是"尽力而为"而不是
+ * "绝对互斥"。既然生产端没法保证事件绝对不重复，消费端就必须自己扛住
+ * 重复——这是事件溯源架构里一条通用原则，不是本 OS 的临时补丁。
+ *
+ * 相应地，本次没有额外给 completeTask/cancelTask 加 per-taskId 锁——
+ * 加锁只能降低重复事件出现的概率，不能保证清零；而让消费端幂等，则是
+ * 不管重复事件发不发生、发生几次，结果都保证正确，是更强的保证。两者
+ * 不是互斥的（以后如果有其他理由需要加锁，比如别的原因导致的竞态，
+ * 仍然可以加），但作为这次的主要修复手段，消费端幂等收益更高、复杂度
+ * 更低，优先选它。
+ *
+ * ── Consequences ──────────────────────────────────────────────────────────
+ *
+ * 正面：
+ *   - 不管未来还会不会出现新的并发路径导致重复事件（不只是这次发现的
+ *     completeTask/cancelTask 双击场景），只要 Projection 消费函数遵守
+ *     这条规则，TaskStatistics 就不会因为重复事件而漂移
+ *   - 这条规则比"给每个可能有竞态的入口都加锁"更容易维护——以后新增
+ *     Engine Contract Standard（00_Project_Constitution.gs 零之三）里的
+ *     Projection 字段标 YES 的函数，写的时候就会想到要检查这一点
+ *
+ * 需要接受的代价：
+ *   - 每个 project*_ 函数需要多读一次"事件发生前的状态"（本来就在读，
+ *     比如 current 变量，多数情况下不需要额外的 Sheet I/O，只是多一个
+ *     判断），不是零成本，但成本很小
+ *   - 这条规则只覆盖"增量计数器"这一类操作；如果未来出现别的非幂等
+ *     副作用（比如"每次事件都发一条 Telegram 通知"），需要针对那类
+ *     副作用单独设计幂等策略，本 ADR 的结论不能不假思索地照搬过去
  */

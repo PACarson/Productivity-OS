@@ -1,6 +1,6 @@
 /**
  * 00_File_Map.gs
- * Productivity OS v4.4 — 文件地图
+ * Productivity OS v4.5 — 文件地图
  *
  * 本文件只放两类内容：文件职责 / 模块关系。
  * LAST_UPDATED: 2026-07-06 — V4.4：第二轮外部审计修复（3 HIGH + 1 MEDIUM
@@ -52,7 +52,11 @@
  *   event 新增 projection_ok 字段；(3) V4.4 起新增 getEventCount_() 和
  *   Events 表过大时的警告（HIGH RISK 3 修复）。差异仅限这三处，其余逻辑
  *   跟 Core 项目版本一致。
- * 03_Output.gs — 本地副本，逐字未改（本项目目前不直接调用，留着备用）。
+ * 03_Output.gs — 本地副本，逐字未改。【V4.5 修正】之前这里写"本项目目前
+ *   不直接调用"是不准确的——02_EventBus.gs 的
+ *   _alertAdminProjectionFailure_() 会在 Projection 写入失败时调用
+ *   Output.sendMessage() 给管理员发告警，这是本项目唯一的调用点，且只在
+ *   罕见的异常路径上触发（见 03_Output.gs 文件头 V4.5 核实说明）。
  * 06_TaskIntentParser.gs — 【V4 重写】parseTaskIntent / handleTaskIntent。
  *   V4 变更：
  *     1. 新增指令：/today /week /month /priority /overdue /upcoming
