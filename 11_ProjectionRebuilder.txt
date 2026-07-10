@@ -1,6 +1,16 @@
 /**
  * 11_ProjectionRebuilder.gs
- * Productivity OS v4.4 — Projection Rebuilder（从 Events 全量重建 Read Model）
+ * Productivity OS v4.6 — Projection Rebuilder（从 Events 全量重建 Read Model
+ * ／每日常规维护 TaskStatistics）
+ *
+ * 【V4.6 新增 recomputeStatisticsFromTasks_()】第五轮外部审计 HIGH RISK 1
+ * + HIGH RISK 4：TaskStatistics 不再由 10_ProjectionEngine.gs 同步增量
+ * 维护（那样既有并发下的 lost update 风险，又是为一张没有查询路径依赖的
+ * 表支付的纯浪费 I/O）。新增本函数，从 Tasks 表（不是 Events）按 chat_id
+ * 重新聚合，由 15_Setup.gs 的每日触发器调用，成本远低于本文件其余函数
+ * 那种"全量重放 Events"的方式。完整架构论证见 00_ADR.gs
+ * ADR-2026-07-06-005。rebuildStatisticsProjection()（从 Events 重放）
+ * 保留作为灾难恢复工具，两者的定位区别见各自的函数头注释。
  *
  * 【V4.4 配套修复 HIGH RISK 3：Events 全表扫描风险】rebuildAllProjections()
  * 开始前新增一行日志，用 EventBus.getEventCount_()（轻量，只读行数）报一下
@@ -194,13 +204,21 @@ function rebuildActiveTasksProjection() {
 }
 
 /**
- * 重建 TaskStatistics Read Model（V4新增）。
+ * 重建 TaskStatistics Read Model（从 Events 全量重放）。
  *
  * 跟 ActiveTasks 一样是"派生汇总视图"，先清空数据行再按 chat_id 分组重算，
  * 避免陈旧计数器残留（比如某个 chat_id 的任务全被删光了，旧的统计行还在）。
+ *
+ * 【V4.6 定位澄清】TaskStatistics 现在的常规维护方式是每日批量任务
+ * recomputeStatisticsFromTasks_()（见下方，从 Tasks 表算，成本低得多），
+ * 本函数（从 Events 全量重放算）保留作为"灾难恢复"工具——如果连 Tasks
+ * 表本身都怀疑损坏、需要从最原始的事实来源（Events）重建一切时用这个；
+ * 日常场景（比如每天的定时任务）应该用 recomputeStatisticsFromTasks_()，
+ * 不需要为了刷新一张汇总表就重放全部历史 Events。两者算出来的结果应该
+ * 一致（都是"当前 Tasks 状态的聚合"），只是数据来源和成本不同。
  */
 function rebuildStatisticsProjection() {
-  Logger.log('=== rebuildStatisticsProjection ===');
+  Logger.log('=== rebuildStatisticsProjection（从 Events 全量重放，灾难恢复用） ===');
 
   var sheet;
   try {
@@ -251,7 +269,80 @@ function rebuildStatisticsProjection() {
     count = result.updated + result.appended;
   }
 
-  Logger.log('✅ 重建 TaskStatistics 完成，共处理 ' + count + ' 个 chat_id');
+  Logger.log('✅ 重建 TaskStatistics 完成（Events重放），共处理 ' + count + ' 个 chat_id');
+  return count;
+}
+
+/**
+ * 【V4.6 新增】按 chat_id 分组，从 Tasks 表（不是 Events）重新聚合
+ * TaskStatistics 每一行。这是 TaskStatistics 现在的常规维护方式，供
+ * 15_Setup.gs 的每日触发器 triggerDailyStatisticsRecompute() 调用。
+ *
+ * 跟 rebuildStatisticsProjection()（从 Events 全量重放）的区别：本函数
+ * 假设 Tasks 表本身是可信的——Tasks 自己有独立的一致性保障
+ * （10_ProjectionEngine 同步维护 + rebuildTasksProjection() 兜底），只是
+ * 把 Tasks 表现有数据重新聚合一遍写回 TaskStatistics，不需要读那张只增
+ * 不减、随时间增长的 Events 表（见 02_EventBus.gs getAllEvents() 文件头
+ * 关于 Events 表规模的警告）。
+ *
+ * 完整架构论证见 00_ADR.gs ADR-2026-07-06-005。
+ *
+ * @returns {number} 处理的 chat_id 数量
+ */
+function recomputeStatisticsFromTasks_() {
+  Logger.log('=== recomputeStatisticsFromTasks_（从 Tasks 表聚合，每日常规维护用） ===');
+
+  var statsSheet;
+  try {
+    statsSheet = getSheet_('TaskStatistics');
+  } catch (e) {
+    Logger.log('⚠️ TaskStatistics Sheet 不存在，跳过（先跑 setupSheets() 建表）');
+    return 0;
+  }
+
+  var tasksSheet = getSheet_('Tasks');
+  var headerMap = getHeaderMap_(tasksSheet);
+  var lastRow = tasksSheet.getLastRow();
+
+  var byChat = {};
+  if (lastRow >= 2) {
+    var rows = tasksSheet.getRange(2, 1, lastRow - 1, tasksSheet.getLastColumn()).getValues();
+    rows.forEach(function (row) {
+      var chatId = row[headerMap['chat_id']];
+      if (!chatId) return;
+
+      if (!byChat[chatId]) {
+        byChat[chatId] = {
+          chat_id: chatId, total_count: 0, pending_count: 0, done_count: 0,
+          cancelled_count: 0, recurring_count: 0, reminder_count_total: 0,
+          last_updated_at: new Date().toISOString()
+        };
+      }
+
+      var status = String(row[headerMap['status']] || '').toUpperCase();
+      byChat[chatId].total_count++;
+      if (status === 'DONE') byChat[chatId].done_count++;
+      else if (status === 'CANCELLED') byChat[chatId].cancelled_count++;
+      else byChat[chatId].pending_count++;
+      if (row[headerMap['recurring']]) byChat[chatId].recurring_count++;
+      byChat[chatId].reminder_count_total += Number(row[headerMap['reminder_count']]) || 0;
+    });
+  }
+
+  var statsRows = Object.keys(byChat).map(function (k) { return byChat[k]; });
+
+  var statsLastRow = statsSheet.getLastRow();
+  if (statsLastRow >= 2) {
+    statsSheet.getRange(2, 1, statsLastRow - 1, statsSheet.getLastColumn()).clearContent();
+  }
+
+  var count = 0;
+  if (statsRows.length > 0) {
+    var result = batchUpsertRowsByKey_('TaskStatistics', 'chat_id', statsRows);
+    count = result.updated + result.appended;
+  }
+
+  Logger.log('✅ recomputeStatisticsFromTasks_ 完成，共处理 ' + count + ' 个 chat_id（数据源：Tasks 表，未触碰 Events）');
   return count;
 }
 
@@ -493,4 +584,14 @@ function compareProjectionWithEvents() {
  */
 function repairProjection() {
   rebuildAllProjections();
+}
+
+/**
+ * 【V4.6 新增】每日定时触发器入口，调用 recomputeStatisticsFromTasks_()。
+ * 挂载见 15_Setup.gs 的 createTriggers()。命名跟 13_ActiveTasksEngine.gs
+ * 的 triggerDailyArchive() 保持同一种"trigger 前缀 + 描述性名字"约定，
+ * 方便在 Apps Script 触发器管理界面里辨认。
+ */
+function triggerDailyStatisticsRecompute() {
+  recomputeStatisticsFromTasks_();
 }

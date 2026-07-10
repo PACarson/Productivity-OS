@@ -1,6 +1,11 @@
 /**
  * 12_TaskQueryEngine.gs
- * Productivity OS v4.3 — Task Query Engine（V4 改名+中心化）
+ * Productivity OS v4.6 — Task Query Engine（V4 改名+中心化）
+ *
+ * 【V4.6 修复 LOW RISK 1】getTask() 原来调 _readAllRows_ 做全表扫描，
+ * 改成"先读 task_id 单列定位行号、再读那一行"的两步查找，减少写事务
+ * 路径（completeTask/cancelTask/updateTask 的存在性校验）上的数据传输量，
+ * 完整说明见 getTask() 函数头注释。
  *
  * 【V4】原 12_QueryEngine.gs。规格书要求的"centralized query API"：
  * getTask / getTasks / getTodayTasks / getWeekTasks / getMonthTasks /
@@ -107,19 +112,56 @@ var TaskQueryEngine = (function () {
 
   /**
    * 按 task_id 查单个任务。
+   *
+   * 【V4.6 修复 LOW RISK 1：单任务点查询时的全表扫描性能瓶颈】原来直接调
+   * _readAllRows_ 把 Tasks 全表所有行、所有列都读进内存再线性找一遍——
+   * completeTask/cancelTask/updateTask 这些写事务路径每次都要先调
+   * getTask 校验任务存在，等于每次完成/取消/更新一个任务，都要搭配一次
+   * 全表扫描，随着 Tasks 数据量增长，这个点查询的成本会越来越不成比例。
+   * 修复：分两步，只读 task_id 那一列定位行号（一维扫描，只传输1列
+   * 数据，不是整张表），找到后再单独读那一行的全部字段——数据传输量从
+   * "行数×列数"降到"行数×1 + 1×列数"，随着列数变多这个差距会更明显。
+   *
    * @param {string} taskId
    * @param {string} [chatId]  传入时额外校验 chat_id 匹配（跨用户隔离）
    * @returns {object|null}
    */
   function getTask(taskId, chatId) {
-    var rows = _readAllRows_(TASKS_SHEET);
-    for (var i = 0; i < rows.length; i++) {
-      if (String(rows[i].task_id) === String(taskId)) {
-        if (chatId && String(rows[i].chat_id) !== String(chatId)) return null;
-        return rows[i];
+    try {
+      var sheet = getSheet_(TASKS_SHEET); // 05_SheetUtils.gs
+      var lastRow = sheet.getLastRow();
+      if (lastRow < 2) return null;
+
+      var headerMap = getHeaderMap_(sheet); // 05_SheetUtils.gs
+      var taskIdCol = headerMap['task_id'];
+      if (taskIdCol === undefined) {
+        Logger.log('[TaskQueryEngine] getTask: Tasks 表头缺少 task_id 列');
+        return null;
       }
+
+      // 第一步：只读 task_id 这一列，定位匹配行的位置
+      var idColumnValues = sheet.getRange(2, taskIdCol + 1, lastRow - 1, 1).getValues();
+      var matchedRowIndex = -1; // 相对于数据区（不含表头）的 0-based 索引
+      for (var i = 0; i < idColumnValues.length; i++) {
+        if (String(idColumnValues[i][0]) === String(taskId)) {
+          matchedRowIndex = i;
+          break;
+        }
+      }
+      if (matchedRowIndex === -1) return null;
+
+      // 第二步：只读这一行的全部字段
+      var numCols = sheet.getLastColumn();
+      var rowValues = sheet.getRange(matchedRowIndex + 2, 1, 1, numCols).getValues()[0];
+      var task = {};
+      for (var h in headerMap) task[h] = rowValues[headerMap[h]];
+
+      if (chatId && String(task.chat_id) !== String(chatId)) return null;
+      return task;
+    } catch (e) {
+      Logger.log('[TaskQueryEngine] getTask error (' + taskId + '): ' + e.message);
+      return null;
     }
-    return null;
   }
 
   /**

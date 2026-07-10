@@ -1,12 +1,17 @@
 /**
  * 00_File_Map.gs
- * Productivity OS v4.5 — 文件地图
+ * Productivity OS v4.6 — 文件地图
  *
  * 本文件只放两类内容：文件职责 / 模块关系。
- * LAST_UPDATED: 2026-07-06 — V4.4：第二轮外部审计修复（3 HIGH + 1 MEDIUM
+ * LAST_UPDATED: 2026-07-06 — V4.6：第五轮外部审计修复（TaskStatistics
+ * 从事件驱动实时投影降级为每日批量重算，见 00_ADR.gs ADR-2026-07-06-005；
+ * 另有 Events 表动态表头映射、getTask 单行查找、归档列数一致性等修复，
+ * 完整清单见 00_Project_State.gs）。01/02/03/05/13 五个"逐字未改"/共享
+ * 副本文件的描述已按实际改动更新。V4.5：第四轮外部审计修复（Gate 等待
+ * 时间、Projection 幂等、归档有界扫描、SecureConfig/Spreadsheet 缓存、
+ * SYSTEM_BUSY 错误细分）。V4.4：第三轮外部审计修复（3 HIGH + 1 MEDIUM
  * 在本项目范围内可修，1 HIGH + 1 MEDIUM 涉及的文件不在本项目——见
- * 00_Project_State.gs 完整清单和范围说明）。02_EventBus.gs / 09_TemporalParser.gs
- * 不再是"逐字未改"，本文件对应描述已更新。V4.3（第二部分，代码落地）：
+ * 00_Project_State.gs 完整清单和范围说明）。V4.3（第二部分，代码落地）：
  *   1. 新增「三、Architecture Layer Map」，把全部 21 个可执行文件归类到
  *      Presentation/Application/Domain/Infrastructure 四层中的唯一一层，
  *      对应 00_Project_Constitution.gs「零之四、Dependency Rules」。
@@ -70,24 +75,35 @@
  * 09_IdempotencyManager.gs — 【V4 微调】createTaskIfNotExists 内部调用改成
  *   TaskEngine.createTaskDirect_(...)（原来是裸全局 _createTaskDirect_，
  *   见 00_Project_State.gs "已知Bug"第1条修复）。
- * 10_ProjectionEngine.gs — 【V4 扩展】dispatch 新增 TASK_UPDATED case；
- *   新增对 TaskStatistics（计数器增量维护）和 TaskFilters（搜索用扁平表
- *   逐行 upsert）两张 Projection 表的同步维护。
- * 11_ProjectionRebuilder.gs — 【V4 修复+扩展】
+ * 10_ProjectionEngine.gs — 【V4 扩展，V4.6 移除 TaskStatistics 维护】
+ *   dispatch 新增 TASK_UPDATED case；新增对 TaskFilters（搜索用扁平表
+ *   逐行 upsert）表的同步维护。V4.6 起不再对 TaskStatistics 做同步增量
+ *   维护——原来的 _bumpStatistics_ 已删除，见 00_ADR.gs
+ *   ADR-2026-07-06-005。
+ * 11_ProjectionRebuilder.gs — 【V4 修复+扩展，V4.6 新增每日常规维护】
  *     1. 删除 rebuildInventoryProjection() / _markRemovedItemsConsumed_()
  *        （本次审计新发现的 bug，见 00_Project_State.gs）。
  *     2. 新增 rebuildStatisticsProjection() / rebuildTaskFiltersProjection()，
  *        rebuildAllProjections() 改成依次调用 Tasks→ActiveTasks→
- *        Statistics→TaskFilters 四个重建函数。
+ *        Statistics→TaskFilters 四个重建函数（rebuildStatisticsProjection
+ *        是从 Events 全量重放，V4.6 起定位为"灾难恢复"专用）。
+ *     3. 【V4.6新增】recomputeStatisticsFromTasks_()：从 Tasks 表（不是
+ *        Events）按 chat_id 聚合重算 TaskStatistics，是这张表现在的
+ *        常规维护方式，由 triggerDailyStatisticsRecompute()（15_Setup.gs
+ *        每日触发器调用）触发。
  * 12_TaskQueryEngine.gs — 【V4 改名+中心化】原 12_QueryEngine.gs。
  *   规格书要求的"centralized query API"：getTask / getTasks /
  *   getTodayTasks / getWeekTasks / getMonthTasks / getOverdueTasks /
  *   getUpcomingTasks / getRecurringTasks / getPriorityTasks / searchTasks /
- *   getDashboard / getStatistics。
- *   本项目唯一允许直接读 Tasks/ActiveTasks/TaskStatistics/TaskFilters 这几张
+ *   getDashboard / getStatistics。V4.6 起 getTask() 改成先定位行号、再
+ *   读单行，不再全表扫描（LOW RISK 1 修复）。
+ *   本项目唯一允许直接读 Tasks/ActiveTasks/TaskFilters 这几张
  *   Sheet 的模块（00_Project_Constitution.gs P6 铁律5）；每次查询只批量读
  *   一次 Sheet，读出来的任务数组转交给 View/Priority/Search/Dashboard/
  *   Analytics 五个纯函数 Engine 做内存运算，自己不重复实现过滤逻辑。
+ *   TaskStatistics 不在这个"允许直接读"的列表里——目前没有任何查询路径
+ *   读取它，它只被 11_ProjectionRebuilder.gs 的两个函数写入，见
+ *   00_ADR.gs ADR-2026-07-06-005。
  * 20_TaskEngine.gs — 【V4 改名+IIFE封装】原 20_ProductivityModule.gs。
  *   createTask / updateTask（V4新增） / completeTask / cancelTask /
  *   createTaskDirect_（原_createTaskDirect_，改为 IIFE 内部方法，只允许
@@ -122,21 +138,30 @@
  *   + AnalyticsEngine 的输出成最终展示文案。不额外落盘、不重放 Events、
  *   不知道"Telegram"是什么（完整论证见 00_ADR.gs ADR-2026-07-06）。
  * 26_AnalyticsEngine.gs — 【V4 新增】completionRate/overdueRate/
- *   reminderStatistics/recurringStatistics/workload，默认只读 Read Model
- *   （TaskStatistics + Tasks）。唯一允许重放 Events 的例外：
+ *   reminderStatistics/recurringStatistics/workload，computeStatistics()
+ *   只读调用方传入的 task 数组（源头是 Tasks Read Model），从不直接触碰
+ *   TaskStatistics 这张表——TaskStatistics 是独立维护的缓存，不是本
+ *   Engine 的数据来源（V4.6 起两者的关系更明确了，见
+ *   00_ADR.gs ADR-2026-07-06-005）。唯一允许重放 Events 的例外：
  *   replayCompletionTrend_()（历史趋势，Read Model 当前状态天然不包含时间
  *   序列，见 00_Project_Constitution.gs P6 铁律4），此函数明确标注仅供
  *   debug/深度分析场景手动调用，不在任何 Telegram 指令路径上。
  *
  * ── Testing/Setup ───────────────────────────────────────────────────────
  *
- * 15_Setup.gs — 【V4 扩展】setupSheets 新增建 TaskStatistics/TaskFilters
- *   两张表；Tasks/ActiveTasks/ArchiveTasks 表头新增 description/tags 两列
- *   （向后兼容追加列）；createTriggers/repairSheetHeaders/runDiagnostics
- *   同步更新。13_ActiveTasksEngine.gs（Archive Engine）触发器不变。
- * 13_ActiveTasksEngine.gs — 逐字未改（Blueprint 术语里对应 Archive Engine：
- *   archive=runDailyArchive / restore=（暂无，见下方"下一步"）/
- *   retention=DEFAULT_ARCHIVE_DAYS）。文件名保留 v3 命名，避免无意义的
+ * 15_Setup.gs — 【V4 扩展，V4.6 新增触发器】setupSheets 新增建
+ *   TaskStatistics/TaskFilters 两张表；Tasks/ActiveTasks/ArchiveTasks
+ *   表头新增 description/tags 两列（向后兼容追加列）；
+ *   createTriggers/repairSheetHeaders/runDiagnostics 同步更新。
+ *   createTriggers() 现在挂两个每日触发器：triggerDailyArchive（凌晨2点，
+ *   13_ActiveTasksEngine.gs）和 triggerDailyStatisticsRecompute（凌晨3点，
+ *   V4.6新增，11_ProjectionRebuilder.gs）。
+ * 13_ActiveTasksEngine.gs — 【不再是"逐字未改"】Blueprint 术语里对应
+ *   Archive Engine：archive=runDailyArchive / restore=（暂无，见下方
+ *   "下一步"）/ retention=DEFAULT_ARCHIVE_DAYS。V4.4 起新增归档前的
+ *   ArchiveTasks 排重校验（防重复归档）、V4.5 把排重校验改成有界扫描
+ *   （只读最近 2000 行）、V4.6 修复列数计算的一致性问题（缓存
+ *   archiveColumnCount，加边界防护）。文件名保留 v3 命名，避免无意义的
  *   改名 churn——Blueprint 分类见 00_Project_Constitution.gs P4 第2层
  *   已经把它标注为 Archive Engine 的实现。
  */
@@ -216,8 +241,12 @@
  *    的任何代码
  * 2. Events 表（共享）里 TASK_ 开头和 REMINDER_SENT 类型的事件只有本项目的
  *    02_EventBus.publish() 能写
- * 3. Tasks/ActiveTasks/TaskStatistics/TaskFilters（Read Model）只有本项目的
+ * 3. Tasks/ActiveTasks/TaskFilters（Read Model）只有本项目的
  *    10_ProjectionEngine 能写（materializeTaskRow_ 是安全兜底，属例外）；
+ *    TaskStatistics 只有 11_ProjectionRebuilder 的
+ *    recomputeStatisticsFromTasks_()（每日批量）和
+ *    rebuildStatisticsProjection()（灾难恢复）能写，V4.6 起
+ *    10_ProjectionEngine 不再写它（见 00_ADR.gs ADR-2026-07-06-005）；
  *    ArchiveTasks 只有 13_ActiveTasksEngine.runDailyArchive() 能写
  * 4. 所有查询必须经过 12_TaskQueryEngine，禁止直接 derive Events，
  *    禁止 View/Priority/Search/Dashboard/Analytics 五个纯函数 Engine

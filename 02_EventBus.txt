@@ -1,6 +1,17 @@
 /**
  * 02_EventBus.gs
- * Productivity OS v4.5 — 事件总线（Events 表唯一写入口，本项目内）
+ * Productivity OS v4.6 — 事件总线（Events 表唯一写入口，本项目内）
+ *
+ * 【V4.6 修复 MEDIUM RISK 2：Events 表硬编码列索引的脆弱性】原来
+ * publish()/getAllEvents() 都用 r[0]..r[5] 固定位置读写——跟 Tasks/
+ * ActiveTasks 一直用的 getHeaderMap_ 动态表头映射方案不一致。如果 Events
+ * 表的列被手动调整过顺序，固定位置读写会直接错位、payload 解析失败退化
+ * 成 {}，且没有任何报错提示。修复：改用 _headerMap_()（内部按名字动态
+ * 定位列，执行期内缓存一份，避免每次 publish 都重新读表头），跟
+ * Tasks/ActiveTasks 用同一套方案。⚠️ 这跟本项目"逐字未改"的 Core 共享
+ * 副本状态有关的说明见下方，本次改动只影响 Productivity OS 自己这份
+ * 副本，不影响 Core 项目的独立副本（Core 那边如果也有同样的硬编码写法，
+ * 需要在 Core 项目里单独处理，本项目没有那个文件）。
  *
  * ⚠️ 2026-07-03 拆分说明：这是 Personal AI Core 的 02_EventBus.gs 的本地副本，
  * 唯一改动是 _sheet_()——Core 是 container-bound 脚本，用
@@ -8,6 +19,12 @@
  * 是独立（standalone）脚本，没有"容器"，必须用 SpreadsheetApp.openById()
  * 显式指定 Spreadsheet ID（跟 Core 用同一个共享 Spreadsheet，Script
  * Properties 里的 SPREADSHEET_ID 要设成跟 Core 一样的值）。
+ * 【V4.5/V4.6 起这句"唯一改动"已经不准确】除了 _sheet_() 的
+ * openById/getActiveSpreadsheet 差异外，本文件还独立新增了
+ * projection_ok 字段（V4.2）、Spreadsheet 对象缓存（V4.5）、Events 表
+ * 行数警告 + getEventCount_()（V4.5）、动态表头映射（V4.6）——这些都是
+ * 本项目基于自己的审计发现单独演进出来的改动，Core 项目的副本是否也有
+ * 同样的问题/修复，需要在那边单独核实，本文件不能替 Core 项目下结论。
  *
  * 为什么 Task 事件不通过 Core 的 EventBus，而是自己另开一份：
  * P1（EventBus 是 Events 表唯一写入者）指的是"同一类事件只有一条定义清晰
@@ -92,6 +109,33 @@ var EventBus = (function () {
     return sheet;
   }
 
+  /**
+   * 【V4.6 新增，修复 MEDIUM RISK 2：Events 表硬编码列索引的脆弱性】
+   * 原来 publish()/getAllEvents() 都是按 r[0]..r[5] 固定位置读写 Events
+   * 表——跟 Tasks/ActiveTasks 一直采用的"按表头名字动态找列"
+   * （05_SheetUtils.getHeaderMap_）方案不一致。如果有人在运维时手动在
+   * Events 表里插入/调整了列的位置，固定位置的读写会直接错位，JSON
+   * payload 解析失败退化成 {}，且不会有任何报错提示，容易大面积损坏
+   * 历史数据的可读性（虽然 Events 本身不可变，但"读出来的解释"会是错的）。
+   * 修复：跟 Tasks/ActiveTasks 用同一套 getHeaderMap_ 动态映射方案，
+   * 按列名找位置，不依赖固定顺序。表头本身在一次执行期间不会变化（跟
+   * _cachedSpreadsheet_ 同样的道理），缓存一份，避免每次 publish/读取都
+   * 重新查一遍表头行。
+   */
+  var _cachedHeaderMap_ = null;
+
+  function _headerMap_() {
+    if (!_cachedHeaderMap_) {
+      _cachedHeaderMap_ = getHeaderMap_(_sheet_()); // 05_SheetUtils.gs
+      var missing = COLS.filter(function (c) { return !_cachedHeaderMap_.hasOwnProperty(c); });
+      if (missing.length > 0) {
+        Logger.log('[EventBus] ⚠️ Events 表头缺少预期列: ' + JSON.stringify(missing) +
+          '——这些字段的读写会被跳过，建议跑 15_Setup.repairSheetHeaders() 检查表头。');
+      }
+    }
+    return _cachedHeaderMap_;
+  }
+
   function _generateEventId_() {
     return 'EVT-' + new Date().getTime() + '-' + Math.floor(Math.random() * 1000);
   }
@@ -127,14 +171,26 @@ var EventBus = (function () {
       source: source || ''
     };
 
-    _sheet_().appendRow([
-      event.event_id,
-      event.timestamp,
-      event.type,
-      event.chat_id,
-      JSON.stringify(event.payload),
-      event.source
-    ]);
+    // 【V4.6 修复 MEDIUM RISK 2】按表头名字动态定位列，不再假设固定顺序。
+    var sheet = _sheet_();
+    var headerMap = _headerMap_();
+    var numCols = Math.max(sheet.getLastColumn(), COLS.length);
+    var row = new Array(numCols).fill('');
+    var fieldValues = {
+      event_id:  event.event_id,
+      timestamp: event.timestamp,
+      type:      event.type,
+      chat_id:   event.chat_id,
+      payload:   JSON.stringify(event.payload),
+      source:    event.source
+    };
+    COLS.forEach(function (col) {
+      if (headerMap.hasOwnProperty(col)) {
+        row[headerMap[col]] = fieldValues[col];
+      }
+      // 缺列的情况已经在 _headerMap_() 里打过一次性警告，这里不重复打印
+    });
+    sheet.appendRow(row);
 
     _cachedEvents = null; // 写入新事件，缓存失效
 
@@ -243,21 +299,33 @@ var EventBus = (function () {
         '在正常路径上意外触发了全表扫描，需要排查。');
     }
 
-    var rows = sheet.getRange(2, 1, lastRow - 1, COLS.length).getValues();
+    // 【V4.6 修复 MEDIUM RISK 2】按表头名字动态定位列，不再假设 r[0]..r[5]
+    // 固定顺序，见 _headerMap_() 的完整说明。找不到的字段用空字符串兜底，
+    // 不会因为某一列缺失就让整行解析失败。
+    var headerMap = _headerMap_();
+    var idIdx      = headerMap['event_id'];
+    var tsIdx       = headerMap['timestamp'];
+    var typeIdx      = headerMap['type'];
+    var chatIdx       = headerMap['chat_id'];
+    var payloadIdx     = headerMap['payload'];
+    var sourceIdx        = headerMap['source'];
+
+    var rows = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
     _cachedEvents = rows.map(function (r) {
       var payload = {};
       try {
-        payload = r[4] ? JSON.parse(r[4]) : {};
+        var rawPayload = (payloadIdx !== undefined) ? r[payloadIdx] : '';
+        payload = rawPayload ? JSON.parse(rawPayload) : {};
       } catch (e) {
         payload = {};
       }
       return {
-        event_id:  r[0],
-        timestamp: r[1],
-        type:      r[2],
-        chat_id:   r[3],
+        event_id:  (idIdx     !== undefined) ? r[idIdx]     : '',
+        timestamp: (tsIdx     !== undefined) ? r[tsIdx]     : '',
+        type:      (typeIdx   !== undefined) ? r[typeIdx]   : '',
+        chat_id:   (chatIdx   !== undefined) ? r[chatIdx]   : '',
         payload:   payload,
-        source:    r[5]
+        source:    (sourceIdx !== undefined) ? r[sourceIdx] : ''
       };
     });
     return _cachedEvents;

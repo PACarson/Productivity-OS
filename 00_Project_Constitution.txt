@@ -1,6 +1,6 @@
 /**
  * 00_Project_Constitution.gs
- * Productivity OS v4.3 — 项目宪法
+ * Productivity OS v4.6 — 项目宪法
  *
  * 本文件只放这个 OS 自己的东西。平台级原则（IMIOR、UDP、Engine 命名规范等）
  * 的权威定义在 Personal AI Core 项目的 00_Project_Constitution.gs，这里只做
@@ -9,8 +9,14 @@
  * 新窗口交接时，先贴这份文件 + Core 项目的 00_Project_Constitution.gs +
  * 00_ADR.gs + 00_Roadmap.gs。
  *
- * LAST_UPDATED: 2026-07-06 — V4.3：Architecture / Governance Upgrade（纯文档
- * 升级，不改任何业务逻辑/API/Schema/Event/Query/Projection，见 00_Roadmap.gs
+ * LAST_UPDATED: 2026-07-06 — V4.6：第五轮外部审计 HIGH RISK 1+4（TaskStatistics
+ * 并发漂移 + 冗余高频写入，两条一起解决）——TaskStatistics 从"事件驱动实时
+ * 投影"降级为"每日批量重算"，10_ProjectionEngine.gs 移除 _bumpStatistics_，
+ * 完整架构论证见 00_ADR.gs ADR-2026-07-06-005。相应更新了 P6 CQRS 铁律2/4/5、
+ * Event Definition Standard 的 Projection Updated 字段、P4 4.5 Operations、
+ * Architecture Principles 第1条。
+ *
+ * V4.3：Architecture / Governance Upgrade（纯文档升级，见 00_Roadmap.gs
  * "Architecture Evolution"）：
  *   1. 新增 Architecture Principles（本 OS 最高设计哲学，10 条）。
  *   2. 新增 Engine Contract Standard（以后所有新 Engine 必须遵守的文件头标准）。
@@ -45,6 +51,12 @@
  *      11_ProjectionRebuilder.gs 的 rebuildAllProjections() 从零重建，
  *      重建结果理论上应该跟增量维护的结果完全一致（这也是
  *      verifyProjection()/compareProjectionWithEvents() 存在的意义）。
+ *      TaskStatistics 是唯一的例外情况：它有两条重建路径——
+ *      rebuildStatisticsProjection()（从 Events 全量重放，走的是
+ *      rebuildAllProjections() 那条路，保证"从最原始事实来源也能重建"
+ *      这条原则不被打破）和 recomputeStatisticsFromTasks_()（从 Tasks
+ *      表聚合，更便宜，V4.6 起作为日常维护手段，见
+ *      00_ADR.gs ADR-2026-07-06-005）。
  *
  * ── 2. Pure Function First ───────────────────────────────────────────────
  * WHY：带副作用（读写 Sheet/Events/网络）的代码难测试、难复用、难推理；
@@ -232,13 +244,25 @@
  *   ArchiveTasks（冷归档库，只增不删）
  *
  *   同一条 Events 流也并行驱动：
- *   Events → TaskStatistics（计数器增量，10_ProjectionEngine._bumpStatistics_）
  *   Events → TaskFilters（搜索用扁平投影，10_ProjectionEngine._upsertTaskFilters_）
  *
- *   铁律：Events 只能追加；Tasks/ActiveTasks/TaskStatistics/TaskFilters 只能
- *   被 Projection（增量）或 ProjectionRebuilder（全量重建，仅限迁移/修复）
- *   写入；ArchiveTasks 只能被 Archive Engine 写入。任何查询路径都不允许
- *   反过来读 Events 重放当查询用（唯一例外见流程B下方"例外"）。
+ *   TaskStatistics 不在上面这条"Events 驱动"的链路里（V4.6 起）——它由
+ *   Tasks 表每天批量重新聚合一次（11_ProjectionRebuilder.
+ *   recomputeStatisticsFromTasks_，15_Setup.gs 的每日触发器），完整架构
+ *   论证见 00_ADR.gs ADR-2026-07-06-005。这是本 OS 里唯一一张"降级为
+ *   低频批量维护而不是事件驱动实时投影"的 Read Model 表，之所以特别
+ *   拎出来说明，是因为它打破了"Read Model 都是 Events 增量驱动"这个
+ *   看起来理所当然的印象——保留这张表是因为已经证实的事情是"同步维护
+ *   它没有任何查询路径依赖、还有并发漂移风险"，不是"这张表本身没用"，
+ *   所以选择保留表结构、只降级维护频率，而不是删除整张表。
+ *
+ *   铁律：Events 只能追加；Tasks/ActiveTasks/TaskFilters 只能被 Projection
+ *   （增量）或 ProjectionRebuilder（全量重建，仅限迁移/修复）写入；
+ *   TaskStatistics 只能被 11_ProjectionRebuilder.recomputeStatisticsFromTasks_()
+ *   （每日批量）或 rebuildStatisticsProjection()（灾难恢复，从 Events
+ *   全量重放）写入；ArchiveTasks 只能被 Archive Engine 写入。任何查询
+ *   路径都不允许反过来读 Events 重放当查询用（唯一例外见流程B下方
+ *   "例外"）。
  *
  * 流程 B：Runtime Domain Pattern（一次 Telegram 请求的生命周期）
  *
@@ -454,7 +478,11 @@
  *   Destination Projection — 哪个 Projection 函数负责消费它
  *
  * 本 OS 现有 5 个事件类型，按此标准补全文档（一次性补全存量，以后新增
- * 事件类型必须照此格式补充）：
+ * 事件类型必须照此格式补充）。V4.6 起 TaskStatistics 不再由任何单个
+ * Event 同步驱动（见 00_ADR.gs ADR-2026-07-06-005），所以下面每条的
+ * Projection Updated 都不再列 TaskStatistics——它现在由
+ * 11_ProjectionRebuilder.recomputeStatisticsFromTasks_() 每日批量重算，
+ * 不属于任何单个事件的投影范围：
  *
  * ── TASK_CREATED ──────────────────────────────────────────────────────────
  *   Purpose         : 一个新任务被创建
@@ -464,8 +492,7 @@
  *                     reminder_count/archived）
  *   Required Fields : task_id, title, chat_id
  *   Projection Updated: Tasks（新增行）, ActiveTasks（新增行）,
- *                     TaskFilters（新增行）, TaskStatistics（total/pending
- *                     +1，recurring 非空则 recurring_count +1）
+ *                     TaskFilters（新增行）
  *   Example         : { task_id:"TSK-20260706-A1B2C3", title:"交房租",
  *                     category:"ADMIN", status:"PENDING",
  *                     due_date:"2026-07-10", priority:"HIGH", chat_id:"123" }
@@ -483,9 +510,7 @@
  *                     修复）}
  *   Required Fields : task_id
  *   Projection Updated: Tasks（覆写变更字段）, ActiveTasks（若任务当前
- *                     非终态）, TaskFilters（重新拼 searchable_text）,
- *                     TaskStatistics（仅当 recurring 或 chat_id 变化时调整，
- *                     见 V4.2 MEDIUM RISK 2 修复）
+ *                     非终态）, TaskFilters（重新拼 searchable_text）
  *   Example         : { task_id:"TSK-20260706-A1B2C3", priority:"CRITICAL" }
  *   Version         : V4（20_TaskEngine.updateTask 新增），V4.2 起可能带
  *                     identity 字段
@@ -498,20 +523,19 @@
  *   Payload         : { task_id }
  *   Required Fields : task_id
  *   Projection Updated: Tasks（status=DONE, completed_at=事件时间戳）,
- *                     ActiveTasks（删除对应行）, TaskStatistics
- *                     （pending -1, done +1）
+ *                     ActiveTasks（删除对应行）
  *   Example         : { task_id:"TSK-20260706-A1B2C3" }
  *   Version         : V3
  *   Source Module   : 20_TaskEngine.completeTask（V4.2 起先校验任务存在，
- *                     见 MEDIUM RISK 1 修复）
+ *                     V4.4/V4.5 起先校验非终态，见 MEDIUM RISK 1/
+ *                     ADR-2026-07-06-004 修复）
  *   Destination Projection: 10_ProjectionEngine.projectTaskCompleted_
  *
  * ── TASK_CANCELLED ────────────────────────────────────────────────────────
  *   Purpose         : 一个任务被取消
  *   Payload         : { task_id }
  *   Required Fields : task_id
- *   Projection Updated: Tasks（status=CANCELLED）, ActiveTasks（删除对应行）,
- *                     TaskStatistics（pending -1, cancelled +1）
+ *   Projection Updated: Tasks（status=CANCELLED）, ActiveTasks（删除对应行）
  *   Example         : { task_id:"TSK-20260706-A1B2C3" }
  *   Version         : V3
  *   Source Module   : 20_TaskEngine.cancelTask（V4.2 起先校验任务存在）
@@ -521,8 +545,7 @@
  *   Purpose         : 针对某个任务发送了一次提醒
  *   Payload         : { task_id, sent_at? }
  *   Required Fields : task_id
- *   Projection Updated: Tasks（reminder_count +1）, TaskStatistics
- *                     （reminder_count_total +1）
+ *   Projection Updated: Tasks（reminder_count +1）
  *   Example         : { task_id:"TSK-20260706-A1B2C3", sent_at:"2026-07-06T09:00:00Z" }
  *   Version         : V3
  *   Source Module   : Reminder OS（跨项目发布，本项目只负责消费/投影，见
@@ -612,9 +635,12 @@
  *      Project Constitution / Project State / File Map
  *        → 这三份文件（00_ 开头）。
  *      ADR (Optional)
- *        → 00_ADR.gs（V4.1 起本项目开始正式收录 ADR：ADR-2026-07-06
- *          Dashboard 架构决策，V4.3 新增 ADR-2026-07-06-002 Schema
- *          Authority，见下方 P7 简述 + 00_ADR.gs 完整版）。
+ *        → 00_ADR.gs（V4.1 起本项目开始正式收录 ADR，目前共 5 条：
+ *          ADR-2026-07-06 Dashboard 架构决策、ADR-2026-07-06-002 Schema
+ *          Authority、ADR-2026-07-06-003 Per-User Soft Lock、
+ *          ADR-2026-07-06-004 Projection 消费端幂等、ADR-2026-07-06-005
+ *          TaskStatistics 降级为每日批量重算，见下方 P7 简述 +
+ *          00_ADR.gs 完整版）。
  *
  *   1. Foundation
  *      Configuration        → 01_SecureConfig.gs（敏感配置）+
@@ -712,7 +738,12 @@
  *                              rebuildActiveTasksProjection()/
  *                              rebuildStatisticsProjection()/
  *                              rebuildTaskFiltersProjection()/
- *                              rebuildAllProjections()
+ *                              rebuildAllProjections()（以上均为人工手动
+ *                              触发）；V4.6 新增
+ *                              recomputeStatisticsFromTasks_()（每日自动，
+ *                              由 15_Setup.gs 的 triggerDailyStatisticsRecompute
+ *                              触发器调用，是 TaskStatistics 现在的常规
+ *                              维护方式，见 00_ADR.gs ADR-2026-07-06-005）
  *      Recovery                     → 11_ProjectionRebuilder.gs 的
  *                              repairProjection()（rebuildAllProjections
  *                              的别名）
@@ -737,10 +768,15 @@
  *
  * P6. CQRS 铁律（V4 新增，本次架构升级的核心）
  *       1. Events 是唯一的 Write Model，只能追加，不能重放着当查询用。
- *       2. Tasks / ActiveTasks / ArchiveTasks / TaskStatistics / TaskFilters
- *          都是 Read Model（Projection），只能被 10_ProjectionEngine.gs（增量）
- *          和 11_ProjectionRebuilder.gs（全量重建，仅限迁移/修复场景手动运行）
- *          写入。
+ *       2. Tasks / ActiveTasks / ArchiveTasks / TaskFilters 都是 Read Model
+ *          （Projection），只能被 10_ProjectionEngine.gs（增量）和
+ *          11_ProjectionRebuilder.gs（全量重建，仅限迁移/修复场景手动
+ *          运行）写入。TaskStatistics 是例外——V4.6 起它不再由
+ *          10_ProjectionEngine.gs 同步维护，只能被
+ *          11_ProjectionRebuilder.recomputeStatisticsFromTasks_()（每日
+ *          批量，从 Tasks 表算）或 rebuildStatisticsProjection()（灾难
+ *          恢复，从 Events 全量重放）写入，完整原因见
+ *          00_ADR.gs ADR-2026-07-06-005。
  *       3. 任何 Telegram 指令（经由 06_TaskIntentParser.gs）禁止直接调用
  *          EventBus.getAllEvents() / deriveTaskState_()，一律经过
  *          12_TaskQueryEngine.gs 读 Read Model。
@@ -748,13 +784,17 @@
  *          「历史趋势」的函数（如 replayCompletionTrend_()）——因为「过去N周
  *          每周完成几个」这种时间序列数据，Read Model 的当前状态快照结构性
  *          地不包含，只有 Events 的时间轴才有。除此之外 AnalyticsEngine 的
- *          日常统计（completionRate/overdueRate等当前值）一样只读
- *          TaskStatistics/Tasks Read Model，不重放 Events。
+ *          日常统计（completionRate/overdueRate等当前值，即
+ *          computeStatistics()）只读调用方传入的 task 数组（来自 Tasks
+ *          Read Model），从不直接触碰 TaskStatistics 这张表本身——
+ *          TaskStatistics 是给"需要低成本快照读取"的场景预留的缓存，
+ *          不是 AnalyticsEngine 的数据来源。
  *       5. 12_TaskQueryEngine.gs 是唯一允许直接读 Tasks/ActiveTasks/
- *          TaskStatistics/TaskFilters 这几张 Sheet 的模块。View/Priority/
- *          Search/Dashboard/Analytics 五个 Engine 都是纯函数：接收
- *          TaskQueryEngine 已经读出来的任务数组做内存运算，自己不摸 Sheet、
- *          不摸 Events。
+ *          TaskFilters 这几张 Sheet 的模块（TaskStatistics 目前没有任何
+ *          查询路径读取，见 P6 铁律2 和 00_ADR.gs ADR-2026-07-06-005）。
+ *          View/Priority/Search/Dashboard/Analytics 五个 Engine 都是纯
+ *          函数：接收 TaskQueryEngine 已经读出来的任务数组做内存运算，
+ *          自己不摸 Sheet、不摸 Events。
  *
  * P7. Dashboard 不额外落盘（正式架构决策，完整版见 00_ADR.gs ADR-2026-07-06）
  *       简述：Dashboard（Today/Weekly/Monthly/Statistics）依赖"查询发生的

@@ -1,15 +1,22 @@
 /**
  * 00_Project_State.gs
- * Productivity OS v4.5 — 项目状态快照
+ * Productivity OS v4.6 — 项目状态快照
  *
  * ⚠️ 快照，不是日志。每次更新覆盖旧状态。
- * LAST_UPDATED: 2026-07-06 — V4.5：修复第四轮外部审计发现的全部问题
- * （3 HIGH + 2 MEDIUM + 2 LOW，本轮全部落在本项目范围内，没有跨项目
- * 遗留项）。V4.4：修复第三轮外部审计里落在本项目范围内的问题（另有
- * 04_Main.gs/80_RiderConnector.gs 相关的跨项目遗留项，见"三、已知Bug"）。
- * V4.3.1：修复 setupSheets() 忽略 Events 表的 bug。V4.3：Architecture /
- * Governance Upgrade + Engine Contract Standard 落地。V4.2：修复第二轮
- * 外部审计发现的 3 HIGH + 3 MEDIUM + 1 LOW（完整清单见"三、已知Bug"）。
+ * LAST_UPDATED: 2026-07-06 — V4.6：第五轮外部审计，逐条核实后处理——
+ * 4 项确认修复（2 HIGH + 1 MEDIUM + 1 LOW，其中 HIGH1+HIGH4 是同一个
+ * 架构决策解决的两个侧面：TaskStatistics 降级为每日批量重算，见
+ * 00_ADR.gs ADR-2026-07-06-005）+ 1 项确认修复但判断"部分采纳"（MEDIUM1，
+ * 具体触发场景不成立但加固有益）+ 2 项核实后确认不成立（HIGH2/HIGH3，
+ * 基于对 GAS 执行模型的错误假设，有网络证据支持）+ 1 项已在前几轮评估过
+ * 维持不变（MEDIUM3）+ 1 项需要产品判断，未擅自决定（LOW2）。完整分析见
+ * "三、已知Bug"。V4.5：修复第四轮外部审计发现的全部问题（3 HIGH + 2
+ * MEDIUM + 2 LOW，本轮全部落在本项目范围内，没有跨项目遗留项）。V4.4：
+ * 修复第三轮外部审计里落在本项目范围内的问题（另有 04_Main.gs/
+ * 80_RiderConnector.gs 相关的跨项目遗留项）。V4.3.1：修复 setupSheets()
+ * 忽略 Events 表的 bug。V4.3：Architecture / Governance Upgrade。V4.2：
+ * 修复第二轮外部审计发现的 3 HIGH + 3 MEDIUM + 1 LOW（完整清单见
+ * "三、已知Bug"）。
  */
 
 // ============================================================
@@ -17,7 +24,70 @@
 // ============================================================
 
 /**
- * - 2026-07-06（V4.5，本次）：修复第四轮外部审计发现的全部问题：
+ * - 2026-07-06（V4.6，本次）：第五轮外部审计，逐条核实（"再三检查是否
+ *   需要修复"）后处理，不是照单全收：
+ *
+ *   【确认修复，HIGH1+HIGH4 一并解决】TaskStatistics 并发漂移
+ *   （_bumpStatistics_ 非原子读改写，同一 chatId 两个并发请求会 lost
+ *   update）+ TaskStatistics 冗余高频写入（getStatistics() 早就完全绕过
+ *   这张表，见 12_TaskQueryEngine.gs 注释）——这是同一件事的两个侧面：
+ *   一条被证实没人依赖、纯属浪费的同步写入路径，同时还不是线程安全的。
+ *   给它加锁只会让"浪费"更严重，所以没有加锁，而是把 TaskStatistics
+ *   降级为每日批量重算（10_ProjectionEngine.gs 删除 _bumpStatistics_ /
+ *   _adjustStatisticsForUpdate_；11_ProjectionRebuilder.gs 新增
+ *   recomputeStatisticsFromTasks_()，从 Tasks 表算，比重放 Events 便宜；
+ *   15_Setup.gs 新增每日触发器）。批量重算天然没有"读-改-写"竞争，
+ *   一并解决了并发漂移问题。完整架构论证见 00_ADR.gs
+ *   ADR-2026-07-06-005。
+ *
+ *   【确认不成立，有网络证据支持】HIGH2（容器温启动导致跨执行周期事件
+ *   被误判去重）和 HIGH3（内存事件缓存温启动脏读）——这两条的前提都是
+ *   "GAS 会像某些 Node.js serverless 平台（如 Lambda）那样，因为容器
+ *   复用而在不同的独立执行之间保留全局变量状态"。查证了 Google Apps
+ *   Script 的实际执行模型（社区文档 + 官方讨论一致确认）：每次执行都是
+ *   全新的脚本实例，全局变量不会在不同执行之间保留，这正是本项目所有
+ *   "执行期内存缓存"设计（_cachedEvents/_inExecIdentityCache_，以及
+ *   V4.5 新增的 __ProductivityOS_cachedSpreadsheet__/SecureConfig 的
+ *   _cache）能够安全工作的前提，不是这次才发现的巧合。这两条审计发现
+ *   本身没有改任何代码——修复一个不存在的问题只会增加复杂度、可能引入
+ *   新 bug，没有任何收益。
+ *
+ *   【确认修复，部分采纳】MEDIUM1（归档行数组列数不匹配导致归档失败）：
+ *   审计描述的具体触发路径（archiveHeaderMap 索引超过 getLastColumn()）
+ *   核实后判断在单次执行内不该发生——两者本来就源自同一条调用链。但
+ *   原代码确实在循环里对"列数是多少"反复发起实时查询，如果考虑"脚本
+ *   执行期间有人通过 Sheets UI 手动删列"这种极窄的理论竞态窗口，加固
+ *   它没有坏处。13_ActiveTasksEngine.gs：getLastColumn() 只在函数开头
+ *   调一次并缓存，赋值处加了硬性边界检查（越界跳过+打日志，绝不让数组
+ *   自动扩张）。
+ *
+ *   【确认修复】MEDIUM2（Events 表硬编码列索引脆弱性）：
+ *   02_EventBus.gs 的 publish()/getAllEvents() 改成跟 Tasks/ActiveTasks
+ *   一样，用 getHeaderMap_ 按列名动态定位，不再假设 r[0]..r[5] 固定
+ *   顺序（新增 _headerMap_() 内部缓存，避免每次都重新读表头）。
+ *
+ *   【已在前几轮评估过，本次复核后维持不变】MEDIUM3（05_SheetUtils.gs/
+ *   09_TemporalParser.gs 裸全局函数）：这是 V4.5 LOW RISK 1 的同一个
+ *   发现。复核后判断评估没有过时——落地建议需要改十几个函数+项目里
+ *   几乎所有调用点，是一次牵动全项目的重构，投入产出仍然不成比例，
+ *   完整评估记录不变，见 05_SheetUtils.gs 文件头。
+ *
+ *   【确认修复】LOW1（getTask 单任务点查询全表扫描）：
+ *   12_TaskQueryEngine.getTask() 改成先只读 task_id 单列定位行号，
+ *   再单独读那一行，不再每次都读全表所有列。
+ *
+ *   【需要产品判断，未擅自决定】LOW2（thisWeek/thisMonth 的边界是"从
+ *   今天起"还是"从本周一/本月1号起"）：这是 24_ViewEngine.gs
+ *   thisWeek/thisMonth 当初的一个明确设计选择（文件头原文写着"从今天到
+ *   本周日"），不是意外产生的 bug——审计提出的"应该从自然周/自然月开始"
+ *   是一种合理的替代解释，但不是唯一正确答案，两种理解在真实产品里都
+ *   存在。这类"改了会改变现有指令可见行为，且取决于使用习惯偏好"的
+ *   决定，不该由我单方面替 Carson 做，已经在对话里单独提出来问了。
+ *
+ *   本轮修复前用 web_search 核实了 GAS 执行模型的官方/社区文档，是这次
+ *   "再三检查"能确认 HIGH2/HIGH3 不成立的关键依据，不是凭印象判断。
+ *
+ * - 2026-07-06（V4.5）：修复第四轮外部审计发现的全部问题：
  *
  *   【HIGH RISK 1】并发状态下的统计数据漂移——V4.4 给 completeTask/
  *   cancelTask 加的状态拦截没有配锁，真正并发时两次调用仍可能都读到
@@ -250,7 +320,11 @@
 // ============================================================
 
 /**
- * （暂无）
+ * - thisWeek/thisMonth 的日历边界该怎么定义（第五轮外部审计 LOW RISK 2）：
+ *   24_ViewEngine.gs 当前实现是"从今天到本周日/本月最后一天"（前瞻性
+ *   窗口），审计建议改成"从本周一/本月1号到本周日/本月最后一天"（完整
+ *   自然周/月，含已经过去的部分）。这是产品行为选择，不是 bug，已经在
+ *   对话里单独问了 Carson，等他的决定后再动这部分代码。
  */
 
 // ============================================================
@@ -258,75 +332,112 @@
 // ============================================================
 
 /**
- * 全部已在本次（2026-07-06）V4.5 审计修复中处理，本轮全部落在本项目
- * 范围内，没有跨项目遗留项，记录留存供交接参考：
+ * 全部已在本次（2026-07-06）V4.6 审计处理——这一轮是"再三检查是否需要
+ * 修复"，不是照单全收，记录留存供交接参考：
  *
  * HIGH RISK
  *
- * - HIGH RISK 1（并发状态下的统计数据漂移）：
- *   V4.4 给 completeTask/cancelTask 加的"已经是终态就拦截"检查没有配锁，
- *   真正并发（两个 GAS 执行几乎同时处理同一个 taskId）时两次调用仍可能
- *   都读到 PENDING 快照、都通过检查、都发布终态事件，
- *   projectTaskCompleted_/projectTaskCancelled_ 对每个到达的事件无条件
- *   执行 _bumpStatistics_，重复事件导致统计重复扣减/累加。
- *   ✅ 修复：两个 Projection 消费函数在 bump 统计前，先判断"事件发生前
- *   任务是否已经处于同一个终态"，是则跳过——这不是给这两个函数的一次性
- *   补丁，是本 OS 对所有 Projection 消费函数的通用要求（消费端幂等，而
- *   不是只在生产端加锁降低概率），完整架构论证见 00_ADR.gs
- *   ADR-2026-07-06-004。
+ * - HIGH RISK 1（TaskStatistics 增量更新的并发竞争漏洞）：
+ *   _bumpStatistics_ 是非原子的"读一行、内存里加减、写回"，同一 chatId
+ *   的两个并发请求（哪怕是两个不同的任务）会同时读到同一份旧统计行，
+ *   其中一个的更新会被覆盖丢失（lost update）。
+ *   ✅ 修复（跟 HIGH RISK 4 一起解决，见下方）：TaskStatistics 从"事件
+ *   驱动实时投影"降级为"每日批量重算"，批量重算不存在"读-改-写"竞争。
+ *   完整架构论证见 00_ADR.gs ADR-2026-07-06-005。
  *
- * - HIGH RISK 2（Gate 门控在高并发下无差别阻塞）：
- *   09_IdempotencyManager._acquireSoftLock_ 的 GATE_WAIT_MS 只有 500ms，
- *   高并发下即使完全不冲突的用户也可能因为排队超过这个窗口而被误判
- *   SYSTEM_BUSY，遭无差别拒绝。
- *   ✅ 修复：调大到 2000ms。安全性论证：Gate 只保护毫秒级的 CacheService
- *   读写操作本身，不像 V4.2 那次锁住的是整个创建流程——调大等待上限
- *   不会重新引入"锁住慢操作导致 Webhook 超时"的问题。
+ * - HIGH RISK 2（容器温启动导致跨执行周期事件被误判去重）：
+ *   ❌ 核实后判断不成立。这条假设 GAS 会像某些 Node.js serverless 平台
+ *   那样因为"容器温启动"在不同的独立执行之间保留全局变量状态
+ *   （_inExecIdentityCache_）。查证了 Google Apps Script 实际执行模型
+ *   （web_search 到的社区文档与官方讨论一致确认）：每次执行都是全新的
+ *   脚本实例，全局变量不会跨执行保留。这正是本项目所有"执行期内存缓存"
+ *   设计能够安全工作的前提（不是巧合）。没有修改任何代码——修复一个不
+ *   存在的问题只会增加复杂度、可能引入新 bug。
  *
- * - HIGH RISK 3（归档表无限膨胀引发的执行超时/内存风险）：
- *   V4.4 新增的 ArchiveTasks 排重校验是全表扫描 task_id 列，ArchiveTasks
- *   只增不减，长期运行后这一列会越来越大，扫描越来越慢。
- *   ✅ 修复：改成只读最近 ARCHIVE_DEDUP_LOOKBACK_ROWS=2000 行（有界扫描，
- *   不随总行数增长）。排重真正需要覆盖的只是"上次运行中断留下的半完成
- *   行"，触发器每天跑一次，2000 行的窗口有几十倍安全余量，足够覆盖。
+ * - HIGH RISK 3（内存事件缓存温启动脏读风险）：
+ *   ❌ 核实后判断不成立，跟 HIGH RISK 2 是同一个错误前提（_cachedEvents
+ *   同样不会跨执行保留），理由同上，没有修改代码。
+ *
+ * - HIGH RISK 4（TaskStatistics 冗余高频写入造成的性能开销与超限风险）：
+ *   12_TaskQueryEngine.getStatistics() 早就完全绕过 TaskStatistics（直接
+ *   用 AnalyticsEngine.computeStatistics 现扫 Tasks），但所有写入路径
+ *   仍然在同步维护这张没有查询依赖的表。
+ *   ✅ 修复：跟 HIGH RISK 1 一起解决——10_ProjectionEngine.gs 删除
+ *   _bumpStatistics_/_adjustStatisticsForUpdate_；11_ProjectionRebuilder.gs
+ *   新增 recomputeStatisticsFromTasks_()（从 Tasks 表算，比重放 Events
+ *   便宜），由 15_Setup.gs 新增的每日触发器调用。TaskStatistics 的表和
+ *   Schema 都没删除，只是维护方式降级。
  *
  * MEDIUM RISK
  *
- * - MEDIUM RISK 1（PropertiesService 高频调用导致的限额与延迟风险）：
- *   05_SheetUtils.getSheet_ 和 02_EventBus._spreadsheet_ 每次调用都重新
- *   SecureConfig.getKey('SPREADSHEET_ID') + SpreadsheetApp.openById(id)，
- *   单次请求内可能被调用好几次。
- *   ✅ 修复：01_SecureConfig.getKey() 增加执行期内存缓存（同一次执行内，
- *   同一个 key 只读一次 PropertiesService）；05_SheetUtils.gs 和
- *   02_EventBus.gs 各自再加一层，缓存已经打开的 Spreadsheet 对象本身——
- *   两层加起来单次执行最多只有一次 openById 调用。
+ * - MEDIUM RISK 1（物理列数不匹配导致归档失败漏洞）：
+ *   ⚠️ 部分采纳。审计描述的具体触发路径（archiveHeaderMap 索引超过
+ *   archiveSheet.getLastColumn()）核实后判断在单次执行内不该发生——
+ *   archiveHeaderMap 本身就是从同一条 getLastColumn() 调用链派生的。
+ *   但原代码在循环里对"列数是多少"反复发起实时查询，考虑"脚本执行期间
+ *   有人手动删列"这种极窄的理论竞态窗口，加固它没有坏处。
+ *   ✅ 修复：13_ActiveTasksEngine.gs 的 getLastColumn() 只在函数开头
+ *   调一次并缓存（archiveColumnCount），赋值处加了硬性边界检查（越界
+ *   跳过该字段+打日志，绝不让数组自动扩张越界），顺带去掉了循环里原本
+ *   的冗余 API 调用。
  *
- * - MEDIUM RISK 2（锁冲突导致 Telegram 重试"假失败"）：
- *   同一 chatId 的 Soft Lock 被占用时（典型场景：Telegram 因响应慢发起
- *   重试，前一个请求其实还在正常处理、大概率会成功），之前统一回复
- *   "系统繁忙，这个任务没建成，请重发"，对这种情况而言是误导性的。
- *   ✅ 修复：09_IdempotencyManager.gs 把"Gate 都没排上"（真正的全站级
- *   繁忙）和"这个 chatId 已经有请求在处理"拆成两种错误前缀
- *   （"SYSTEM_BUSY:" vs "SYSTEM_BUSY_RETRY_IN_PROGRESS:"），
- *   06_TaskIntentParser.gs 对应给出不同回复文案——后者回复"正在处理中，
- *   稍后再看"而不是"没建成"。
+ * - MEDIUM RISK 2（Events 表硬编码列索引的脆弱性风险）：
+ *   getAllEvents()/publish() 用 r[0]..r[5] 固定位置读写，跟 Tasks/
+ *   ActiveTasks 一直用的动态表头映射方案不一致，手动调整列顺序会导致
+ *   数据错位。
+ *   ✅ 修复：02_EventBus.gs 改用 getHeaderMap_ 按列名动态定位（新增
+ *   _headerMap_() 内部缓存），跟 Tasks/ActiveTasks 用同一套方案。这个
+ *   修复只影响本项目自己的副本，不影响 Core 项目是否有同样的问题——
+ *   本项目没有 Core 项目的 02_EventBus.gs 副本，无法代为核实/修复。
+ *
+ * - MEDIUM RISK 3（裸全局函数和配置变量命名冲突隐患）：
+ *   跟 V4.5 LOW RISK 1 是同一个发现（05_SheetUtils.gs/09_TemporalParser.gs
+ *   大量裸全局工具函数）。
+ *   ⚠️ 复核后维持不变：评估没有过时，落地成本（改十几个函数+项目里
+ *   几乎所有调用点）依然跟"不改架构/不重构"的前提冲突，完整评估记录
+ *   不变，见 05_SheetUtils.gs 文件头。
  *
  * LOW RISK
  *
- * - LOW RISK 1（05_SheetUtils.gs/09_TemporalParser.gs 裸全局工具函数）：
- *   核实属实——评估后判断本次不做：把十几个函数收进命名空间需要同步
- *   修改项目里几乎所有文件的调用点，是一次牵动全项目的重构，跟这几轮
- *   审计"不改架构/不重构"的前提冲突，且是 LOW 级别的最低风险等级，
- *   投入产出不成比例。完整评估记录在 05_SheetUtils.gs 文件头，不是
- *   被遗漏，是记录在案的暂缓。
+ * - LOW RISK 1（单任务点查询时的全表扫描性能瓶颈）：
+ *   getTask() 调 _readAllRows_ 读 Tasks 全表所有行所有列，写事务路径
+ *   （completeTask/cancelTask/updateTask 的存在性校验）每次都要为一次
+ *   单行查找付出全表扫描的代价。
+ *   ✅ 修复：12_TaskQueryEngine.getTask() 改成先只读 task_id 单列定位
+ *   行号，再单独读那一行的全部字段，数据传输量从"行数×列数"降到
+ *   "行数×1 + 1×列数"。
  *
- * - LOW RISK 2（03_Output.gs 的 UrlFetchApp 同步调用额度/超时风险）：
- *   核实后澄清：00_File_Map.gs 之前写"本项目不直接调用"是错的——
- *   02_EventBus._alertAdminProjectionFailure_ 会在 Projection 失败时
- *   调它发管理员告警，是唯一调用点，且只在这种本应罕见的异常路径上
- *   触发。已有的 try/catch + muteHttpExceptions + 长度截断防护足够
- *   应对当前唯一的调用面，没有做批处理/异步化改造；已更正
- *   00_File_Map.gs 里的错误描述。
+ * - LOW RISK 2（逻辑日期区间边界引发的直觉偏差）：
+ *   24_ViewEngine.gs 的 thisWeek/thisMonth 从"今天"算起，不是从"本周一/
+ *   本月1号"算起，审计认为这跟用户对"本周/本月"的直觉认知有偏差。
+ *   ⏸️ 未修改，需要 Carson 决定：这是 thisWeek/thisMonth 当初的明确设计
+ *   选择（文件头原文写着"从今天到本周日"），不是意外产生的 bug——
+ *   "前瞻性窗口"和"完整自然周/月"都是合理的产品解释，取决于使用习惯，
+ *   不该由我单方面替 Carson 决定，已经单独问了，见"二、进行中"。
+ *
+ * 附注：本轮"再三检查"最大的价值在于 HIGH2/HIGH3——如果照单全收去"修复"
+ * 一个不存在的问题，很可能会画蛇添足引入新代码路径、新的复杂度，却对
+ * 实际正确性毫无帮助。核实平台执行模型这类基础设施行为时，查文档/搜索
+ * 证据比凭经验/印象判断更可靠，以后遇到类似"这个平台会不会有 XXX 行为"
+ * 的审计发现，应该继续用这个方法核实，不要预设审计报告的每一条都成立。
+ *
+ * ── V4.5 审计（已修复，历史记录）────────────────────────────────────────
+ *
+ * - HIGH RISK 1：completeTask/cancelTask 双击导致统计漂移——加了"事件
+ *   发生前是否已处于同一终态"的判断（ADR-2026-07-06-004）。V4.6 起
+ *   TaskStatistics 不再同步维护，这个判断原本保护的调用已不存在，但
+ *   判断本身保留用于日志。
+ * - HIGH RISK 2：Gate 门控 GATE_WAIT_MS 500ms→2000ms。
+ * - HIGH RISK 3：ArchiveTasks 排重校验全表扫描→只读最近2000行
+ *   （V4.6 进一步加固了列数计算的一致性，见上方 MEDIUM RISK 1）。
+ * - MEDIUM RISK 1：SecureConfig.getKey() + getSheet_/_spreadsheet_ 增加
+ *   执行期缓存。
+ * - MEDIUM RISK 2：SYSTEM_BUSY 拆成两种错误前缀，区分"真繁忙"和"你自己
+ *   的请求在处理中"。
+ * - LOW RISK 1：05_SheetUtils.gs/09_TemporalParser.gs 裸全局函数——评估
+ *   后判断暂不做（V4.6 MEDIUM RISK 3 复核后维持同一判断）。
+ * - LOW RISK 2：03_Output.gs 的 UrlFetchApp 调用面核实澄清（唯一调用点
+ *   是罕见的 Projection 失败告警），更正了 File Map 里的错误描述。
  *
  * ── V4.4 审计（已修复，历史记录）────────────────────────────────────────
  *

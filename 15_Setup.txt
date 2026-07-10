@@ -1,6 +1,13 @@
 /**
  * 15_Setup.gs
- * Productivity OS v4.3.1 — 一键初始化
+ * Productivity OS v4.6 — 一键初始化
+ *
+ * 【V4.6 新增】createTriggers() 新增 triggerDailyStatisticsRecompute
+ * 每日触发器——TaskStatistics 不再由 10_ProjectionEngine.gs 同步增量
+ * 维护，改成每天批量重算一次，见 00_ADR.gs ADR-2026-07-06-005。已经跑过
+ * 旧版 createTriggers() 的部署，需要重新跑一次这个函数才能补上新触发器
+ * （createTriggers() 是幂等的，会先清掉同名旧触发器再重新创建，可以放心
+ * 重复运行）。
  *
  * 【V4.3 修复】setupSheets() 之前完全没有创建 Events 表，日志里还写着
  * "Events 由 Core 项目建"——这个假设在"先跑过 Core 项目的 setupSheets()
@@ -111,13 +118,21 @@ function _ensureSheet_(ss, name, headers) {
 // ============ 2. 定时触发器 ============
 
 /**
- * 本项目只有一个定时任务：triggerDailyArchive（每天凌晨2点，见
- * 13_ActiveTasksEngine.gs 的 runDailyArchive）。V4 没有新增触发器——
- * TaskStatistics/TaskFilters 都是事件驱动的同步增量维护，不需要定时任务；
- * 如果发现漂移，手动跑 11_ProjectionRebuilder.gs 的对应 rebuild 函数即可。
+ * 本项目现在有两个定时任务：
+ *   triggerDailyArchive              — 每天凌晨2点（冷归档，13_ActiveTasksEngine.gs）
+ *   triggerDailyStatisticsRecompute  — 每天凌晨3点（V4.6新增，TaskStatistics
+ *                                       批量重算，11_ProjectionRebuilder.gs）——
+ *                                       错开1小时跑，避免两个每日任务同一
+ *                                       时刻抢 Sheet 资源（虽然两者操作的
+ *                                       是不同表，理论上不冲突，错开纯粹是
+ *                                       图个干净，没有实质必要性）。
+ * TaskStatistics/TaskFilters 都是事件驱动或按需生成的，V4.6 前两者都不需要
+ * 定时任务；V4.6 起 TaskStatistics 改为每日批量重算（见 00_ADR.gs
+ * ADR-2026-07-06-005），需要这第二个触发器。如果发现漂移，也可以手动跑
+ * 11_ProjectionRebuilder.gs 的对应 rebuild/recompute 函数。
  */
 function createTriggers() {
-  var handlerNames = ['triggerDailyArchive'];
+  var handlerNames = ['triggerDailyArchive', 'triggerDailyStatisticsRecompute'];
   ScriptApp.getProjectTriggers().forEach(function (t) {
     if (handlerNames.indexOf(t.getHandlerFunction()) !== -1) {
       ScriptApp.deleteTrigger(t);
@@ -125,9 +140,11 @@ function createTriggers() {
   });
 
   ScriptApp.newTrigger('triggerDailyArchive').timeBased().everyDays(1).atHour(2).create();
+  ScriptApp.newTrigger('triggerDailyStatisticsRecompute').timeBased().everyDays(1).atHour(3).create();
 
   Logger.log('✅ Productivity OS 自己的触发器挂好了:');
   Logger.log('  triggerDailyArchive — 每天 02:00 左右（冷归档）');
+  Logger.log('  triggerDailyStatisticsRecompute — 每天 03:00 左右（TaskStatistics 批量重算，V4.6新增）');
 }
 
 // ============ 修复：表头被污染 ============

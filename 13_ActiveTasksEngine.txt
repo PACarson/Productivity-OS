@@ -52,6 +52,18 @@
  * 行数增长）——排重真正需要覆盖的只有"上一次运行中断留下的半完成行"，
  * 触发器每天跑一次，这类行必然产生于最近一次运行，2000 行的窗口留了
  * 几十倍的安全余量，足够覆盖，不需要扫描全部历史。
+ *
+ * v3.5 变更（V4.6，2026-07-06，外部审计 MEDIUM RISK 1，核实后判断"部分
+ * 采纳"）：审计描述的具体触发条件（archiveHeaderMap 的索引超过
+ * archiveSheet.getLastColumn()）在单次执行内理论上不该发生——两者都
+ * 源自同一条 getLastColumn() 调用链，中间没有会改变列结构的操作。但
+ * 原代码确实在循环里对同一个"列数是多少"反复发起实时查询（每构建一行
+ * 就调一次 getLastColumn()），如果考虑"有人在脚本执行期间通过 Sheets UI
+ * 手动删列"这种极窄的理论竞态窗口，加固它没有坏处。修复：getLastColumn()
+ * 只在函数开头调一次并缓存（archiveColumnCount），后续全部复用同一个值，
+ * 并在赋值处加了硬性边界检查（越界则跳过该字段+打日志，绝不让数组自动
+ * 扩张越界）——即使审计描述的具体场景不完全成立，这样改也是纯粹的加固，
+ * 没有下行代价，顺带还去掉了循环里原本的冗余 API 调用。
  */
 
 /**
@@ -119,6 +131,22 @@ var ActiveTasksEngine = (function () {
     var tasksHeaderMap   = getHeaderMap_(tasksSheet);
     var archiveHeaderMap = getHeaderMap_(archiveSheet);
     var tasksLastRow     = tasksSheet.getLastRow();
+
+    // 【V4.6 修复 MEDIUM RISK 1：物理列数不匹配导致归档失败】原来在下面的
+    // 循环里，每构建一行 archiveRow 都会重新调一次 archiveSheet.getLastColumn()，
+    // 最后 setValues() 时又再调一次——同一次执行内对同一个"列数应该是多少"
+    // 这个问题反复发起实时查询，理论上如果这中间发生了列结构变化（比如
+    // 归档进行到一半，有人手动在 Sheets UI 里删了 ArchiveTasks 最右侧的
+    // 列），前后几次 getLastColumn() 就可能返回不同的值，导致 archiveRow
+    // 的长度和最终 setValues() 指定的 Range 宽度不一致，报
+    // "The number of columns in the data does not match..." 异常，
+    // 归档任务整体失败。
+    // 修复：只在这里调一次 getLastColumn()，缓存进 archiveColumnCount，
+    // 后面构建每一行 / 最终写入都复用这同一个数值，不再重复实时查询——
+    // 这同时也去掉了循环里原本每行一次的冗余 API 调用（性能顺带改善），
+    // 并让"这次归档操作认定的列数"在整个函数执行期间保持单一、确定的
+    // 来源，不会中途改变。
+    var archiveColumnCount = archiveSheet.getLastColumn();
 
     if (tasksLastRow < 2) {
       Logger.log('Tasks Sheet 没有数据行，跳过');
@@ -218,13 +246,25 @@ var ActiveTasksEngine = (function () {
         // 构建 ArchiveTasks 行（在标记 archived 之前构建，archived 本身不是
         // ArchiveTasks 的字段，顺序其实不影响正确性，但这样写更清楚：
         // "先原样拷贝这一行的数据去archive，再改这一行在Tasks里的归档标记"）
-        var archiveRow = new Array(archiveSheet.getLastColumn()).fill('');
+        var archiveRow = new Array(archiveColumnCount).fill('');
         for (var h in tasksHeaderMap) {
-          if (archiveHeaderMap.hasOwnProperty(h)) {
-            archiveRow[archiveHeaderMap[h]] = row[tasksHeaderMap[h]];
+          if (!archiveHeaderMap.hasOwnProperty(h)) continue;
+          var colIdx = archiveHeaderMap[h];
+          // 硬性边界防护：哪怕上面 archiveColumnCount 缓存的机制出于某种
+          // 没预料到的原因还是跟 archiveHeaderMap 的索引对不上，这里也
+          // 绝不允许越界赋值把数组悄悄撑大（JS 数组对越界索引赋值默认会
+          // 自动扩张，正是 MEDIUM RISK 1 描述的问题的直接成因）——宁可
+          // 跳过这个字段、打日志，也不要让 setValues() 最后炸在一个更难
+          // 定位的地方。
+          if (colIdx < 0 || colIdx >= archiveColumnCount) {
+            Logger.log('[ActiveTasksEngine] ⚠️ 字段"' + h + '"在 ArchiveTasks 表头映射的列索引(' +
+              colIdx + ')超出当前表实际列数(' + archiveColumnCount + ')，跳过该字段（不影响其余字段归档）');
+            continue;
           }
+          archiveRow[colIdx] = row[tasksHeaderMap[h]];
         }
-        if (archiveHeaderMap.hasOwnProperty('archived_at')) {
+        if (archiveHeaderMap.hasOwnProperty('archived_at') &&
+            archiveHeaderMap['archived_at'] >= 0 && archiveHeaderMap['archived_at'] < archiveColumnCount) {
           archiveRow[archiveHeaderMap['archived_at']] = archiveNowTimestamp;
         }
         archiveRowArrays.push(archiveRow);
@@ -255,7 +295,7 @@ var ActiveTasksEngine = (function () {
     // 批量写入 ArchiveTasks（只写真正需要新追加的行，见上方排重校验）
     if (archiveRowArrays.length > 0) {
       var archiveStartRow = archiveSheet.getLastRow() + 1;
-      archiveSheet.getRange(archiveStartRow, 1, archiveRowArrays.length, archiveSheet.getLastColumn())
+      archiveSheet.getRange(archiveStartRow, 1, archiveRowArrays.length, archiveColumnCount)
                   .setValues(archiveRowArrays);
     }
 

@@ -382,3 +382,100 @@
  *     副作用（比如"每次事件都发一条 Telegram 通知"），需要针对那类
  *     副作用单独设计幂等策略，本 ADR 的结论不能不假思索地照搬过去
  */
+
+// ============================================================
+// ADR-2026-07-06-005：TaskStatistics 从实时投影降级为每日批量重算
+// ============================================================
+
+/**
+ * ── Metadata ──────────────────────────────────────────────────────────────
+ *   ADR Number      : ADR-2026-07-06-005
+ *   Status          : Accepted
+ *   Decision Date   : 2026-07-06
+ *   Supersedes      : ADR-2026-07-06-004 的适用范围（该 ADR"Projection
+ *                     消费端必须幂等"这条原则本身继续成立，不是被推翻，
+ *                     但它在 _bumpStatistics_ 上的具体应用已经不存在了，
+ *                     因为 _bumpStatistics_ 本身被移除，见 Context）
+ *   Superseded By   : （无，仍然生效）
+ *   Affected Modules: 10_ProjectionEngine.gs（移除 _bumpStatistics_ /
+ *                     _adjustStatisticsForUpdate_）、
+ *                     11_ProjectionRebuilder.gs（新增
+ *                     recomputeStatisticsFromTasks_() /
+ *                     triggerDailyStatisticsRecompute()）、
+ *                     15_Setup.gs（新增每日触发器）
+ *   Related ADR     : ADR-2026-07-06-004（Projection 消费端幂等——这条
+ *                     ADR 记录的问题被本次修复"顺带"解决了，不是因为
+ *                     004 的方案错了，而是发现了更彻底、成本更低的解法）
+ *   Consequences    : 见下方正文
+ *   Notes           : 第五轮外部审计 HIGH RISK 1 + HIGH RISK 4 的正式
+ *                     记录，两条发现指向同一个架构决策。
+ *
+ * ── Context ──────────────────────────────────────────────────────────────
+ *
+ * TaskStatistics 从 V4 起由 10_ProjectionEngine.gs 在每个 Task 生命周期
+ * 事件（create/update/complete/cancel/reminder）触发时同步做增量更新
+ * （_bumpStatistics_：读一行、内存里加减、写回）。第五轮外部审计同时指出
+ * 两个问题：
+ *
+ *   HIGH RISK 1：_bumpStatistics_ 的"读-改-写"不是原子操作。同一 chatId
+ *   的两个并发请求（哪怕是两个完全不同的任务，比如同一用户几乎同时完成
+ *   两个不同的待办事项）会同时读到同一份旧统计行，其中一个的增量会被
+ *   另一个覆盖丢失（lost update），TaskStatistics 的计数器永久性漂移。
+ *
+ *   HIGH RISK 4：12_TaskQueryEngine.getStatistics()（本 OS 里 /stats
+ *   指令实际调用的函数）早就完全不读 TaskStatistics 这张表——V4 设计
+ *   TaskStatistics 时就留了一句"这里现算，TaskStatistics 表仍然维护，
+ *   供未来需要跨 chatId 聚合总览时用"，但"未来的需要"至今没有出现，
+ *   而"同步维护"这个代价一直在稳定支付：每一次 create/update/complete/
+ *   cancel/reminder，都在为一张零查询依赖的表额外付一次 Sheet 读写。
+ *
+ * 这两个问题不是相互独立的两件事，而是同一件事的两个侧面：一条被证实
+ * 没人依赖、纯属浪费的同步写入路径，同时还不是线程安全的。
+ *
+ * ── Decision ──────────────────────────────────────────────────────────────
+ *
+ * 不给 _bumpStatistics_ 加锁（那样只会让 HIGH RISK 4 更严重——花更多时间
+ * 去做一件已经证明没人需要做实时的事）。而是采纳 HIGH RISK 4 审计原文
+ * 自己给出的方向：把 TaskStatistics 从"事件驱动的实时投影"降级为"低频、
+ * 异步的每日批量维护"：
+ *
+ *   - 10_ProjectionEngine.gs 的 dispatch() 分发到的 5 个 project*_ 函数
+ *     全部移除 _bumpStatistics_ 调用；_bumpStatistics_ 和
+ *     _adjustStatisticsForUpdate_（V4.2 专门为处理 TASK_UPDATED 场景写的
+ *     增量调整逻辑）两个函数本体一并删除。
+ *   - 新增 11_ProjectionRebuilder.recomputeStatisticsFromTasks_()：从
+ *     Tasks 表（不是 Events）按 chat_id 分组重新聚合，整体覆写
+ *     TaskStatistics。之所以从 Tasks 表算而不是从 Events 重放算（后者是
+ *     rebuildStatisticsProjection() 已经在做的事）：Tasks 本身已经是
+ *     可信的 Read Model（有自己的一致性保障和 rebuildTasksProjection()
+ *     兜底），从它聚合比重放全部历史 Events 便宜得多，也不需要每天都去
+ *     摸一遍那张只增不减、持续变大的 Events 表。
+ *   - 15_Setup.gs 新增每日触发器 triggerDailyStatisticsRecompute()
+ *     （凌晨3点，跟冷归档的凌晨2点错开）。
+ *   - TaskStatistics 的表和 Schema 都不删除——万一未来真的出现
+ *     "跨 chatId 聚合总览"的查询需求，这张表还在，只是语义变成"最多
+ *     24 小时前的快照"而不是"实时值"。
+ *
+ * ── Consequences ──────────────────────────────────────────────────────────
+ *
+ * 正面：
+ *   - HIGH RISK 1（并发 lost update）自动消失——批量重算是"从当前状态
+ *     完整重新计算"，不是"在旧值上累加"，没有"读-改-写"竞争这个概念
+ *   - HIGH RISK 4（冗余同步写入）直接解决——create/update/complete/
+ *     cancel/reminder 五条路径都少了一次 Sheet I/O
+ *   - 09_IdempotencyManager.gs 的并发处理（Gate+Soft Lock，
+ *     ADR-2026-07-06-003）现在只需要为"创建路径的去重判断"负责，不用
+ *     再间接为 TaskStatistics 的准确性兜底，职责更单一
+ *
+ * 需要接受的代价：
+ *   - TaskStatistics 现在最多有 24 小时的延迟（如果真的有查询路径需要
+ *     "刚刚发生的变化立刻反映在统计里"，这张表不再满足这个要求——但
+ *     目前没有任何查询路径提出过这个要求，getStatistics() 本来就是现算）
+ *   - 如果 setupSheets()/createTriggers() 是旧版本部署的，需要重新跑一次
+ *     createTriggers() 才能补上新的每日触发器（15_Setup.gs 已在文件头
+ *     注明）
+ *   - ADR-2026-07-06-004 记录的"Projection 消费端必须幂等"这条原则，
+ *     它当初的具体应用场景（_bumpStatistics_）已经不存在，但原则本身
+ *     对本 OS 未来任何新增的、真正需要同步增量维护的 Read Model 仍然
+ *     适用，不能因为这次的问题被绕开就忘记这条原则
+ */
