@@ -5,13 +5,16 @@
  *
  * 目的：把"用户/审计员能直接观察到的行为契约"——Telegram 指令匹配规则、
  * 查询时间窗口定义、打分/统计公式、去重与幂等规则、归档规则等——集中记录
- * 在一份文件里，跟另外三份治理文件分工如下：
- *   00_Project_Constitution.gs → 记录 WHY / 架构原则 / 层次划分
- *   00_File_Map.gs             → 记录每个文件"是什么、依赖谁"
- *   00_ADR.gs                  → 记录"为什么选了这个方案而不是那个"的决策过程
- *   00_Command_Reference.gs（本文件）→ 记录 WHAT，即"每条指令/规则的具体
- *                                 数值、公式、边界条件"，不重复前三份文件
- *                                 已经写过的架构论证
+ * 在一份文件里。V4.6 起本项目 Governance 目录固定为 7 份文件，分工如下：
+ *   00_Project_Constitution.gs → Why —— 架构原则 / 层次划分
+ *   00_Project_State.gs        → 当前快照 —— 已完成/进行中/已知Bug/下一步
+ *   00_ADR.gs                  → Decision —— 为什么选了这个方案而不是那个
+ *   00_File_Map.gs             → Where —— 每个文件"是什么、依赖谁"
+ *   00_Command_Reference.gs（本文件）→ What —— 每条指令/规则的具体数值、
+ *                                 公式、边界条件
+ *   00_Known_Limitations.gs    → Not Yet —— 刻意不做 / 暂未对外暴露的能力，
+ *                                 不要被 Review 误判成 bug 或遗漏
+ *   00_Roadmap.gs              → Future —— 未来计划
  *
  * 本文件每一条规则都标注了实现它的具体文件/函数，供以后核对"这是不是
  * bug"时直接跳转到源码确认，不用每次都重新读一遍七八个 Engine 文件。
@@ -22,12 +25,21 @@
  * 08_DeduplicationEngine / 09_IdempotencyManager / 12_TaskQueryEngine /
  * 13_ActiveTasksEngine / 20_TaskEngine / 21_RecurringEngine /
  * 22_PriorityEngine / 23_SearchEngine / 24_ViewEngine / 25_DashboardEngine /
- * 26_AnalyticsEngine / 06_TaskIntentParser / 15_Setup。核对中发现的、
- * 目前还没有定论的疑点集中放在文末「七、待确认事项」，不代入前面几节
- * 当成"已确认的规则"。
+ * 26_AnalyticsEngine / 06_TaskIntentParser / 15_Setup。
  *
- * LAST_UPDATED: 2026-07-11 — 首次创建（纯文档补充，不改动任何代码，
- * 版本号沿用 v4.6）。
+ * "已实现但暂未通过 Telegram 暴露的能力"（Weekly/Monthly Dashboard、
+ * suggestPriority()、updateTask() 等）不放在本文件——那些是 Not Yet 类，
+ * 记在 00_Known_Limitations.gs，本文件只记"已经对外生效"的规则，避免
+ * 两份文件互相重复。
+ *
+ * 本文件最后一节（七、Design Clarifications）专门收录"容易被误认为 bug、
+ * 实际上是刻意设计"的行为契约（比如 /search 为什么搜全部状态），按 7.1/
+ * 7.2/... 顺次累加，是常青的设计说明，不是审计历史记录——Audit Trail 由
+ * 00_Project_State.gs / Git History / Changelog 承担，本文件不重复。
+ *
+ * LAST_UPDATED: 2026-07-11 — 首次创建 + 新增第七节 Design Clarifications
+ * 7.1（/search Scope，见二、V11 与 G2(d)），不改动任何代码，版本号沿用
+ * v4.6。
  */
 
 // ============================================================
@@ -59,8 +71,8 @@
  *     (d) searchTasks（/search）—— **不做非终结态过滤**，除非调用方在
  *         query 里显式传 status。Telegram 单关键字搜索固定只传
  *         `{text: keyword}`，不带 status，所以 /search 会把 DONE/
- *         CANCELLED 的历史任务也搜出来。这跟 (a) 类视图的整体基调不一致，
- *         详见文末「七、待确认事项」第1条。
+ *         CANCELLED 的历史任务也搜出来——这是刻意的设计，不是 bug，完整
+ *         理由见文末「七、Design Clarifications」7.1。
  *     (e) getPriorityTasks（/priority）—— 单独在 12_TaskQueryEngine.
  *         getPriorityTasks 里手写了一次"排除 DONE/CANCELLED"的 filter，
  *         再转交给 PriorityEngine.rankByPriority，不是靠 ViewEngine。
@@ -137,7 +149,7 @@
  *   ≥80→CRITICAL / ≥55→HIGH / ≥25→MEDIUM / 否则 LOW 给建议标签），目前
  *   /priority 的回复文案（_buildPriorityReply_）只显示原始分数和任务自己
  *   的 manual priority，**没有调用 suggestPriority 展示建议标签**——见
- *   文末「六、已实现但未接 Telegram」第2条。
+ *   00_Known_Limitations.gs「Internal Capability, Not Yet Exposed」一节。
  *
  * ── V7. 重复任务 ──────────────────────────────────────────────────────
  *   触发：/recurring 或 重复 / 循环 / 重复任务
@@ -148,6 +160,8 @@
  *         全部任务 / 待办 / todo(s)
  *   实现：12_TaskQueryEngine.getPendingTasks() — 直接按
  *         status === 'PENDING' 精确匹配（见 G2(b)），无时间窗口限制。
+ *   职责边界（跟 V9/V11 对照，见文末「七、Design Clarifications」7.1）：
+ *         active task list——"我现在要做什么"，只看未完成。
  *
  * ── V9. 任务历史 ──────────────────────────────────────────────────────
  *   触发：/history 或 历史 / 已完成 / 完成记录 / 已完成任务 / 任务历史
@@ -155,6 +169,8 @@
  *         匹配——**不含 CANCELLED**，这点跟 G2(c) 的笼统说法略有出入，
  *         已取消的任务查不到，只能在 completed_at 排序上 slice(0,30) 取
  *         最近 30 条，取的是"最近插入顺序"而不是按完成时间显式排序）。
+ *   职责边界（跟 V8/V11 对照，见文末「七、Design Clarifications」7.1）：
+ *         completed record——"我做完了什么"，只看 DONE。
  *
  * ── V10. 已归档任务 ───────────────────────────────────────────────────
  *   触发：/archive 或 归档 / 已归档 / 归档记录
@@ -167,8 +183,9 @@
  * ── V11. 搜索任务 ─────────────────────────────────────────────────────
  *   触发：/search <关键字> 或 搜索 <关键字>
  *   实现：23_SearchEngine.search() — 在 title/description/notes/tags/
- *         category 五个字段拼接后做大小写不敏感的包含匹配。**范围见
- *         G2(d)：不排除 DONE/CANCELLED，是本文件已知的待确认项。**
+ *         category 五个字段拼接后做大小写不敏感的包含匹配。
+ *   范围（见 G2(d)）：不排除 DONE/CANCELLED——刻意设计，非 bug，完整
+ *         Rationale 见文末「七、Design Clarifications」7.1。
  *
  * ── V12. 仪表盘 ───────────────────────────────────────────────────────
  *   触发：/dashboard 或 仪表盘
@@ -185,7 +202,8 @@
  *        分区的任务不会在这里重复出现。
  *   注：25_DashboardEngine 还有 buildWeeklyDashboard/buildMonthlyDashboard
  *   两个函数，但 06_TaskIntentParser 目前只把 /dashboard 接到 'today'——
- *   Weekly/Monthly 两种展示存在但没有 Telegram 指令能触发，见文末第六节。
+ *   Weekly/Monthly 两种展示存在但没有 Telegram 指令能触发，见
+ *   00_Known_Limitations.gs「Internal Capability, Not Yet Exposed」一节。
  *
  * ── V13. 统计数据 ─────────────────────────────────────────────────────
  *   触发：/stats 或 统计 / 统计数据
@@ -343,9 +361,15 @@
  *     **目前所有通过 Telegram 自然语言创建的任务，category 永远落到
  *     默认值 GENERAL，priority 永远落到默认值 MEDIUM**，系统不会从
  *     文本内容（比如出现"买"就归到 SHOPPING，或出现"紧急"就设成
- *     CRITICAL）做任何推断。这是当前 v4.6 的真实行为，不是这次记录时
- *     的误读——但没有在任何既有治理文件里被显式记成"已知限制"，见文末
- *     第六节第4条。
+ *     CRITICAL）做任何推断。
+ *
+ *     **【已确认为 Known Limitation，2026-07-11，非 bug】**：这是刻意的
+ *     Clean Architecture 边界，不是遗漏——Productivity OS 的职责到"解析
+ *     时间/重复规则、落库、去重"为止，不应该承担"理解任务语义"这件事
+ *     （比如判断"下周找律师"该归哪个 category、该给多高 priority）。
+ *     那是上层调用方（Personal AI Core 这类 AI Agent）的职责，Productivity
+ *     OS 保持"傻瓜式" API 反而更稳。完整结论见
+ *     00_Known_Limitations.gs「Natural Language Parser Scope」一节。
  */
 
 // ============================================================
@@ -412,59 +436,53 @@
  */
 
 // ============================================================
-// 六、已实现但尚未通过 Telegram 暴露的能力（Known Gaps，非 bug）
+// 六、已实现但尚未通过 Telegram 暴露的能力
 // ============================================================
 
 /**
- * 以下几点都是"代码里已经存在、能正常工作，但 06_TaskIntentParser.gs
- * 目前没有指令路由到它"的情况——如果外部审计报告说"这个功能缺失"，先来
- * 这里核对是"真的没实现"还是"实现了但没接指令"：
- *
- *   1. 25_DashboardEngine.buildWeeklyDashboard() /
- *      buildMonthlyDashboard()：函数存在（今日完成数/本周剩余/即将到来/
- *      逾期/完成率 —— 或 本月待办/已完成/已取消/Recurring/提醒次数/
- *      完成率），但 /dashboard 只接到 'today'，没有 /weekly、/monthly
- *      这类指令。
- *
- *   2. 22_PriorityEngine.suggestPriority()：能根据 Priority Score 给出
- *      建议标签（≥80 CRITICAL / ≥55 HIGH / ≥25 MEDIUM / 否则 LOW），
- *      但 /priority 的回复文案不展示这个建议，只展示原始分数和任务自己
- *      已有的 manual priority。
- *
- *   3. 20_TaskEngine.updateTask(taskId, changes, chatId)：能修改
- *      title/due_date/recurring/priority/category 等字段（改到
- *      IDENTITY_AFFECTING_FIELDS 里任一个会重算 identity），但
- *      06_TaskIntentParser.gs 的指令列表里**没有任何指令路由到它**——
- *      当前 Telegram 端创建任务之后，用户没有办法通过发消息改
- *      category/priority/due_date，只能 done/cancel 改状态。
- *
- *   4. category/priority 的自然语言推断：如本文件 C5 所述，Telegram
- *      自然语言创建任务时不会从文本内容推断 category/priority，一律是
- *      默认值 GENERAL/MEDIUM。如果这是有意留给未来版本的范围收窄（类似
- *      00_Project_State.gs「下一步」P2 里其它几条"V4 刻意收窄"的记录），
- *      建议在该文件对应位置补一条，本文件先如实记录现状。
+ * 这一类内容（Weekly/Monthly Dashboard、suggestPriority()、updateTask()、
+ * 以及 category/priority 不做自然语言推断）从 2026-07-11 起统一移到
+ * 00_Known_Limitations.gs 的「Internal Capability / Internal API」两节，
+ * 不再放在本文件——它们不是"指令规则"，而是"刻意不做/暂未暴露"的边界，
+ * 归 Known Limitations 管，避免两份文件重复维护同一份清单。
  */
 
 // ============================================================
-// 七、待确认事项（记录现状，尚未定性为"确认无误"，不要当成结论引用）
+// 七、Design Clarifications（设计澄清）
 // ============================================================
 
 /**
- * Q1. /search 的范围是否应该排除 DONE/CANCELLED？
+ * This section records intentional behaviors that are frequently mistaken
+ * for bugs. It documents the design rationale to avoid repeated
+ * architecture review discussions.
  *
- *     现状（见 G2(d)）：23_SearchEngine.search() 本身支持按 status 过滤，
- *     但 12_TaskQueryEngine.searchTasks() 转发 Telegram 单关键字搜索时
- *     固定只传 `{text: keyword}`，不带 status 条件，所以 /search 会把
- *     已经 DONE/CANCELLED 的历史任务也搜出来、混在结果列表里展示。
+ * 本节是"容易被误认为 bug、实际上是刻意设计"这类行为的永久记录处——每一条
+ * 都是常青的设计澄清（Design Clarification），不是"历史问答/审计记录"。
+ * Audit Trail（谁、什么时候、为什么改的）已经有 00_Project_State.gs / Git
+ * History / Changelog 承担，本节不重复那个职责，只回答一个问题："这是不是
+ * bug？"——不是，这是设计决定，理由如下。
  *
- *     这跟第二节其余十种视图类指令"统一只看未终结任务"的整体基调不一致，
- *     两种可能都说得通：
- *       (a) 有意为之——用户可能想找"我之前买过的xx是什么时候"这类已完成
- *           任务，/search 保留全量范围是产品层面刻意的选择；
- *       (b) 未完成的收窄——其它十种指令 V4 落地时都有意排除了终结态，
- *           /search 这里可能只是遗漏了同样的过滤，应该补上。
+ * 以后再遇到类似情况（比如 /archive 要不要包含 CANCELLED、Priority Score
+ * 公式要不要调整、Reminder 的 overdue 要不要计算并展示），直接在本节按
+ * 7.2 / 7.3 / 7.4 顺次追加一条，格式跟 7.1 保持一致（一句话结论 + 
+ * Rationale + 必要的 Use/对照 + 实现位置引用），不要另起"疑点/待确认"
+ * 性质的章节。
+ */
+
+/**
+ * 7.1 /search Scope
  *
- *     本文件记录到这里为止，不代为下结论。一旦确认，请把结论连同理由
- *     补回本条（如果是(a)，补一句"WHY"说明产品意图；如果是(b)，改代码
- *     后把这条从「待确认」挪到第二节 V11 正文，并删掉这条）。
+ * /search intentionally searches all task states
+ * (ACTIVE, DONE, CANCELLED).
+ *
+ * Rationale
+ *   Search is a retrieval command rather than an active task list.
+ *
+ * Use:
+ *   /tasks   → active tasks only
+ *   /history → completed tasks only
+ *   /search  → all task states
+ *
+ * 实现位置：23_SearchEngine.search()；12_TaskQueryEngine.searchTasks()
+ * 转发 Telegram 单关键字搜索时不带 status 过滤，见第一节 G2(d)。
  */
