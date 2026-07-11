@@ -1,11 +1,18 @@
 /**
  * 00_Roadmap.gs
- * Productivity OS v4.4 — Roadmap（长期规划）
+ * Productivity OS v4.6 — Roadmap（长期规划）
  *
  * ⚠️ 本文件只谈"接下来要往哪走"，不记录历史、不记录 Bug、不记录架构决策——
  * 那三类内容分别属于 00_Project_State.gs（当前状态快照）、
  * 00_Project_State.gs"已知Bug"、00_ADR.gs（决策记录）。本文件跟
  * 00_Project_State.gs 一样是"快照"，每次更新覆盖旧内容，不是日志。
+ *
+ * LAST_UPDATED: 2026-07-11 — 00_Architecture_Review.gs（UEF v1.0 Domain
+ * Profile Review #1）Finding D3-1：本文件版本头和「一、Current Version」
+ * 落后实际状态两个版本（停留在 V4.4，未反映 V4.5/V4.6），且治理文档数量
+ * 描述过期（写"五份"，实际现在七份 + 本次新增的 Architecture Review
+ * 共八份）。本次已按 00_Project_State.gs 的实际记录修正，纯文档修正，
+ * 不涉及任何架构决定本身的重新论证。
  */
 
 // ============================================================
@@ -13,17 +20,30 @@
 // ============================================================
 
 /**
- * V4.4——第三轮外部审计修复（连续点击幂等化、跨用户软锁、归档排重、
- * Events 规模可见性、命名空间收敛）。
+ * V4.6——第五轮外部审计修复（TaskStatistics 从事件驱动实时投影降级为
+ * 每日批量重算，一并解决并发漂移与冗余高频写入两个问题，见 00_ADR.gs
+ * ADR-2026-07-06-005）。此前 V4.5 完成第四轮修复（Gate 等待时间调优、
+ * Projection 消费端幂等、归档有界扫描、SecureConfig/Spreadsheet 执行期
+ * 缓存、SYSTEM_BUSY 错误细分）。完整逐条记录见 00_Project_State.gs。
  *
  * 本 OS 现状一句话概括：9 个 Engine（Task/Recurring/Priority/Search/View/
  * Dashboard/Analytics/Query + Archive），严格 CQRS（Events 唯一 Write
- * Model，Tasks/ActiveTasks/TaskStatistics/TaskFilters 四张 Projection 表，
- * View/Dashboard 按需生成不落盘），治理文档齐备（Constitution/State/
- * File Map/ADR/Roadmap 五份），Telegram 是唯一呈现层但 Query/View/
- * Dashboard 三层已经不依赖 Telegram 这个呈现介质本身。跨项目遗留问题
- * （04_Main.gs/80_RiderConnector.gs 相关，见 00_Project_State.gs"下一步"
- * P1）不在本 OS 范围内，需要另外在对应项目里处理。
+ * Model，Tasks/ActiveTasks/TaskFilters 三张实时 Projection 表 +
+ * TaskStatistics 每日批量重算一张，View/Dashboard 按需生成不落盘），
+ * 治理文档共八份（Constitution/State/File Map/ADR/Roadmap/Known
+ * Limitations/Command Reference/Architecture Review），Telegram 是唯一
+ * 呈现层但 Query/View/Dashboard 三层已经不依赖 Telegram 这个呈现介质
+ * 本身。跨项目遗留问题（04_Main.gs/80_RiderConnector.gs 相关，见
+ * 00_Project_State.gs"下一步"P1）不在本 OS 范围内，需要另外在对应项目
+ * 里处理。
+ *
+ * 【2026-07-11 新增】本项目完成了 UEF（Universal Engineering Framework）
+ * v1.0 ratify 后的第一次正式 Domain Profile Architecture Review，完整
+ * 记录见新增的 00_Architecture_Review.gs。结论：Separation of Concerns /
+ * Layering 两项 Pass；Governance / Doc-Code Drift 两项各有一个已修正的
+ * 小问题（Doc-Code Drift 的问题就是本文件本身此前的版本落后，已在本次
+ * 更新里修正）；Testing 一项是本次唯一还没关闭的 MEDIUM 级别发现——见
+ * 下方「六、Architecture Evolution」新增条目。
  */
 
 // ============================================================
@@ -50,7 +70,7 @@
  */
 
 // ============================================================
-// 三、Next Version（V4.4 候选，尚未开始）
+// 三、Next Version（下一版本候选，尚未开始）
 // ============================================================
 
 /**
@@ -58,9 +78,9 @@
  *
  *   1. Recurring lifecycle 补全：目前只有"完成后自动续期"一种生命周期
  *      事件，没有"暂停/恢复某条 recurring 规则"的能力（见
- *      00_Project_State.gs"下一步"）。如果这个需求变得具体，V4.4 应该
- *      优先做这个，因为它是现有 Engine（21_RecurringEngine.gs）的能力
- *      补全，不涉及新架构。
+ *      00_Project_State.gs"下一步"）。如果这个需求变得具体，应该优先做
+ *      这个，因为它是现有 Engine（21_RecurringEngine.gs）的能力补全，
+ *      不涉及新架构。
  *
  *   2. TaskPriority 缓存表：如果观察到 22_PriorityEngine.computePriorityScore
  *      现算变贵（目前没有观察到），按 ADR-2026-07-06 Consequences 里
@@ -156,4 +176,23 @@
  *     长期方向是这类标准最终应该有轻量的自动化校验，但目前 GAS 环境下
  *     实现成本较高（没有现成的静态分析工具链），暂不作为具体计划，只
  *     记录方向。
+ *
+ *   - 【2026-07-11 新增，来自 00_Architecture_Review.gs Finding C1-1】
+ *     测试覆盖：V4 新增的 12 个文件（含全部 5 个 Domain 纯函数 Engine）
+ *     目前零测试覆盖，只有继承自 Core 项目 V3 的 07/08/09 三个文件带
+ *     手工测试函数。按 UEF（Universal Engineering Framework）Testing
+ *     Standard，Domain Profile 至少需要一个跨模块的 Scenario Test，
+ *     其内部的 Engine Profile 子模块各自需要 Unit/Boundary/Contract
+ *     Test，目前都不存在。优先级顺序见 00_Architecture_Review.gs 该
+ *     Finding 的 Recommendation（先补 5 个纯函数 Engine，尤其是
+ *     22_PriorityEngine 和 26_AnalyticsEngine，成本最低）。这是本项目
+ *     目前唯一还没关闭的 Review 发现，需要 Carson 决定是开一轮专门的
+ *     测试补齐会话，还是先用一条 ADR 记录"已知暂缓，原因和期限"。
+ *
+ *   - 【2026-07-11 新增】本项目现在同时接受两套平台级标准的约束：
+ *     Universal Domain OS Blueprint（管"怎么组织"，见零、Constitution
+ *     开头）和 UEF（管"怎么被设计/评审/交付"，v1.0 于 2026-07-10
+ *     ratify）。两者是平行关系，不互相包含——00_Architecture_Review.gs
+ *     走的是 UEF 的 Review 流程，不改变本项目内部按 Blueprint 组织代码
+ *     的方式。
  */

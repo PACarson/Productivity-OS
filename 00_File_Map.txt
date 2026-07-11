@@ -3,7 +3,14 @@
  * Productivity OS v4.6 — 文件地图
  *
  * 本文件只放两类内容：文件职责 / 模块关系。
- * LAST_UPDATED: 2026-07-06 — V4.6：第五轮外部审计修复（TaskStatistics
+ * LAST_UPDATED: 2026-07-11 — 00_Architecture_Review.gs（UEF v1.0 Domain
+ * Profile Review #1）Finding D3-1 附带发现的第三个实例：「三、Architecture
+ * Layer Map」开头的治理文档计数过期（写于 V4.3，未跟进 2026-07-11 新增的
+ * Known Limitations / Command Reference 两份，以及本次新增的
+ * Architecture Review 本身），本次修正为实际的八份。不改变本节的分层
+ * 结论本身。
+ *
+ * 2026-07-06 — V4.6：第五轮外部审计修复（TaskStatistics
  * 从事件驱动实时投影降级为每日批量重算，见 00_ADR.gs ADR-2026-07-06-005；
  * 另有 Events 表动态表头映射、getTask 单行查找、归档列数一致性等修复，
  * 完整清单见 00_Project_State.gs）。01/02/03/05/13 五个"逐字未改"/共享
@@ -267,8 +274,9 @@
  * 跟上面「二、模块关系」的区别：「二」画的是"谁调用谁"的具体函数级依赖图，
  * 本节画的是每个文件在 Clean Architecture 四层里属于哪一层——这是更粗粒度
  * 的分类，用来配合 00_Project_Constitution.gs「零之四、Dependency Rules」
- * 检查"有没有箭头往上指"。00_ 开头的四份治理文档（Constitution/State/
- * File Map/ADR）以及本次新增的 00_Roadmap.gs 不参与这个分层——它们属于
+ * 检查"有没有箭头往上指"。00_ 开头的治理文档（Constitution/State/
+ * File Map/ADR/Roadmap/Known Limitations/Command Reference/Architecture
+ * Review，共八份）不参与这个分层——它们属于
  * Blueprint 的 Governance 顶层分类，跟"请求怎么被处理"这件事无关。
  *
  * Architecture Layer Map

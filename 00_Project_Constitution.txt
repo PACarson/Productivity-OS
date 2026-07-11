@@ -7,9 +7,19 @@
  * 「这个 OS 具体怎么套用」的记录，不重复定义，避免以后两边措辞不一致（drift）。
  *
  * 新窗口交接时，先贴这份文件 + Core 项目的 00_Project_Constitution.gs +
- * 00_ADR.gs + 00_Roadmap.gs。
+ * 00_ADR.gs + 00_Roadmap.gs + 00_Architecture_Review.gs（后者记录了
+ * 尚未关闭的 Review 发现，尤其是测试覆盖缺口，见该文件「五、待决问题」）。
  *
- * LAST_UPDATED: 2026-07-11 — 文档补充（不改代码，版本号仍为 v4.6）：新增
+ * LAST_UPDATED: 2026-07-11 — 完成 UEF（Universal Engineering Framework）
+ * v1.0 ratify 后本项目第一次正式 Domain Profile Architecture Review，
+ * 完整记录见新增的 00_Architecture_Review.gs。Governance 目录从 7 份
+ * 扩到 8 份，P4 Governance 一节相应补充引用（详见下方 P4）。同时
+ * 00_ADR.gs 补记两条此前只有行内论证、没有正式 ADR 条目的"维持现状"
+ * 决定（ADR-2026-07-11-006/007，见 Review Finding D1-1），
+ * 00_Roadmap.gs 版本头从落后的 v4.4 修正为 v4.6（见 Review Finding
+ * D3-1）。均为文档修正/补记，不改变任何已实现的架构决定本身。
+ *
+ * 2026-07-11 — 文档补充（不改代码，版本号仍为 v4.6）：新增
  * 00_Command_Reference.gs（What——Telegram 指令匹配规则/查询时间窗口/
  * 打分公式/去重规则/归档批处理时间点等"具体数值型"规则）和
  * 00_Known_Limitations.gs（Not Yet——category/priority 不做自然语言
@@ -644,12 +654,14 @@
  *      Project Constitution / Project State / File Map
  *        → 这三份文件（00_ 开头）。
  *      ADR (Optional)
- *        → 00_ADR.gs（V4.1 起本项目开始正式收录 ADR，目前共 5 条：
+ *        → 00_ADR.gs（V4.1 起本项目开始正式收录 ADR，目前共 7 条：
  *          ADR-2026-07-06 Dashboard 架构决策、ADR-2026-07-06-002 Schema
  *          Authority、ADR-2026-07-06-003 Per-User Soft Lock、
  *          ADR-2026-07-06-004 Projection 消费端幂等、ADR-2026-07-06-005
- *          TaskStatistics 降级为每日批量重算，见下方 P7 简述 +
- *          00_ADR.gs 完整版）。
+ *          TaskStatistics 降级为每日批量重算、ADR-2026-07-11-006
+ *          RecurringEngine 复用 IdempotencyManager（补记）、
+ *          ADR-2026-07-11-007 SheetUtils/TemporalParser 裸全局函数维持
+ *          现状（补记），见下方 P7 简述 + 00_ADR.gs 完整版）。
  *      Command & Business Rule Reference（V4.6 文档补充新增）
  *        → 00_Command_Reference.gs——全部 Telegram 指令的匹配规则、
  *          查询时间窗口定义、Priority/Statistics 打分公式、去重与幂等
@@ -663,11 +675,20 @@
  *          语言推断、updateTask() 目前是 Internal API、Weekly/Monthly
  *          Dashboard 与 suggestPriority() 暂未接 Telegram 指令。避免
  *          Review/审计把这些已确认的刻意边界误判成 bug 或遗漏。
+ *      Architecture Review（2026-07-11 新增，UEF v1.0 引入后新增的
+ *      Governance 分类）
+ *        → 00_Architecture_Review.gs——本项目对照 Universal Engineering
+ *          Framework（UEF，管"怎么被设计/评审/交付"，跟本文件开头的
+ *          Universal Domain OS Blueprint 管"怎么组织"是平行关系）跑的
+ *          正式 Domain Profile Architecture Review 记录，与 00_ADR.gs
+ *          的分工：ADR 记录"做了什么决定"，本文件记录"这个项目现在
+ *          是否符合一套外部标准、哪里不符合"。
  *
- *      至此本项目 Governance 目录固定为 7 份文件：Project Constitution
+ *      至此本项目 Governance 目录固定为 8 份文件：Project Constitution
  *      （Why）/ Project State（当前快照）/ ADR（Decision）/ File Map
  *      （Where）/ Command Reference（What）/ Known Limitations（Not Yet）
- *      / Roadmap（Future），每份文件职责单一、不互相重复。
+ *      / Roadmap（Future）/ Architecture Review（Compliance），每份文件
+ *      职责单一、不互相重复。
  *
  *   1. Foundation
  *      Configuration        → 01_SecureConfig.gs（敏感配置）+

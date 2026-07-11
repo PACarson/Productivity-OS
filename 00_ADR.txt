@@ -1,6 +1,6 @@
 /**
  * 00_ADR.gs
- * Productivity OS v4.5 — Architecture Decision Records
+ * Productivity OS v4.6 — Architecture Decision Records
  *
  * 本文件收录本项目"影响后续所有开发判断"的重大架构决策，格式固定为
  * Metadata（V4.3 新增，见下方字段定义） + Context / Decision /
@@ -12,6 +12,18 @@
  * 本文件对应 Universal Domain OS Blueprint「0. Governance → ADR (Optional)」
  * 这一格（00_Project_Constitution.gs P4 之前原本写"暂无"，V4.1 起改为
  * 指向本文件）。
+ *
+ * 【2026-07-11 新增】ADR-2026-07-11-006 / 007——00_Architecture_Review.gs
+ * （UEF v1.0 Domain Profile Review #1）Finding D1-1 的正式记录：两条此前
+ * 已经实现、且论证已经存在（分别在 Constitution 零之四和
+ * 05_SheetUtils.gs 文件头），但没有对应正式 ADR 条目的"维持现状"决定，
+ * 本次补记归档。是补充归档，不是重新做决定，两条决定的内容和实现都不变。
+ * 同时修正本文件头版本号——此前 ADR-2026-07-06-005（V4.6 的决定）已经
+ * 收录在下方正文，但文件头一直没跟着改成 v4.6（Review Finding D3-1
+ * 顺带发现的第二个实例，见该 Finding）。
+ *
+ * 【V4.6 新增】ADR-2026-07-06-005（TaskStatistics 从事件驱动实时投影
+ * 降级为每日批量重算，第五轮外部审计 HIGH RISK 1+4 的正式记录）。
  *
  * 【V4.5 新增】ADR-2026-07-06-004（Projection 消费端必须对重复事件保持
  * 幂等，第四轮外部审计 HIGH RISK 1 的正式记录）。
@@ -478,4 +490,154 @@
  *     它当初的具体应用场景（_bumpStatistics_）已经不存在，但原则本身
  *     对本 OS 未来任何新增的、真正需要同步增量维护的 Read Model 仍然
  *     适用，不能因为这次的问题被绕开就忘记这条原则
+ */
+
+// ============================================================
+// ADR-2026-07-11-006：21_RecurringEngine.gs 复用
+// 09_IdempotencyManager.gs 的幂等去重路径（Dependency Rules 唯一例外，
+// 补记归档）
+// ============================================================
+
+/**
+ * ── Metadata ──────────────────────────────────────────────────────────────
+ *   ADR Number      : ADR-2026-07-11-006
+ *   Status          : Accepted
+ *   Decision Date   : 2026-07-11（本条 ADR 的归档日期——决定本身在 V4.3
+ *                     就已经实现并生效，见 00_Project_Constitution.gs
+ *                     零之四；本条是 00_Architecture_Review.gs Finding
+ *                     D1-1 触发的补记，不是新做一次决定，Decision/
+ *                     Consequences 描述的是当初实际做出、现在仍然生效
+ *                     的那个决定）
+ *   Supersedes      : （无）
+ *   Superseded By   : （无，仍然生效）
+ *   Affected Modules: 21_RecurringEngine.gs, 09_IdempotencyManager.gs
+ *   Related ADR     : （无——这是 Dependency Rules 层面的决定，跟其它
+ *                     几条 ADR 关注的问题维度不同）
+ *   Consequences    : 见下方正文
+ *   Notes           : 本 ADR 是 00_Architecture_Review.gs（UEF v1.0
+ *                     Domain Profile Review #1）Finding D1-1 的正式记录
+ *                     之一——审查发现这个决定虽然论证充分，但只写在
+ *                     Constitution 零之四的行内注释里，没有对应的正式
+ *                     ADR 条目，不满足 UEF Constitution §5.2 对
+ *                     "Won't fix / 维持现状"类决定"必须能引用一条 ADR"
+ *                     的要求。本条只是把已经存在、已经生效的论证正式
+ *                     归档到它该在的地方，不重新审视这个决定本身是否
+ *                     应该改变（UEF 00_Review_Framework.md §6：Review
+ *                     不重新审判已有决定）。
+ *
+ * ── Context ──────────────────────────────────────────────────────────────
+ *
+ * 00_Project_Constitution.gs「零之四、Dependency Rules」把本项目内部
+ * 分成 Presentation → Application → Domain → Infrastructure 四层，规则
+ * 是依赖只能往下指，Domain 层不得依赖 Application 层。
+ * 21_RecurringEngine.gs（Domain 层，负责 recurring 规则/下一次到期日
+ * 计算/续期生命周期）的 spawnNextIfNeeded()——完成一个 recurring 任务后
+ * 自动生成"下一次"实例——需要保证这个"下一次实例"的创建走跟用户手动
+ * 建任务完全一样的幂等去重判断（同一个 identity 判重逻辑），否则如果
+ * 同一个到期事件因为某种原因被处理两次（比如 completeTask 被重复调用），
+ * 会生成两条重复的下一次实例。而幂等去重判断目前只存在于
+ * 09_IdempotencyManager.gs（Application 层）的 createTaskIfNotExists()
+ * 里。
+ *
+ * ── Options Considered ───────────────────────────────────────────────────
+ *
+ * 1. 复用 09_IdempotencyManager.createTaskIfNotExists()——
+ *    21_RecurringEngine.gs 直接调用它，接受"这是本 OS 唯一一处 Domain
+ *    依赖 Application"这个对 Dependency Rules 的例外。
+ * 2. 在 21_RecurringEngine.gs 内部重新实现一遍幂等判重逻辑，保持
+ *    Dependency Rules 零例外。
+ *
+ * ── Decision ──────────────────────────────────────────────────────────────
+ *
+ * 选项 1：复用 09_IdempotencyManager.createTaskIfNotExists()，接受这一处
+ * 有名有姓、边界清楚的例外，并在 00_Project_Constitution.gs 零之四
+ * 「已知例外」明确记录、承诺"不再新增第二个"。
+ *
+ * ── Consequences ──────────────────────────────────────────────────────────
+ *
+ * 正面：
+ *   - "下一次 recurring 实例"和"用户手动建任务"永远走同一套判重逻辑，
+ *     不存在两条判重代码长期演进出行为差异的风险
+ *   - 不需要在 21_RecurringEngine.gs 里维护一份平行的幂等/锁逻辑
+ *
+ * 需要接受的代价：
+ *   - Dependency Rules 从"零例外"变成"一个例外"，本 OS 承诺这个例外
+ *     数量不再增加（见 00_Roadmap.gs「六、Architecture Evolution」）——
+ *     如果未来出现第二个类似需求，应该先考虑能不能调整 Engine 职责边界
+ *     避免它，而不是默认再记一条例外
+ *   - 选项 2（重新实现一遍）本可以保持"零例外"这个更干净的状态，被否决
+ *     的原因是：两套判重逻辑要保持同步演进，长期看比"记录一个例外"风险
+ *     更大——这个权衡在 21_RecurringEngine.gs 的需求没有发生实质变化前，
+ *     应该持续成立
+ */
+
+// ============================================================
+// ADR-2026-07-11-007：05_SheetUtils.gs / 09_TemporalParser.gs
+// 裸全局工具函数维持现状，不包进命名空间（补记归档）
+// ============================================================
+
+/**
+ * ── Metadata ──────────────────────────────────────────────────────────────
+ *   ADR Number      : ADR-2026-07-11-007
+ *   Status          : Accepted
+ *   Decision Date   : 2026-07-11（本条 ADR 的归档日期——这项评估在
+ *                     V4.5 LOW RISK 1 首次做出，V4.6 MEDIUM RISK 3
+ *                     复核后维持同一判断，本条是 00_Architecture_
+ *                     Review.gs Finding D1-1 触发的补记，两轮评估的
+ *                     结论和理由都不变，只是把它从"审计发现记录"补记成
+ *                     正式 ADR）
+ *   Supersedes      : （无）
+ *   Superseded By   : （无，仍然生效——但见下方 Consequences，这是一条
+ *                     "当前判断"，不是"永久判断"）
+ *   Affected Modules: 05_SheetUtils.gs, 09_TemporalParser.gs
+ *   Related ADR     : （无）
+ *   Consequences    : 见下方正文
+ *   Notes           : 本 ADR 是 00_Architecture_Review.gs Finding D1-1
+ *                     的正式记录之一——这项"维持现状"的判断此前两轮
+ *                     （V4.5 LOW RISK 1 / V4.6 MEDIUM RISK 3）都只记录
+ *                     在 00_Project_State.gs 的审计历史和
+ *                     05_SheetUtils.gs 文件头，没有对应的正式 ADR 条目，
+ *                     不满足 UEF Constitution §5.2 对"Won't fix"类
+ *                     disposition"必须能引用一条 ADR"的要求。本条同样
+ *                     只是补记归档，不重新评估这个判断本身。
+ *
+ * ── Context ──────────────────────────────────────────────────────────────
+ *
+ * 05_SheetUtils.gs 和 09_TemporalParser.gs 里有十几个裸全局函数（不包在
+ * 任何 IIFE/命名空间里，比如 getSheet_/getHeaderMap_/parseDueDate_/
+ * round1_/round2_ 等）——这是历史遗留（这两个文件是从 Core 项目"逐字
+ * 未改"继承的共用工具文件，见 00_File_Map.gs Foundation 分类）。GAS 的
+ * 全局命名空间是扁平的：如果本项目未来任何一个文件不小心定义了同名
+ * 函数，会静默覆盖这里的声明，不会报错，只会在运行时出现难以定位的
+ * 业务异常。这个风险在 V4.5 外部审计 LOW RISK 1 被提出，V4.6 MEDIUM
+ * RISK 3 复核时再次确认属实。
+ *
+ * ── Options Considered ───────────────────────────────────────────────────
+ *
+ * 1. 把这十几个函数包进一个命名空间（比如 SheetUtils.getSheet_(...)/
+ *    TemporalParser.parseDueDate_(...)），同步修改项目里几乎所有调用点。
+ * 2. 维持现状，不做这次重构，只记录风险和触发重新评估的条件。
+ *
+ * ── Decision ──────────────────────────────────────────────────────────────
+ *
+ * 选项 2：维持现状。这是"当前阶段"的判断，不是"永久不做"的判断——见
+ * Consequences 里"什么情况下应该重新评估"。
+ *
+ * ── Consequences ──────────────────────────────────────────────────────────
+ *
+ * 正面：
+ *   - 避免了一次牵动项目里几乎所有调用点的大范围重构，这类重构本身就
+ *     有引入新 bug 的风险，尤其是在"这几轮审计的前提是不改架构/不做
+ *     重构"的背景下（V4.5 LOW RISK 1 记录的原话）
+ *
+ * 需要接受的代价（不回避）：
+ *   - 命名冲突风险本身没有消除，只是被判断为"当前发生概率低、一旦发生
+ *     难以快速定位"这类风险，选择继续承担
+ *   - 这个判断已经连续两轮被复核（V4.5→V4.6）而结论不变，如果不设定
+ *     一个会触发"这次真的该做了"的具体条件，容易变成"每次都用同一个
+ *     理由拖延，从来不重新评估"——本条 ADR 正式设定触发条件：(a) 本
+ *     项目新增第三个共用工具文件、且同样需要裸全局函数模式时，或
+ *     (b) 命名冲突真的发生过一次（哪怕只是开发过程中被发现，未流入
+ *     生产）时，无论哪个先发生，都应该重新打开这个决定，不能再套用
+ *     "投入产出不成比例"这个理由不做评估就直接维持现状
  */

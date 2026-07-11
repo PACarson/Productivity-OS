@@ -1,0 +1,378 @@
+/**
+ * 00_Architecture_Review.gs
+ * Productivity OS — Architecture Review #1（UEF v1.0 Domain Profile）
+ *
+ * 目的：Universal Engineering Framework（UEF）v1.0 于 2026-07-10 ratify 后，
+ * 本项目第一次按 UEF 正式流程（00_Review_Framework.md）跑 Architecture
+ * Review——此前 5 轮"外部审计"走的是本项目自己的 ad hoc 流程，跟 UEF
+ * Domain Profile 的 checklist 不是同一套东西，UEF Constitution §6.3
+ * 要求每个项目在其 Release Gate 之前至少有一次匹配 Profile 的正式 Review，
+ * 本项目已经在生产环境跑了 V4~V4.6，属于"补跑"（retroactive），跟
+ * UEF Review History 里 Investment OS 2026-07-10 那条的性质一样。
+ *
+ * 本文件是本项目 Governance 层新增的第 8 份文件（Constitution/State/
+ * File Map/ADR/Roadmap/Known Limitations/Command Reference/本文件）。
+ *
+ * LAST_UPDATED: 2026-07-11 — 首次创建。
+ */
+
+// ============================================================
+// 一、Review Request（按 UEF Review Templates §1）
+// ============================================================
+
+/**
+ * Scope:            Productivity OS（整个项目，21 个可执行文件 + 7 份既有
+ *                    治理文档）
+ * Review Profile:   Domain
+ *                    （判定依据：UEF 01_Review_Profiles.md §2 选择测试——
+ *                    本项目"是一个完整的 Domain OS 整体"，命中第5问，选
+ *                    Domain，不是 Engine——虽然本项目内部有 5 个 Engine
+ *                    Profile 的纯函数模块，但那是"项目内部子模块"的归类，
+ *                    不改变"项目整体"这次 Review 的 Profile）
+ * Minimum checklist: Separation of Concerns（A1）/ Layering（A3）/
+ *                    Governance（D1）/ Testing（C1）/ Doc-Code Drift（D3）
+ *                    （UEF 01_Review_Profiles.md §3.2 Domain Profile）
+ * Feeds gate:       Testing Gate（补跑——本项目已经部署到生产环境跑了
+ *                    V4~V4.6，这次是"回溯性"对照检查，不是新功能走 Gate
+ *                    流程，跟 UEF 06_Review_History.md 里 Investment OS
+ *                    2026-07-10 那次 Review 性质相同）
+ * Trigger:          UEF v1.0 ratify（2026-07-10）后，本项目作为 Universal
+ *                    Domain OS Blueprint 的首个完整落地样本，补齐这次
+ *                    "正式对齐新流程标准"的 Review
+ * Prior review:     无（本项目此前的 5 轮审计不是 UEF Profile-based
+ *                    Review，见文件头说明；这是本项目在
+ *                    02_Architecture_Review_Standard/06_Review_History.md
+ *                    里的第一条记录）
+ * Requested by:     Carson
+ * Reviewer:         Claude（single-project review——UEF 00_Review_Framework.md
+ *                    §4 Roles 对这种情况的要求：不能凭"写过这段代码的印象"
+ *                    判断，每一项都要对照本次实际读到的代码核实，而不是
+ *                    对照既有治理文档的自我描述）
+ * Date:             2026-07-11
+ */
+
+// ============================================================
+// 一之二、本项目声明的加深 Checklist（UEF 01_Review_Profiles.md §4：
+// "A project can require more, never less"）
+// ============================================================
+
+/**
+ * 【2026-07-11 追加】Domain Profile 的最低 checklist（A1/A3/D1/C1/D3）
+ * 不含 Event Flow / Extensibility / Scalability / AI Readiness——这几项
+ * 对一个"只管内部数据怎么摆"的 Domain OS 不是必答题，但对本项目不是
+ * 这样：本项目明确希望自己的数据未来能被 Personal AI Core 消费
+ * （见 00_Roadmap.gs 长期方向），且已经有 recurring/priority 这类"会
+ * 越长越复杂"的功能演进历史。因此本项目正式声明比最低要求更深的
+ * 子集，往后每次 Review 都必须覆盖：
+ *
+ *   - A5 Event Flow（每个 Task 生命周期事件是否有清楚定义、是否优雅降级）
+ *   - B1 Extensibility（新功能能否不改现有 Engine 边界就加进来）
+ *   - B2 Scalability（Sheet 行数增长/GAS 执行时间上限相关的具体阈值）
+ *   - C3 AI Readiness（本项目数据未来被 Personal AI Core 读取时是否
+ *     需要重新设计——见 02_Review_Checklist_Library.md C3 的 Applies to
+ *     说明，本次一并扩展为明确包含"未来有具名 AI 消费者的 Domain OS"
+ *     这一种情况）
+ *
+ * 这条声明本身不需要 ADR（UEF §4："A project can require more, never
+ * less"，加深不是缩窄，不算需要走 Decision Matrix 的那类决定），但作为
+ * 一个会长期影响"以后每次 Review 该测什么"的事实，记录在这里，跟
+ * Profile 选择放在同一份文件里，避免下次 Review 的人重新决定一遍。
+ */
+
+// ============================================================
+// 二、Checklist Execution（Domain Profile 最低子集，逐项 Pass/Fail/N-A）
+// ============================================================
+
+/**
+ * ── A1. Separation of Concerns ──────────────────────────────────────────
+ * [Pass] 逐条核实（不是复述 00_File_Map.gs 的自我描述，是直接读代码）：
+ *   - 22/23/24/25_Engine.gs 四个 Domain 层纯函数 Engine：grep 全文件搜索
+ *     getSheet_/getHeaderMap_/EventBus\./SpreadsheetApp\.，零命中——确认
+ *     真的不摸 Sheet/Events，不是文档说了算。
+ *   - 26_AnalyticsEngine.gs：唯一命中 EventBus.getAllEvents() 的地方是
+ *     replayCompletionTrend_()，且该函数文件头 Engine Contract 块明确
+ *     标注"Replay Events: YES（本 OS 唯一允许重放 Events 的函数）"，
+ *     不在任何 Telegram 指令路径上（06_TaskIntentParser.gs 指令列表核实
+ *     确认不存在对应路由）——这是唯一例外，且例外本身有名有姓、边界清楚，
+ *     符合"一个模块的职责能用一句话说清楚"的要求。
+ *   - 06_TaskIntentParser.gs：grep 命中的一处 getSheet_/getHeaderMap_ 字样
+ *     是文件头注释里描述"V4 之前的架构违规"这段历史，本身不是当前代码在
+ *     调用——核实当前代码路径（_getActiveTasksForDisplay_ 等）确认已经
+ *     全部改经 12_TaskQueryEngine.gs，没有 drift。
+ *
+ * ── A3. Layering ─────────────────────────────────────────────────────────
+ * [Pass] 00_File_Map.gs「三、Architecture Layer Map」宣称 21 个文件each
+ *   恰好归类到 Presentation/Application/Domain/Infrastructure 四层之一；
+ *   对照「二、模块关系」列出的具体函数级调用关系逐条核对，没有发现箭头
+ *   往上指的未记录案例。唯一一处跨层依赖
+ *   （21_RecurringEngine.gs → 09_IdempotencyManager.gs，Domain→Application）
+ *   在 File Map 和 Constitution 零之四都有一致、清楚的记录——但这处例外
+ *   牵出一个 Governance 层面的问题，见下方 Finding D1-1（例外本身没有
+ *   越界，越界的是"这个决定该有的正式记录方式"）。
+ *
+ * ── D1. Governance ───────────────────────────────────────────────────────
+ * [Fail — 见 Finding D1-1] ADR log 存在且质量高（00_ADR.gs 五条正式 ADR，
+ *   每条都有 Metadata/Context/Decision/Consequences，且 Consequences 部分
+ *   老实列了代价，不是只写好处——这部分是真正的 Pass）。Project State
+ *   反映真实现状（核对 V4.6 changelog 与实际代码一致，见下方 D3 checklist
+ *   的交叉核实）。唯一的 Fail 点：有两处"决定不改"的架构判断符合 UEF 自己
+ *   定义的 ADR 触发标准，却没有被记录成正式 ADR 条目——见 Finding D1-1。
+ *
+ * ── C1. Testing ──────────────────────────────────────────────────────────
+ * [Fail — 见 Finding C1-1] 全项目 21 个可执行文件里，只有 07/08/09 三个
+ *   文件带手工测试函数（且这三个是"逐字未改"继承自 Core 项目的 V3 遗留
+ *   代码，不是本项目 V4 新增部分）。V4 新增的全部 12 个文件（10/11/12/13/
+ *   15/20/21/22/23/24/25/26）——包括本项目最核心的 5 个纯函数 Domain
+ *   Engine 和整条 Application 层写入/查询路径——零测试覆盖。
+ *
+ * ── D3. Doc/Code Drift ───────────────────────────────────────────────────
+ * [Fail — 见 Finding D3-1，范围仅限 00_Roadmap.gs] 交叉核实过的其余文档
+ *   （00_Project_State.gs / 00_File_Map.gs / 00_Known_Limitations.gs /
+ *   00_Command_Reference.gs / 00_Project_Constitution.gs）版本号、改动
+ *   描述均与实际代码一致——这几份是真正的 Pass，说明本项目治理文档整体
+ *   维护得不错，Drift 不是普遍问题。唯一的例外是 00_Roadmap.gs 本身，
+ *   见 Finding D3-1。
+ */
+
+// ============================================================
+// 三、Findings（按 UEF Review Templates §2，每条 Fail 一条）
+// ============================================================
+
+// ------------------------------------------------------------
+// Finding C1-1
+// ------------------------------------------------------------
+
+/**
+ * ### Finding: V4 原生的 12 个文件（含全部 5 个 Domain 纯函数 Engine）
+ *     没有任何形式的测试覆盖
+ *
+ * File / Module:  10_ProjectionEngine.gs, 11_ProjectionRebuilder.gs（部分——
+ *                 verifyProjection()/_verifyActiveTasksConsistency_() 是
+ *                 一致性校验，但 rebuild 系列函数本身无测试）,
+ *                 12_TaskQueryEngine.gs, 13_ActiveTasksEngine.gs,
+ *                 15_Setup.gs, 20_TaskEngine.gs, 21_RecurringEngine.gs,
+ *                 22_PriorityEngine.gs, 23_SearchEngine.gs,
+ *                 24_ViewEngine.gs, 25_DashboardEngine.gs,
+ *                 26_AnalyticsEngine.gs
+ * Function:       上述文件的全部 public API（如
+ *                 PriorityEngine.computePriorityScore/computeUrgencyScore/
+ *                 suggestPriority，TaskQueryEngine.getTask/getTasks/...，
+ *                 TaskEngine.createTask/updateTask/completeTask/cancelTask
+ *                 等）
+ * Checklist item: C1 Testing
+ *
+ * Mechanism:
+ * 只有 07_IdentityEngine.gs / 08_DeduplicationEngine.gs /
+ * 09_IdempotencyManager.gs 带手工测试函数（testIdentity /
+ * testDuplicateTask / testDuplicateInventory / testWebhookRetry /
+ * testDifferentChatsDontBlock / testConcurrentExecution）——这三个文件
+ * 都是"逐字未改"继承自 Core 项目的 V3 遗留代码（见 00_File_Map.gs
+ * Foundation 分类），本项目自己在 V4 新增的 12 个文件一个测试函数都没有。
+ * 15_Setup.runDiagnostics() 是目前唯一会执行到这些模块的验证路径，但它
+ * 只走 happy path（try/catch 只是记日志、不断言预期值），且会在生产
+ * Spreadsheet 里真实创建一条任务（标题"诊断测试任务"，notes 里标
+ * DIAGNOSTIC_TEST_TEMP）——用真实数据做手工冒烟测试，不是隔离的测试用例。
+ *
+ * Evidence:
+ * 对 21 个 .gs 文件分两轮 grep：一轮找 `function test`（未加锚点，覆盖
+ * IIFE 内部缩进的函数定义），一轮找 verify/check/diagnos/validate 命名——
+ * 命中只在 07/08/09（test 系列）和 11（verify 系列，但只覆盖一致性校验，
+ * 不覆盖 rebuild 逻辑本身）。另外直接读取 22_PriorityEngine.gs 和
+ * 26_AnalyticsEngine.gs 全文——两者都是评分/计算类纯函数（UEF Testing
+ * Standard §1.7 Boundary Test 明确要求"任何做归一化/打分/除法的 Engine
+ * 函数"要有边界测试），确认代码本身实现质量不差（26 的三处除法都有
+ * `total > 0 ? ... : 0` 式的零除防护，22 的逾期天数有 clamp(30) 上限），
+ * 但这些防护本身完全没有测试锁定——防护存在但没有回归测试，意味着未来
+ * 任何一次改动都可能在无声无息中撤掉这层防护而不被发现。
+ *
+ * Severity:          MEDIUM
+ *   Likelihood:      Foreseeable（不是"现在就在发生"的錯誤，而是"这个
+ *                    项目会继续按 Roadmap 演进"这件事本身可预见会带来的
+ *                    后果——5 轮外部审计期间已经在这一层修过好几个真实
+ *                    bug（TaskStatistics 漂移、归档排重、getTask 全表
+ *                    扫描），没有一次是靠测试先捕捉到的，全部是外部审计
+ *                    人工读代码发现，说明"未来某次改动引入类似问题、且
+ *                    没有测试拦截"不是假设性风险）
+ *   Impact:          Medium（错误的优先级排序/视图过滤/统计数字会被静默
+ *                    地算错，不会崩溃、不会丢数据，但会让用户看到错误的
+ *                    结果而不自知——符合 Risk Matrix Impact:Medium 定义
+ *                    "a subset of operations produce wrong or degraded
+ *                    results"，够不上 High 的"硬失败/数据丢失/安全暴露"）
+ *
+ * Disposition:       Confirmed
+ *   （本次直接读代码核实，不是照抄某份既有文档的自我描述）
+ *
+ * Recommendation:
+ * 这是实现工作，不属于本次 Review 本身范围（UEF 00_Review_Framework.md
+ * §6："A review is not a rewrite"），按优先级供下一次专门的测试补齐会话
+ * 参考：
+ *   1. 先做 5 个 Domain 纯函数 Engine（22-26）——UEF Testing Standard §3
+ *      "standalone logic reproduction" 对纯函数最省成本：不需要 mock
+ *      Sheet/Event，直接给定输入断言输出。22_PriorityEngine 优先（有
+ *      具体边界：无 due_date/临界天数/逾期 clamp/recurring 折扣/最终
+ *      Math.min(100) 五类边界），其次 26_AnalyticsEngine（三处已加固的
+ *      零除防护，正该补一个回归测试把"防护存在"这件事锁死，而不是留着
+ *      "现在没事"）。
+ *   2. 再做 12_TaskQueryEngine 的 Contract Test（全项目唯一的查询入口，
+ *      被依赖面最广）。
+ *   3. Application 层（20_TaskEngine/13_ActiveTasksEngine/
+ *      09_IdempotencyManager 的新增部分）由于涉及真实 Sheet/Event I/O，
+ *      按 Testing Standard §3 需要"结构化的手工验证流程"而非
+ *      standalone reproduction，成本更高，可以晚一步。
+ *   4. 这份清单本身建议搬进 00_Roadmap.gs（本次 Review 已经代为补上，
+ *      见该文件本次更新）。
+ *
+ * Gate 影响：
+ * 按 UEF 00_Review_Framework.md §9，MEDIUM finding 会 block Testing Gate，
+ * 除非有 ADR 明确接受延后。本次 Review 没有替 Carson 做"接受延后"这个
+ * 产品判断——是选择现在开一轮测试补齐会话，还是先用 ADR 记录"已知暂缓，
+ * 原因和期限"，由 Carson 决定，见本文件末尾「五、待决问题」。
+ */
+
+// ------------------------------------------------------------
+// Finding D3-1
+// ------------------------------------------------------------
+
+/**
+ * ### Finding: 00_Roadmap.gs 的版本头与「当前版本」章节停留在 V4.4，
+ *     落后实际状态两个版本
+ *
+ * File / Module:  00_Roadmap.gs
+ * Function:       文件头版本号声明 + 「二、Current Version」章节
+ * Checklist item: D3 Doc/Code Drift
+ *
+ * Mechanism:
+ * 00_Roadmap.gs 文件头写"Productivity OS v4.4"，「二、Current Version」
+ * 章节把 V4.4（第三轮外部审计修复）描述成"本 OS 现状"，其中包括一句
+ * "治理文档齐备（Constitution/State/File Map/ADR/Roadmap 五份）"。但
+ * 00_Project_State.gs 的文件头写"v4.6"，且记录了 V4.5（第四轮审计：
+ * Gate 等待时间/Projection 幂等/归档有界扫描/SecureConfig 缓存/
+ * SYSTEM_BUSY 错误细分）和 V4.6（第五轮审计：TaskStatistics 降级为
+ * 每日批量重算，ADR-2026-07-06-005）两轮完整的后续变更，Roadmap 完全
+ * 没有反映这两轮。另外 00_Project_Constitution.gs 2026-07-11 的
+ * changelog 记录了新增 00_Command_Reference.gs 和
+ * 00_Known_Limitations.gs 两份治理文档，实际治理文档数量现在是七份，
+ * Roadmap 里"五份"这个数字也过期了。Roadmap 文件头自己写的维护规则是
+ * "快照，每次更新覆盖旧内容，不是日志"——这次核实到的落后正是这条
+ * 自定规则本身没有被遵守，不是一个抽象的"文档可能不准"的泛泛担忧。
+ *
+ * Evidence:
+ * 直接对照 00_Roadmap.gs 第 3 行、第 15-27 行 与 00_Project_State.gs
+ * 第 3 行及其 V4.5/V4.6 完整记录，以及 00_Project_Constitution.gs 文件头
+ * 2026-07-11 changelog 条目。补记两条新 ADR（见 Finding D1-1）时发现
+ * 同一类 drift 的第二个实例：00_ADR.gs 文件头写"v4.5"，但文件内容本身
+ * 已经收录 ADR-2026-07-06-005（V4.6 的架构决定），头部版本号没有跟着
+ * 内容一起更新。第三个实例：00_File_Map.gs「三、Architecture Layer Map」
+ * 开头说"00_ 开头的四份治理文档（Constitution/State/File Map/ADR）以及
+ * 本次新增的 00_Roadmap.gs 不参与这个分层"——这句话写于 V4.3，此后
+ * 2026-07-11 新增的 00_Known_Limitations.gs / 00_Command_Reference.gs
+ * 两份治理文档没有被补进这句话。三个实例都已一并修正，不算三条独立
+ * Finding，是同一个"版本头/计数类元数据容易落后于内容"模式的三次出现，
+ * 说明这不是 Roadmap 一个文件的孤立问题。
+ *
+ * Severity:          MEDIUM
+ *   Likelihood:      Routine（现在就是这个状态，不是理论风险）
+ *   Impact:          Low（不影响运行中的代码；影响的是未来交接/规划——
+ *                    按本项目自己的交接约定"新窗口先贴 Constitution +
+ *                    ADR + Roadmap"，一个只看 Roadmap 的读者会误以为
+ *                    TaskStatistics 相关工作还没做，可能重新提出已经
+ *                    做过的方案）
+ *
+ * Disposition:       Confirmed
+ *
+ * Recommendation:
+ * 本次 Review 已经直接修正（见本次 00_Roadmap.gs 和 00_ADR.gs 文件头
+ * 更新），属于纯文档修正，不涉及重新论证任何架构决定本身（UEF
+ * 00_Review_Framework.md §6：Review 不重新审判已有 ADR 的决定，只核对
+ * 实现是否跟决定一致——这里核对的是"Roadmap/ADR 文件头版本号描述"是否
+ * 跟 Project State 记录的实际历史一致）。
+ */
+
+// ------------------------------------------------------------
+// Finding D1-1
+// ------------------------------------------------------------
+
+/**
+ * ### Finding: 两处"维持现状/不改"的架构决定符合 UEF 自己定义的 ADR
+ *     触发标准，但只以行内注释形式记录，没有正式 ADR 条目
+ *
+ * File / Module:  00_Project_Constitution.gs「零之四、Dependency Rules」
+ *                 已知例外（21_RecurringEngine.gs → 09_IdempotencyManager.gs）；
+ *                 05_SheetUtils.gs 文件头（裸全局函数命名冲突风险，V4.5
+ *                 LOW RISK 1 / V4.6 MEDIUM RISK 3 两轮评估后维持不变）
+ * Function:       N/A（这是治理文档归档位置问题，不是某个函数的行为问题）
+ * Checklist item: D1 Governance
+ *
+ * Mechanism:
+ * 两处决定本身论证质量不差——都清楚写了"考虑过的替代方案"和"为什么选
+ * 现在这个"（RecurringEngine 例外：重新实现一遍幂等判重 vs 复用现有路径，
+ * 选了复用；裸全局函数：包进命名空间需要动十几个函数+项目里几乎所有
+ * 调用点 vs 维持现状，两轮评估后都选维持现状）。但两者都只是 Constitution
+ * 或文件头里的一段叙述性注释，没有对应的 00_ADR.gs 正式条目。
+ * 按 UEF 01_Architecture_Design_Standard.md §6："跨 Blueprint 层边界的
+ * 新依赖是一个架构决定，要走 Decision Matrix"——RecurringEngine 例外
+ * 正是跨了 Domain→Application 这条边界。按 §8 的 ADR 触发标准（"不易
+ * 撤销""存在过认真考虑过的替代方案且被否决""未来的人会问为什么这样做"），
+ * 两处都至少命中后两条。按 UEF Constitution §5.2，"Won't fix" 这个
+ * disposition 要求"必须引用对应 ADR"——目前两处都没有 ADR 可引用。
+ *
+ * Evidence:
+ * grep 00_ADR.gs 全文搜索"RecurringEngine"和裸全局函数相关字样（如
+ * "裸全局""命名冲突"），零命中——确认这两处决定确实不在 ADR 文件里，
+ * 只在 Constitution 零之四和 05_SheetUtils.gs 文件头。
+ *
+ * Severity:          LOW
+ *   Likelihood:      Foreseeable（只有当有人专门核对"00_ADR.gs 这一份
+ *                    文件"来确认决定清单时才会踩到——本次 Review 过程中
+ *                    确实发生了一次：一开始 grep ADR 文件没找到，是后来
+ *                    去读 Constitution/文件头才确认原来早有论证，不是
+ *                    真的遗漏了推理，只是推理没放在预期的位置）
+ *   Impact:          Low（推理内容本身没有缺失，只是没有归档到"预期该
+ *                    找到它的地方"，不影响任何运行时行为）
+ *
+ * Disposition:       Confirmed
+ *
+ * Recommendation:
+ * 补记两条正式 ADR（ADR-2026-07-11-006 / 007），明确标注"这是对已经
+ * 做出且已经实现的决定做补充归档，不是重新做一次决定、也不是重新论证
+ * 是否应该这样"——本次 Review 已经代为起草并加入 00_ADR.gs（见本次
+ * 更新），沿用现有 5 条 ADR 一致的 Metadata/Context/Decision/
+ * Consequences 结构。
+ */
+
+// ============================================================
+// 四、Review Summary（按 UEF Review Templates §4，供
+//     Universal Engineering Framework 项目里的
+//     02_Architecture_Review_Standard/06_Review_History.md 收录用）
+// ============================================================
+
+/**
+ * ### 2026-07-11 — Productivity OS — 全项目（Profile: Domain）
+ * Reviewer:      Claude（single-project review，逐项对照实际代码核实）
+ * Gate feeding:  Testing Gate（补跑——项目已在生产环境运行 V4~V4.6）
+ * Findings:      0 HIGH, 2 MEDIUM, 1 LOW
+ * Dispositions:  3 confirmed（1 项 MEDIUM——测试覆盖缺口——待 Carson 决定
+ *                是开专门的测试补齐会话还是先用 ADR 记录延后；另 1 项
+ *                MEDIUM + 1 项 LOW 本次 Review 已直接修正/补记，不需要
+ *                额外的实现工作）
+ * Notable:       两个后续可能对其它 Domain OS 也适用的观察——(1) 一个
+ *                项目可以在"Layering/Separation of Concerns"上做得很干净，
+ *                同时在"Testing"上几乎空白，两者是完全独立的健康度轴，
+ *                不能因为架构分层做得好就默认测试也补齐了；(2)"决定维持
+ *                现状"的论证如果只写在受影响文件的文件头/Constitution
+ *                里而不落一条正式 ADR，会在"专门核对 ADR 清单"这个场景
+ *                下显得像是遗漏——即使论证本身完全没有缺失。
+ * Full record:   本文件（00_Architecture_Review.gs），Productivity OS
+ *                项目自己的 Governance 层
+ */
+
+// ============================================================
+// 五、待决问题（需要 Carson 决定，本次 Review 没有单方面替他决定）
+// ============================================================
+
+/**
+ * 1. Finding C1-1（测试覆盖缺口，MEDIUM）：是现在就开一轮专门的测试补齐
+ *    会话（按上方 Recommendation 的优先级顺序），还是先接受用一条 ADR
+ *    记录"已知暂缓，原因是 XXX，暂缓到 YYY"？两种都是合理选择，取决于
+ *    接下来的时间/优先级安排，不该由我单方面替 Carson 决定。
+ */
