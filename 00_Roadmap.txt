@@ -195,4 +195,25 @@
  *     ratify）。两者是平行关系，不互相包含——00_Architecture_Review.gs
  *     走的是 UEF 的 Review 流程，不改变本项目内部按 Blueprint 组织代码
  *     的方式。
+ *
+ *   - 【2026-07-11 新增，来自 00_Architecture_Review.gs Review #2
+ *     Finding B2-1】ActiveTasks 表被正确维护但从未被任何查询路径实际
+ *     读取——getTodayTasks/getTomorrowTasks/getWeekTasks/getMonthTasks/
+ *     getUpcomingTasks/getOverdueTasks/getPriorityTasks 这几个只关心
+ *     非终态任务的查询，目前统一走 _readAllTasks_() 全表扫描 Tasks
+ *     （只增不减，只会随使用年限单调变大）再内存过滤，而不是直接读
+ *     专门为此设计的 ActiveTasks。下次动这块代码时，建议把上述几个函数
+ *     切换成读 ActiveTasks（getRecurringTasks/getCancelledTasks/
+ *     getArchivedTasksInline/getStatistics/searchTasks 因为需要终态或
+ *     全量历史数据，不受影响，继续读 Tasks）。当前规模下不影响使用，
+ *     不紧急，但值得在下次碰这几个函数时顺手做。
+ *
+ *   - 【2026-07-11 新增，来自 00_Architecture_Review.gs Review #2
+ *     Finding C3-1】25_DashboardEngine.gs 的 build() 返回纯文本字符串
+ *     （面向 Telegram 人眼阅读），不是结构化数据。本项目已声明未来希望
+ *     这份数据给 Personal AI Core 消费（见 00_Architecture_Review.gs
+ *     「一之二」），届时需要把 DashboardEngine 内部已经存在的结构化中间
+ *     态（来自 24_ViewEngine.gs 的返回值）暴露出来，而不是重新解析
+ *     格式化文本。暂不需要现在动手——Personal AI Core 真正要接入时再做，
+ *     那时候需求形状会更准确。
  */

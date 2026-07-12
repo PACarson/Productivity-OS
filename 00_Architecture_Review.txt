@@ -376,3 +376,142 @@
  *    记录"已知暂缓，原因是 XXX，暂缓到 YYY"？两种都是合理选择，取决于
  *    接下来的时间/优先级安排，不该由我单方面替 Carson 决定。
  */
+
+// ============================================================
+// 六、Review #2（2026-07-11）——项目级增强检查项
+// Scope: A5 Event Flow / B1 Extensibility / B2 Scalability / C3 AI
+// Readiness（一之二声明的加深子集，Domain 最低要求 A1/A3/D1/C1/D3 已在
+// Review #1 覆盖，不重复跑）
+// ============================================================
+
+/**
+ * ### Executive Summary
+ *
+ * 本次只跑「一之二」声明的四项加深 checklist，逐项直接读代码找证据，
+ * 不假设、不套用经验判断。结论：Event Flow（A5）和 Extensibility（B1）
+ * 两项全部通过，证据扎实；Scalability（B2）和 AI Readiness（C3）各有
+ * 一条问题，均不影响系统当前正常运行，都是"会随时间累积、值得在下一次
+ * 碰这块代码时顺手解决"的级别，不是紧急问题。**No HIGH Issues Found.**
+ * 已有 ADR/Constitution/Governance 明确决定的设计（比如 Dashboard 不落盘
+ * 的 ADR-2026-07-06、TaskStatistics 每日批量重算的 ADR-2026-07-06-005）
+ * 均未重新拿出来讨论——这次两条新发现都是此前从未被记录过的空白点，
+ * 不是对已有决定的重新审判。
+ *
+ * ### Findings
+ *
+ * HIGH: 无。**No HIGH Issues Found.**
+ *
+ * MEDIUM:
+ *   - [B2-1] ActiveTasks（专门为"非终态工作台"设计、且被正确维护的表）
+ *     在全部查询路径上都没有被实际读取过；9 个共享同一个全表扫描模式的
+ *     查询函数里，只有 1 个（getStatistics）写了"这个数据量级还跑得动"
+ *     的假设，且这条假设本身没有实测数据支撑，也没有设定"什么情况下要
+ *     重新评估"的触发条件。
+ *
+ * LOW:
+ *   - [C3-1] DashboardEngine.build() 返回纯文本字符串（专为 Telegram 人眼
+ *     阅读排版），不是结构化数据；本项目已经明确希望这份数据未来给
+ *     Personal AI Core 消费（见「一之二」新增的 C3 适用范围扩展），但
+ *     Dashboard 这条路径目前的输出形态需要被重新解析文本才能结构化使用。
+ *
+ * ### Evidence
+ *
+ * [B2-1]:
+ *   - 00_Project_Constitution.gs 零之二：ActiveTasks 被明确定义为"工作台，
+ *     只有非终态任务"，且 CQRS 写入链路显示它由 Projection 同步增量维护
+ *     （10_ProjectionEngine.gs 的 projectTaskCreated_/projectTaskUpdated_/
+ *     projectTaskCompleted_/projectTaskCancelled_ 四个函数都有 ActiveTasks
+ *     的 upsert 或 delete 调用，逐条读代码核实过，维护逻辑本身是对的）。
+ *   - 12_TaskQueryEngine.gs 文件头 Engine Contract 明确写"Reads: Tasks
+ *     Sheet（唯一直接读取方...)"——不含 ActiveTasks。
+ *   - 12_TaskQueryEngine.gs 第 105-109 行 _readAllTasks_()：唯一的数据入口，
+ *     读的是 TASKS_SHEET 常量（= 'Tasks'），不是 ActiveTasks。
+ *   - getTodayTasks/getTomorrowTasks/getWeekTasks/getMonthTasks/
+ *     getUpcomingTasks/getOverdueTasks/getRecurringTasks/
+ *     getCancelledTasks/getArchivedTasksInline/getPriorityTasks/
+ *     searchTasks/getDashboard（12 个函数里的 12 个——即除 getStatistics
+ *     外全部走视图/展示类查询的函数）全部经由 _readAllTasks_() 读全量
+ *     Tasks，再交给 24_ViewEngine.gs 用 _isNonTerminal_() 在内存里过滤掉
+ *     DONE/CANCELLED——用全表扫描 + 内存过滤，达成了跟直接读 ActiveTasks
+ *     一样的正确结果，但付出了更高的 I/O 成本。
+ *   - 13_ActiveTasksEngine.gs 文件头：归档只对 Tasks 打 archived=true 标记，
+ *     "不物理删除"——确认 Tasks 表只会随时间单调增长，没有任何机制让它
+ *     变小。
+ *   - 12_TaskQueryEngine.gs 第 264-271 行 getStatistics() 注释：唯一一处
+ *     写明了规模假设——"数据量在 GAS 场景下（个人任务系统，通常几百到
+ *     几千行）现算完全够快"——这是一句断言，不是一次实测记录，且只覆盖
+ *     getStatistics 这一个函数，其余 8 个共享同一扫描模式的函数没有任何
+ *     等价说明。
+ *   - 网络查证（2026-07 数据）：GAS 单次执行硬上限 6 分钟，批量
+ *     getRange().getValues() 单次调用处理数万个 cell 量级通常在几秒内
+ *     完成——这意味着即使数据量涨到远超"几百到几千行"，大概率也不会
+ *     真的撞到 6 分钟上限，风险的性质是"效率随时间线性变差、违背
+ *     ActiveTasks 表本来的设计目的"，不是"某天会突然崩溃"。
+ *
+ * [C3-1]:
+ *   - 25_DashboardEngine.gs 文件头 Engine Contract，Forbidden Dependencies
+ *     字段原文："返回值是纯文本字符串，不是 Telegram 消息格式，呼应
+ *     ADR-2026-07-06 关于'不知道 Telegram 是什么'的正式条款"。
+ *   - 00_ADR.gs ADR-2026-07-06 的实际决定范围核实过：只回答了"Dashboard
+ *     该不该落盘（该不该做成 Projection）"，没有涉及"build() 的返回值
+ *     该是字符串还是结构化对象"这个问题——这是两个不同的设计问题被放在
+ *     同一条 Constitution 引用下，本次 Finding 只针对后一个、此前从未被
+ *     讨论过的问题，不重新审判 ADR-2026-07-06 本身"不落盘"这个结论。
+ *   - 25_DashboardEngine.gs 内部实现：buildTodayDashboard 等函数在拼字符
+ *     串之前，实际上是先调用 24_ViewEngine.gs 拿到结构化的 task 数组
+ *     （today()/tomorrow()/overdue() 等的返回值本身就是结构化的），
+ *     只是最后一步把它们循环拼接成人类可读文本——结构化数据在函数内部
+ *     是存在过的中间态，不是从来不存在。
+ *
+ * ### Recommendation
+ *
+ * [B2-1]:
+ *   WHY：ActiveTasks 已经被正确维护，只是没被读——补上"让高频视图查询读
+ *   ActiveTasks 而不是 Tasks"这一步，不需要新建任何东西，是把已经花了
+ *   成本维护的表用起来。
+ *   Trade-off：getTodayTasks 这类只关心非终态任务的查询改读 ActiveTasks
+ *   后，代码分叉成两类数据源（ActiveTasks 给非终态类查询，Tasks 给
+ *   Recurring/Cancelled/Archived(inline)/Statistics 这类需要看终态或全量
+ *   历史的查询），比现在"所有查询统一读一张表"要多一点分支复杂度——但
+ *   这个分叉本身反映的是两类查询真实不同的数据需求，不是无意义的复杂化，
+ *   符合"只在有真实收益时增加复杂度"这条本项目一贯坚持的原则。
+ *   Expected Benefit：高频查询（today/tomorrow/priority 等大概率是日常
+ *   使用里调用最频繁的指令）的 I/O 成本从"正比于全部历史任务数"降到
+ *   "正比于当前工作台任务数"，且不会随使用年限增长而变差——这正是
+ *   ActiveTasks 当初被设计出来的理由，现在补上让它真正生效。
+ *
+ * [C3-1]:
+ *   WHY：结构化中间态已经在 DashboardEngine 内部存在，暴露它的成本很低
+ *   （不需要重新设计，只需要让 build() 除了拼好的文本，也把背后的结构化
+ *   数据一并返回或者提供一个单独的入口）。
+ *   Trade-off：如果现在就做，是在没有实际调用方（Personal AI Core 目前
+ *   不存在）的情况下先做一次接口设计，有"猜错未来需求形状"的风险——
+ *   这也是这条只定为 LOW、且本次不建议立刻动手的原因，等真的开始接
+ *   Personal AI Core 时再做，形状会更准。
+ *   Expected Benefit：真正需要的时候，改动范围小（暴露既有中间态，不是
+ *   重新计算一遍），且不影响 06_TaskIntentParser.gs 现在依赖的文本格式，
+ *   两者可以并存。
+ *
+ * ### Follow-up Actions
+ *
+ *   1. [B2-1，MEDIUM] 建议下次动 Query/View 这块代码时顺手做：把
+ *      getTodayTasks/getTomorrowTasks/getWeekTasks/getMonthTasks/
+ *      getUpcomingTasks/getOverdueTasks/getPriorityTasks 这几个只关心
+ *      非终态任务的查询，数据源从 _readAllTasks_(Tasks) 切到读
+ *      ActiveTasks；getRecurringTasks/getCancelledTasks/
+ *      getArchivedTasksInline/getStatistics/searchTasks 因为需要终态或
+ *      全量历史数据，继续读 Tasks，保持不变。不是本次 Review 范围内的
+ *      实现工作（UEF 00_Review_Framework.md §6），建议记进
+ *      00_Roadmap.gs。
+ *   2. [C3-1，LOW] 暂不动代码，等 Personal AI Core 真的要接 Dashboard
+ *      数据时再设计结构化返回形态——记一条 Roadmap 待办，不是现在的
+ *      优先级。
+ *   3. 两条都已经不是"讨论话题"而是有具体证据支持的发现，跟 Review #1
+ *      的三条一样，建议一并同步进 00_Roadmap.gs 的 Architecture
+ *      Evolution 小节。
+ *
+ * ### Review Summary（供 UEF 06_Review_History.md 收录）
+ * Findings:      0 HIGH, 1 MEDIUM, 1 LOW
+ * Dispositions:  2 confirmed，均未修正代码（Review 不等于 Rewrite），
+ *                已记入 00_Roadmap.gs 供下次实现时参考
+ */

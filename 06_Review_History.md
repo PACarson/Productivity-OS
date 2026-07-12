@@ -28,6 +28,19 @@ A new checklist item added to `02_Review_Checklist_Library.md` or a new pattern 
 
 ## Entries
 
+### 2026-07-11 — Productivity OS — Review #2 (Profile: Domain, project-declared enhanced subset: A5/B1/B2/C3)
+Reviewer: Claude (single-project review, evidence-first — every claim checked against actual code/governance files before being raised, no assumption-based findings)
+Gate feeding: Testing Gate (continuation of the same retroactive review as 2026-07-11 Review #1, scoped to the project's newly-declared deeper checklist)
+Findings: 0 HIGH, 1 MEDIUM, 1 LOW
+Dispositions: 2 confirmed, both left as tracked Roadmap follow-ups rather than fixed in-review (Review is not Rewrite — UEF `00_Review_Framework.md` §6)
+Notable:
+  - A5 (Event Flow) and B1 (Extensibility) both passed cleanly with strong evidence on first check — a reminder that not every checklist category run against a project will surface a finding, and reporting "passed, here's the evidence" is itself a complete and useful result, not a sign the review wasn't thorough enough.
+  - The MEDIUM finding (a purpose-built bounded table, correctly maintained, never actually read by any query — the reads instead scan the full unbounded history table and filter in memory to the same result) is a distinct failure shape from anything in Review #1: the code isn't wrong or untested here, it's an already-built solution to a real problem that simply never got wired up to the queries that would benefit from it. Worth watching for elsewhere — a project can pass Layering and Separation of Concerns cleanly while a specific *Query Layer* choosing the wrong Read Model table (of several available and equally valid ones) slips through, because nothing about the layering itself is wrong.
+  - Where a single function among several near-identical siblings had a written scale assumption ("this is fast enough for a typical personal task volume") and the rest had none, the presence of that one comment could have created a false impression that the pattern as a whole had been reasoned about — it hadn't; only one of nine call sites had.
+Full record: project's own Governance layer (`00_Architecture_Review.gs`).
+
+---
+
 ### 2026-07-11 — Productivity OS — Full-project review (Profile: Domain, minimum checklist subset)
 Reviewer: Claude (single-project review, first UEF-profile review for this project — its prior 5 audit rounds predate UEF v1.0 and used an ad hoc process, not this framework's checklist)
 Gate feeding: Testing Gate (pre-existing implementation, retroactive review — project already deployed and running V4.6 in production)
