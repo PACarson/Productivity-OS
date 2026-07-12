@@ -13,11 +13,7 @@
  * 本文件是本项目 Governance 层新增的第 8 份文件（Constitution/State/
  * File Map/ADR/Roadmap/Known Limitations/Command Reference/本文件）。
  *
- * LAST_UPDATED: 2026-07-12 — Review #2（六）的 B2-1 经 Carson review 后，
- * 由 MEDIUM Architecture Finding 改列为 Improvement Opportunity（按 UEF
- * Evidence-first 原则：现有证据只支持"可以做得更好"，不支持"当前架构
- * 已经出现需要修正的问题"）；C3-1 维持 LOW 不变。详见「六、Review #2」
- * 的 Review Disposition 小节。首次创建于 2026-07-11。
+ * LAST_UPDATED: 2026-07-11 — 首次创建。
  */
 
 // ============================================================
@@ -393,30 +389,24 @@
  *
  * 本次只跑「一之二」声明的四项加深 checklist，逐项直接读代码找证据，
  * 不假设、不套用经验判断。结论：Event Flow（A5）和 Extensibility（B1）
- * 两项全部通过，证据扎实；AI Readiness（C3）有一条 LOW Finding。
- * Scalability（B2）核实出 ActiveTasks 表已存在且被正确维护，但从未被
- * 查询路径实际读取——不过原始 Evidence 只能证明"这里有优化空间"，不能
- * 证明"当前架构已经出现需要修正的问题"（没有任何实测执行时间、真实
- * 生产数据规模、或接近 GAS quota 上限的证据）。按 UEF Evidence-first
- * 原则复核后（Carson review, 2026-07-12），这一条改列为 Improvement
- * Opportunity / Roadmap Item，不计入本次 Architecture Finding——详见
- * 下方「Review Disposition」及「Improvement Opportunities」小节。
- * **No HIGH Issues Found.**
+ * 两项全部通过，证据扎实；Scalability（B2）和 AI Readiness（C3）各有
+ * 一条问题，均不影响系统当前正常运行，都是"会随时间累积、值得在下一次
+ * 碰这块代码时顺手解决"的级别，不是紧急问题。**No HIGH Issues Found.**
  * 已有 ADR/Constitution/Governance 明确决定的设计（比如 Dashboard 不落盘
  * 的 ADR-2026-07-06、TaskStatistics 每日批量重算的 ADR-2026-07-06-005）
- * 均未重新拿出来讨论——本次唯一的 Finding（C3-1）和唯一的 Improvement
- * Opportunity（B2-1）都是此前从未被记录过的空白点，不是对已有决定的
- * 重新审判。**All findings are forward-looking improvements rather than
- * corrections to existing architectural decisions.**
+ * 均未重新拿出来讨论——这次两条新发现都是此前从未被记录过的空白点，
+ * 不是对已有决定的重新审判。
  *
  * ### Findings
  *
  * HIGH: 无。**No HIGH Issues Found.**
  *
- * MEDIUM: 无。（原判定为 MEDIUM 的 B2-1，经 Carson review 后按
- * Evidence-first 原则改列为 Improvement Opportunity，不计入 Finding——
- * 原始 Evidence 未变，只是严重度归类被修正，见下方「Review
- * Disposition」及「Improvement Opportunities」小节。）
+ * MEDIUM:
+ *   - [B2-1] ActiveTasks（专门为"非终态工作台"设计、且被正确维护的表）
+ *     在全部查询路径上都没有被实际读取过；9 个共享同一个全表扫描模式的
+ *     查询函数里，只有 1 个（getStatistics）写了"这个数据量级还跑得动"
+ *     的假设，且这条假设本身没有实测数据支撑，也没有设定"什么情况下要
+ *     重新评估"的触发条件。
  *
  * LOW:
  *   - [C3-1] DashboardEngine.build() 返回纯文本字符串（专为 Telegram 人眼
@@ -424,35 +414,9 @@
  *     Personal AI Core 消费（见「一之二」新增的 C3 适用范围扩展），但
  *     Dashboard 这条路径目前的输出形态需要被重新解析文本才能结构化使用。
  *
- * ### Review Disposition — B2-1 Reclassified（Carson review, 2026-07-12）
- *
- * 原始判定（2026-07-11 草稿）：B2-1 列为 MEDIUM Architecture Finding。
- * Carson 复核后指出：草稿自己给出的 Evidence 里已经写明——当前规模通常
- * 只有几百到几千行、getValues() 在此规模下运行没有问题、也没有任何
- * 执行时间实测数据证明当前已经构成瓶颈；"ActiveTasks 已存在但未被利用"
- * 本身只能证明"存在可以做得更好的空间"，不能证明"当前架构已经出现
- * 需要修正的问题"。按 UEF Evidence-first 原则——Finding 应代表有证据
- * 支持的当前问题，没有证据支持的应进入 Roadmap 而不是提高严重度——本条
- * 改列为 Improvement Opportunity / Roadmap Item，不再计入本次
- * Architecture Finding 统计（HIGH/MEDIUM/LOW 计数相应从 0/1/1 更正为
- * 0/0/1）。C3-1 维持 LOW，不受影响。
- * Upgrade trigger：一旦出现具体证据（实测执行时间、真实生产数据规模、
- * 或确认接近 GAS quota 上限），应在下一次 Review 中重新评估是否把本条
- * 升级回正式 Finding。
- *
- * ### Improvement Opportunities（非 Finding — 有证据支持"可以做得更好"，
- * 没有证据支持"当前架构已经出现问题"）
- *
- *   - [B2-1] ActiveTasks（专门为"非终态工作台"设计、且被正确维护的表）
- *     在全部查询路径上都没有被实际读取过；9 个共享同一个全表扫描模式的
- *     查询函数里，只有 1 个（getStatistics）写了"这个数据量级还跑得动"
- *     的假设，且这条假设本身没有实测数据支撑，也没有设定"什么情况下要
- *     重新评估"的触发条件。详见上方 Review Disposition 说明。
- *
  * ### Evidence
  *
- * [B2-1]（Improvement Opportunity——以下证据支持"存在优化空间"，不支持
- * "当前架构已出现问题"，详见上方 Review Disposition）:
+ * [B2-1]:
  *   - 00_Project_Constitution.gs 零之二：ActiveTasks 被明确定义为"工作台，
  *     只有非终态任务"，且 CQRS 写入链路显示它由 Projection 同步增量维护
  *     （10_ProjectionEngine.gs 的 projectTaskCreated_/projectTaskUpdated_/
@@ -501,8 +465,7 @@
  *
  * ### Recommendation
  *
- * [B2-1]（Improvement Opportunity——以下建议供未来"顺手做"参考，不是本次
- * Review 要求修正的问题）:
+ * [B2-1]:
  *   WHY：ActiveTasks 已经被正确维护，只是没被读——补上"让高频视图查询读
  *   ActiveTasks 而不是 Tasks"这一步，不需要新建任何东西，是把已经花了
  *   成本维护的表用起来。
@@ -531,33 +494,24 @@
  *
  * ### Follow-up Actions
  *
- *   1. [B2-1，Improvement Opportunity] 建议下次动 Query/View 这块代码时
- *      顺手做：把 getTodayTasks/getTomorrowTasks/getWeekTasks/
- *      getMonthTasks/getUpcomingTasks/getOverdueTasks/getPriorityTasks
- *      这几个只关心非终态任务的查询，数据源从 _readAllTasks_(Tasks) 切到
- *      读 ActiveTasks；getRecurringTasks/getCancelledTasks/
+ *   1. [B2-1，MEDIUM] 建议下次动 Query/View 这块代码时顺手做：把
+ *      getTodayTasks/getTomorrowTasks/getWeekTasks/getMonthTasks/
+ *      getUpcomingTasks/getOverdueTasks/getPriorityTasks 这几个只关心
+ *      非终态任务的查询，数据源从 _readAllTasks_(Tasks) 切到读
+ *      ActiveTasks；getRecurringTasks/getCancelledTasks/
  *      getArchivedTasksInline/getStatistics/searchTasks 因为需要终态或
  *      全量历史数据，继续读 Tasks，保持不变。不是本次 Review 范围内的
- *      实现工作（UEF 00_Review_Framework.md §6），也不是需要修正的
- *      Architecture Finding，已记进 00_Roadmap.gs 的 Improvement
- *      Opportunity 条目。若未来出现具体性能证据（实测执行时间、真实
- *      生产数据规模、或接近 GAS quota 上限），下次 Review 应重新评估
- *      是否升级为正式 Finding。
+ *      实现工作（UEF 00_Review_Framework.md §6），建议记进
+ *      00_Roadmap.gs。
  *   2. [C3-1，LOW] 暂不动代码，等 Personal AI Core 真的要接 Dashboard
  *      数据时再设计结构化返回形态——记一条 Roadmap 待办，不是现在的
  *      优先级。
- *   3. C3-1（1 项 LOW Finding）与 B2-1（1 项 Improvement Opportunity）
- *      都已经不是"讨论话题"而是有具体证据支持的记录，跟 Review #1 的
- *      三条一样，建议一并同步进 00_Roadmap.gs 的 Architecture Evolution
- *      小节（B2-1 的 Roadmap 条目措辞需同步更正为 Improvement
- *      Opportunity，不再称 Finding——本次已一并更正）。
+ *   3. 两条都已经不是"讨论话题"而是有具体证据支持的发现，跟 Review #1
+ *      的三条一样，建议一并同步进 00_Roadmap.gs 的 Architecture
+ *      Evolution 小节。
  *
  * ### Review Summary（供 UEF 06_Review_History.md 收录）
- * Findings:      0 HIGH, 0 MEDIUM, 1 LOW（+ 1 Improvement Opportunity，
- *                不计入 Finding 统计——见上方 Review Disposition）
- * Dispositions:  1 confirmed（C3-1，未修正代码），1 reclassified（B2-1：
- *                Carson review 后由 MEDIUM Finding 改列为 Improvement
- *                Opportunity，Evidence 未变，仅严重度归类修正）。两条均
- *                未修正代码（Review 不等于 Rewrite），已记入 00_Roadmap.gs
- *                供下次实现/重新评估时参考
+ * Findings:      0 HIGH, 1 MEDIUM, 1 LOW
+ * Dispositions:  2 confirmed，均未修正代码（Review 不等于 Rewrite），
+ *                已记入 00_Roadmap.gs 供下次实现时参考
  */
