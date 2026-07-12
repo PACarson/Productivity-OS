@@ -28,18 +28,6 @@ A new checklist item added to `02_Review_Checklist_Library.md` or a new pattern 
 
 ## Entries
 
-### 2026-07-12 — Productivity OS — Review #2 Disposition Amendment (Profile: Domain)
-Reviewer: Carson (project-owner review of Claude's 2026-07-11 Review #2 findings, applying UEF Evidence-first to the review's own conclusions)
-Gate feeding: same as amended review (Testing Gate)
-Findings: amends the 2026-07-11 Review #2 entry below — count corrected from 0 HIGH/1 MEDIUM/1 LOW to 0 HIGH/0 MEDIUM/1 LOW. B2-1 reclassified from MEDIUM Architecture Finding to Improvement Opportunity / Roadmap Item; C3-1 (LOW) unaffected.
-Dispositions: 1 reclassified — not a code fix, not a re-scope, a severity-classification correction. The underlying evidence for B2-1 didn't change (ActiveTasks exists, is correctly maintained, and is unread by all 9 non-terminal queries); what changed is the recognition that the evidence only supported "an optimization opportunity exists," never "the current architecture has a problem requiring correction" — no measured execution time, no real production row count, no proximity to a GAS quota was ever produced. An upgrade trigger was recorded: if that evidence appears, re-evaluate as a Finding in a future review.
-Notable:
-  - Worth carrying into future reviews on any project: a review's own Evidence section is the place to check before finalizing a severity label — if the evidence shows only "an unused asset exists" and not "a measured cost is being paid today," the correct disposition is Improvement Opportunity / Roadmap Item, not an Architecture Finding, no matter how plausible the future cost sounds.
-  - A review's conclusions are subject to the same Evidence-first bar the review applies to the code it examines. A project owner catching an over-graded finding by re-reading the review's own Evidence section (not by disputing the underlying facts, which were accurate) is a legitimate, expected step in the process — not a sign the original review was careless.
-Full record: project's own Governance layer (`00_Architecture_Review.gs`, §6 Review Disposition note); Roadmap entry corrected in `00_Roadmap.gs`.
-
----
-
 ### 2026-07-11 — Productivity OS — Review #2 (Profile: Domain, project-declared enhanced subset: A5/B1/B2/C3)
 Reviewer: Claude (single-project review, evidence-first — every claim checked against actual code/governance files before being raised, no assumption-based findings)
 Gate feeding: Testing Gate (continuation of the same retroactive review as 2026-07-11 Review #1, scoped to the project's newly-declared deeper checklist)
