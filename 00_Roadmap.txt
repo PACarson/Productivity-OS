@@ -7,7 +7,13 @@
  * 00_Project_State.gs"已知Bug"、00_ADR.gs（决策记录）。本文件跟
  * 00_Project_State.gs 一样是"快照"，每次更新覆盖旧内容，不是日志。
  *
- * LAST_UPDATED: 2026-07-11 — 00_Architecture_Review.gs（UEF v1.0 Domain
+ * LAST_UPDATED: 2026-07-13 — 「三、Next Version」新增第5项 Due Time
+ * Support，指向 00_Architecture_Review.gs「七、Review #3」已完成的
+ * Pre-Implementation Design Review。这项本身还未实现（待 Carson 批准
+ * 设计），本次只是把已完成的设计审查结果同步进 Roadmap，纯文档同步，
+ * 不代表功能已经交付。
+ *
+ * 2026-07-11 — 00_Architecture_Review.gs（UEF v1.0 Domain
  * Profile Review #1）Finding D3-1：本文件版本头和「一、Current Version」
  * 落后实际状态两个版本（停留在 V4.4，未反映 V4.5/V4.6），且治理文档数量
  * 描述过期（写"五份"，实际现在七份 + 本次新增的 Architecture Review
@@ -97,6 +103,15 @@
  *      如果事件类型数量显著增加（比如超过 10 个），应该拆出独立文件，
  *      判断标准参照 ADR-2026-07-06-002 Schema Authority 里"何时该拆"
  *      的同一套思路（数量阈值 + 变化频率 + 消费方数量）。
+ *
+ *   5.【2026-07-13 新增，来自 00_Architecture_Review.gs「七、Review #3」，
+ *      跟 1-4 项性质不同——这项已经完成完整设计审查，不是方向性候选】
+ *      Due Time Support：Task 新增 due_time / due_datetime 两个字段
+ *      （due_date 保留、语义不变），Reminder 调度逻辑不在本项目范围内。
+ *      Schema/API Impact/Migration Plan/Risk Analysis 均已完成，含 1 条
+ *      MEDIUM Finding（DT-2，已在设计内一并给出修复方案）和 4 项待
+ *      Carson 决定的 Open Decision（见 Review #3「八」）。**待 Carson
+ *      批准设计后即可直接进入实现**，不需要额外的设计会话。
  */
 
 // ============================================================

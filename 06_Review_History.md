@@ -28,6 +28,19 @@ A new checklist item added to `02_Review_Checklist_Library.md` or a new pattern 
 
 ## Entries
 
+### 2026-07-13 — Productivity OS — Review #3: Due Time Support, Pre-Implementation Design Review (Profile: Domain; Review Type: Feature/Change Review, not a periodic Domain Profile sweep)
+Reviewer: Claude (single-project review; this session did not have access to `01_Review_Profiles.md`/`00_Review_Framework.md`, so the review is structured around the requester's own 7 explicit deliverables rather than a cited Profile checklist subset — it still applies the shared Finding/Improvement Opportunity/Evidence/Disposition vocabulary and Evidence-first bar established by Review #1/#2)
+Gate feeding: Design Gate (this review's output is an approve/reject decision on a proposed schema + code design, not a production-readiness sign-off; implementation has not started)
+Findings: 0 HIGH, 1 MEDIUM, 0 LOW
+Dispositions: 1 confirmed — remediation designed within the same proposal (not deferred to Roadmap, not a severity reclassification): the MEDIUM finding (an existing schema-migration helper, `_addColumnsIfMissing_`, doesn't apply plain-text cell formatting to newly added columns — harmless for the text columns it's added so far, but concretely risks Google Sheets auto-type-coercion for the specific new `due_time` column's `'HH:mm'`-shaped values) has its fix designed into this same review's Migration Plan section, ready to ship together with the feature rather than tracked separately.
+Notable:
+  - This is the first review in this project's history that is a pre-implementation feature/design review rather than a retroactive audit of already-shipped code — it surfaced a Disposition shape ("confirmed, remediation designed in-proposal") that doesn't cleanly fit the existing confirmed / reclassified / deferred vocabulary from Review #1/#2, because those were both post-hoc. Worth folding into a future Review Report Standard discussion as its own disposition value rather than stretching an existing one to cover it.
+  - The review's central finding about the current architecture wasn't a problem at all: natural-language time-of-day extraction, correct parsing of both date-only and date+time string shapes, and correct time-of-day carry-forward across recurring task instances were all already working correctly (undocumented, informal, folded into the single existing `due_date` string field) before this review started. The proposed change is substantially a formalization of an already-working capability into explicit schema fields, not new logic — this shifted the effort/risk estimate for the feature meaningfully lower than "add time support" would suggest at face value.
+  - A concrete, testable backward-compatibility invariant was identified as part of the design rather than left as an assumption: because the identity-hash input for existing rows (no `due_time`) is designed to resolve to exactly the same string it resolves to today, every pre-migration task's identity hash should be byte-identical after migration — implementable as a direct unit-test assertion once coding begins, not just an aspiration.
+Full record: project's own Governance layer (`00_Architecture_Review.gs`, §7).
+
+---
+
 ### 2026-07-12 — Productivity OS — Review #2 Disposition Amendment (Profile: Domain)
 Reviewer: Carson (project-owner review of Claude's 2026-07-11 Review #2 findings, applying UEF Evidence-first to the review's own conclusions)
 Gate feeding: same as amended review (Testing Gate)
