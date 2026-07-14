@@ -1,6 +1,6 @@
 /**
  * 00_ADR.gs
- * Productivity OS v4.6 — Architecture Decision Records
+ * Productivity OS v4.7 — Architecture Decision Records
  *
  * 本文件收录本项目"影响后续所有开发判断"的重大架构决策，格式固定为
  * Metadata（V4.3 新增，见下方字段定义） + Context / Decision /
@@ -12,6 +12,12 @@
  * 本文件对应 Universal Domain OS Blueprint「0. Governance → ADR (Optional)」
  * 这一格（00_Project_Constitution.gs P4 之前原本写"暂无"，V4.1 起改为
  * 指向本文件）。
+ *
+ * 【2026-07-13 新增】ADR-2026-07-13-008——Due Time Support（完整设计见
+ * 00_Architecture_Review.gs「七、Review #3」）的两项设计决策正式记录：
+ * identity 计算改用 resolveIdentityDueValue() 辅助函数而不改
+ * generateTaskIdentity() 签名；due_datetime 没有具体时间时为空字符串，
+ * 不默认成午夜。
  *
  * 【2026-07-11 新增】ADR-2026-07-11-006 / 007——00_Architecture_Review.gs
  * （UEF v1.0 Domain Profile Review #1）Finding D1-1 的正式记录：两条此前
@@ -640,4 +646,98 @@
  *     (b) 命名冲突真的发生过一次（哪怕只是开发过程中被发现，未流入
  *     生产）时，无论哪个先发生，都应该重新打开这个决定，不能再套用
  *     "投入产出不成比例"这个理由不做评估就直接维持现状
+ */
+
+// ============================================================
+// ADR-2026-07-13-008：Due Time Support — identity 计算方式与
+// due_datetime 空值语义
+// ============================================================
+
+/**
+ * ── Metadata ──────────────────────────────────────────────────────────────
+ *   ADR Number      : ADR-2026-07-13-008
+ *   Status          : Accepted
+ *   Decision Date   : 2026-07-13
+ *   Supersedes      : （无）
+ *   Superseded By   : （无，仍然生效）
+ *   Affected Modules: 07_IdentityEngine.gs, 09_IdempotencyManager.gs,
+ *                     20_TaskEngine.gs, 21_RecurringEngine.gs,
+ *                     11_ProjectionRebuilder.gs
+ *   Related ADR     : ADR-2026-07-06-002（Schema Authority——本次新增
+ *                     due_time/due_datetime 两列走的是该 ADR 已经定义
+ *                     好的"向后兼容追加列"迁移模式，不是新模式）
+ *   Consequences    : 见下方正文
+ *   Notes           : 完整设计过程见 00_Architecture_Review.gs「七、
+ *                     Review #3」，Carson 2026-07-13 批准后实现。
+ *
+ * ── Context ──────────────────────────────────────────────────────────────
+ *
+ * Due Time Support 给 Task 新增 due_time/due_datetime 两个字段后，有两个
+ * 设计点会长期影响这个 Schema 怎么被使用，值得正式记录而不只是留在
+ * Review 文档里：
+ *
+ * (1) 07_IdentityEngine.generateTaskIdentity(chatId, title, dueDate,
+ *     repeatRule, priority, category) 的 dueDate 参数位，以后应该继续
+ *     只接受 due_date，还是要感知 due_time？
+ *
+ * (2) due_datetime 在"只有 due_date、没有 due_time"时，应该是空字符串，
+ *     还是默认成"该日期 00:00:00"？
+ *
+ * ── Options Considered ───────────────────────────────────────────────────
+ *
+ * 关于 (1)：
+ *   A. 修改 generateTaskIdentity() 签名，新增第七个参数 dueTime，函数
+ *      内部自己拼接。
+ *   B. 签名不变，调用方在 dueDate 参数位传入"有 due_time 就用合并后的
+ *      due_datetime，否则退回 due_date"这个值——即本次新增的
+ *      07_IdentityEngine.resolveIdentityDueValue(task) 辅助函数。
+ *
+ * 关于 (2)：
+ *   A. due_datetime 默认成"该日期 00:00:00"，任何有 due_date 的任务都有
+ *      一个可用的 due_datetime。
+ *   B. due_datetime 只在真的有 due_time 时才非空，否则是空字符串。
+ *
+ * ── Decision ──────────────────────────────────────────────────────────────
+ *
+ * (1) 选项 B：不改 generateTaskIdentity() 签名，新增
+ *     resolveIdentityDueValue() 辅助函数解析出正确的传入值。
+ *
+ * (2) 选项 B：due_datetime 没有具体时间时为空字符串，不默认成午夜。
+ *
+ * ── Consequences ──────────────────────────────────────────────────────────
+ *
+ * 正面：
+ *   - (1) 选项 B 让全部存量任务（due_time 恒为空）的 identity 哈希在
+ *     迁移前后逐字节不变——这是一条可以直接写单元测试验证的具体不变量
+ *     （见 07_IdentityEngine.testIdentity() 新增的第 5/6 组断言），不是
+ *     "应该没问题"这种无法验证的说法。
+ *   - (1) 同时保留了"相同标题+不同 due_date（含不同 due_time）→ 不同
+ *     identity"这条早在 V3 就已经生效的行为——此前自然语言解析器偶尔
+ *     把时间折叠进 due_date 字符串本身，这条效果是间接成立的，现在变成
+ *     显式规则，不是新引入的行为变化。
+ *   - (2) 选项 B 避免了"用户真的说了凌晨0点"和"用户根本没提具体时间"
+ *     这两种情况在 due_datetime 这一个字段上变得无法区分——这正是
+ *     Review #3 发现的、现有系统里已经存在的同一种歧义（09_TemporalParser
+ *     此前偶尔把时间嵌进 due_date 字符串，但从没有一个显式字段回答
+ *     "这个任务到底有没有具体时间"这个问题），选择空字符串能让这个歧义
+ *     被结构性地解决，而不是从"字符串格式里的隐含歧义"平移成"数值
+ *     默认值带来的同一个歧义"。
+ *
+ * 需要接受的代价（不回避）：
+ *   - (1) resolveIdentityDueValue() 是一个新增的间接层——以后任何人读
+ *     "identity 到底是怎么算出来的"，需要多看一个函数才能看全，不是
+ *     所有输入都在 generateTaskIdentity() 一处摊开。这是刻意的取舍：
+ *     用一层薄薄的间接换取"4 个调用点不用各自重复同一句 fallback 表达式"
+ *     （08_Review_Knowledge_Base.md KB-2 的教训）和"签名不用破坏性变更"
+ *     两个好处。
+ *   - (2) due_datetime 为空不代表"这个任务没有到期时刻"——它只代表
+ *     "没有比 due_date 更精确的信息"。任何未来消费 due_datetime 的代码
+ *     （比如 Reminder OS，如果/当它开始读这个字段）必须自己处理"空
+ *     due_datetime 但有 due_date"这种情况，不能假设 due_datetime 永远
+ *     非空。这条代价已经在 00_Known_Limitations.gs 补记，避免以后被
+ *     当成遗漏去修。
+ *   - 两条决定都只覆盖 Productivity OS 自己的 Task 概念——如果未来
+ *     Reminder OS/其他 Domain OS 也有类似"精确到期时刻"的需求，需要
+ *     各自评估是否适用同样的空值语义，不能假设这条 ADR 自动约束别的
+ *     项目。
  */

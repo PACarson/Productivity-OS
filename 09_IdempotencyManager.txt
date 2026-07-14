@@ -1,6 +1,12 @@
 /**
  * 09_IdempotencyManager.gs
- * Productivity OS v4.5 — 幂等性管理器（Task）
+ * Productivity OS v4.7 — 幂等性管理器（Task）
+ *
+ * 【V4.7 新增，Due Time Support，00_Architecture_Review.gs「七、
+ * Review #3」，Carson 2026-07-13 批准】createTaskIfNotExists 生成
+ * identity 时改用 IdentityEngine.resolveIdentityDueValue(meta) 取值，
+ * 不再直接读 meta.due_date——有 due_time 时用合并后的 due_datetime，
+ * 保证"改时间也让 identity 变化"这条既有行为不被新 Schema 意外改变。
  *
  * 职责：确保每个创建操作恰好执行一次（Exactly-Once Semantics）。
  * 所有模块创建 Task 必须经过本层，禁止直接 EventBus.publish('TASK_CREATED')。
@@ -148,7 +154,12 @@ var IdempotencyManager = (function () {
    * 创建任务（幂等，并发安全——同一 chatId 严格串行，不同 chatId 互不阻塞）
    *
    * @param {string} title
-   * @param {object} meta   { category, priority, due_date, recurring, context, budget, notes, description, tags }
+   * @param {object} meta   { category, priority, due_date, due_time, due_datetime,
+   *                          recurring, context, budget, notes, description, tags }
+   *                        （due_time/due_datetime 为 V4.7 新增，Due Time
+   *                        Support；identity 生成用 IdentityEngine.
+   *                        resolveIdentityDueValue(meta) 取值，不直接读
+   *                        meta.due_date，见该函数注释）
    * @param {string} chatId
    * @returns {{ task: object, created: boolean }}
    * @throws {Error}  message 以 "SYSTEM_BUSY" 开头，具体分两种（V4.5 修复
@@ -167,7 +178,7 @@ var IdempotencyManager = (function () {
     var identity = IdentityEngine.generateTaskIdentity(
       chatId,
       title,
-      meta.due_date   || '',
+      IdentityEngine.resolveIdentityDueValue(meta),
       meta.recurring  || '',
       meta.priority   || 'MEDIUM',
       meta.category   || 'GENERAL'

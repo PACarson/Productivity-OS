@@ -1,6 +1,21 @@
 /**
  * 20_TaskEngine.gs
- * Productivity OS v4.3 — Task Engine（create / update / complete / cancel）
+ * Productivity OS v4.7 — Task Engine（create / update / complete / cancel）
+ *
+ * 【V4.7 新增，Due Time Support，00_Architecture_Review.gs「七、
+ * Review #3」，Carson 2026-07-13 批准】
+ *  - createTaskDirect_ 的 task 对象新增 due_time（透传 meta.due_time）、
+ *    due_datetime（派生字段，由新增的私有函数 _computeDueDatetime_ 从
+ *    due_date+due_time 算出，没有具体时间时为 ''）。
+ *  - ProductivityConfig.IDENTITY_AFFECTING_FIELDS 新增 'due_time'；
+ *    UPDATABLE_FIELDS 新增 'due_time'（due_datetime 不在其中——它是
+ *    派生值，updateTask 不接受外部直接覆写）。
+ *  - updateTask：due_date/due_time 任一被改动时重算 merged.due_datetime
+ *    一并写进 payload；identity 重算改用
+ *    IdentityEngine.resolveIdentityDueValue(merged)，不再直接读
+ *    merged.due_date——保证"改时间也会让 identity 变化"这条此前就已
+ *    生效的行为不被新 Schema 意外改变，且全部存量任务（due_time 恒为
+ *    空）的 identity 哈希逐字节不变。
  *
  * 【V4.2 审计修复】（2026-07-06 第二轮外部审计，完整记录见
  * 00_Project_State.gs"已知Bug"）：
@@ -102,12 +117,31 @@ var ProductivityConfig = Object.freeze({
   TASK_RECURRING:   ['', 'Daily', 'Weekly', 'Monthly', 'Yearly'],
   // HIGH RISK 2 修复用：这几个字段任一变化都会让 IdentityEngine 算出不同
   // 的 identity 哈希，updateTask 改到其中任一个都必须重新计算 identity。
-  IDENTITY_AFFECTING_FIELDS: ['title', 'due_date', 'recurring', 'priority', 'category']
+  // 【V4.7 新增 due_time，Due Time Support】due_datetime 是派生字段，不
+  // 出现在这里——它永远等于 due_date+due_time 的合并结果，两者任一变化
+  // 已经足以触发下面的重算，不需要重复列出派生值本身。
+  IDENTITY_AFFECTING_FIELDS: ['title', 'due_date', 'due_time', 'recurring', 'priority', 'category']
 });
 
 var TaskEngine = (function () {
 
   var CFG = ProductivityConfig; // 内部简写，不额外暴露成新的裸全局
+
+  /**
+   * 【V4.7 新增，Due Time Support，00_Architecture_Review.gs「七、
+   * Review #3」2.2 节】due_datetime 是派生字段，永远由 due_date+due_time
+   * 合并算出，不接受外部直接写入——createTaskDirect_ 和 updateTask 两处
+   * 都需要同一份合并逻辑，写成私有函数避免重复（08_Review_Knowledge_Base.md
+   * KB-2 的形状）。
+   *
+   * 只有 due_date 和 due_time 都有值时才返回非空——没有具体时间时返回
+   * ''，不回退成"该日期 00:00:00"，避免"用户真说了凌晨0点"和"用户根本
+   * 没说时间"这两种情况在 due_datetime 上变得无法区分（Review #3「二、
+   * 2.2」的设计决策）。
+   */
+  function _computeDueDatetime_(dueDate, dueTime) {
+    return (dueDate && dueTime) ? (dueDate + 'T' + dueTime + ':00') : '';
+  }
 
   // ============ Create ============
 
@@ -136,6 +170,8 @@ var TaskEngine = (function () {
       category:       category,
       status:         'PENDING',
       due_date:       meta.due_date     || '',
+      due_time:       meta.due_time     || '',
+      due_datetime:   _computeDueDatetime_(meta.due_date || '', meta.due_time || ''),
       recurring:      recurring,
       priority:       priority,
       context:        meta.context      || '',
@@ -162,10 +198,13 @@ var TaskEngine = (function () {
   /**
    * 更新任务的可编辑字段。
    *
-   * 允许更新的字段白名单：title, category, priority, due_date, recurring,
-   * context, budget, notes, description, tags（不允许改 task_id/chat_id/
-   * status/completed_at/identity——identity 是本函数内部按需自动重算的
-   * 派生值，不接受外部直接传入覆盖）。
+   * 允许更新的字段白名单：title, category, priority, due_date, due_time,
+   * recurring, context, budget, notes, description, tags（不允许改
+   * task_id/chat_id/status/completed_at/identity/due_datetime——identity
+   * 和 due_datetime 都是本函数内部按需自动重算的派生值，不接受外部直接
+   * 传入覆盖：identity 见下方 HIGH RISK 2 修复说明；due_datetime 见
+   * 【V4.7】说明，防止调用方传入一个跟 due_date/due_time 自相矛盾的
+   * due_datetime）。
    *
    * 【HIGH RISK 2 修复】DeduplicationEngine.findExistingTask 完全依赖
    * identity 列。title/due_date/category/priority/recurring 任一个变了，
@@ -176,13 +215,21 @@ var TaskEngine = (function () {
    * "已有字段 + 本次改动"合并后的完整值重新算一次 identity，一并写进
    * payload（TASK_UPDATED 事件 + Sheet）。
    *
+   * 【V4.7 新增，Due Time Support】due_date 或 due_time 任一被改动时，
+   * 重新计算 merged.due_datetime 并一并写进 payload，保证 due_datetime
+   * 永远是另外两个字段的正确派生结果，不会出现三个字段互相矛盾的存储
+   * 状态。identity 重算改用 IdentityEngine.resolveIdentityDueValue()，
+   * 不再直接读 merged.due_date（见该函数注释：有 due_datetime 时用
+   * due_datetime，这样"改时间也会让 identity 变化"这条已经生效的行为
+   * 才不会被新 Schema 意外改变）。
+   *
    * @param {string} taskId
    * @param {object} changes
    * @param {string} chatId
    * @returns {object|null}
    */
-  var UPDATABLE_FIELDS = ['title', 'category', 'priority', 'due_date', 'recurring',
-                           'context', 'budget', 'notes', 'description', 'tags'];
+  var UPDATABLE_FIELDS = ['title', 'category', 'priority', 'due_date', 'due_time',
+                           'recurring', 'context', 'budget', 'notes', 'description', 'tags'];
 
   function updateTask(taskId, changes, chatId) {
     var existing = TaskQueryEngine.getTask(taskId, chatId);
@@ -212,6 +259,14 @@ var TaskEngine = (function () {
     var merged = shallowCopy_(existing);
     for (var k in payload) merged[k] = payload[k];
 
+    // 【V4.7】due_date/due_time 任一变化 → due_datetime 是派生值，
+    // 必须跟着重算，不能让三个字段留在互相矛盾的状态。
+    if (payload.hasOwnProperty('due_date') || payload.hasOwnProperty('due_time')) {
+      var recomputedDatetime = _computeDueDatetime_(merged.due_date || '', merged.due_time || '');
+      payload.due_datetime = recomputedDatetime;
+      merged.due_datetime   = recomputedDatetime;
+    }
+
     var identityFieldChanged = CFG.IDENTITY_AFFECTING_FIELDS.some(function (f) {
       return payload.hasOwnProperty(f);
     });
@@ -219,7 +274,7 @@ var TaskEngine = (function () {
       var newIdentity = IdentityEngine.generateTaskIdentity(
         merged.chat_id || chatId || existing.chat_id,
         merged.title,
-        merged.due_date  || '',
+        IdentityEngine.resolveIdentityDueValue(merged),
         merged.recurring || '',
         merged.priority  || 'MEDIUM',
         merged.category  || 'GENERAL'

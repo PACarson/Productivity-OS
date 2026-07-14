@@ -1,6 +1,6 @@
 /**
  * 00_Command_Reference.gs
- * Productivity OS v4.6 — Telegram 指令与业务规则参考
+ * Productivity OS v4.7 — Telegram 指令与业务规则参考
  * （Command & Business Rule Reference）
  *
  * 目的：把"用户/审计员能直接观察到的行为契约"——Telegram 指令匹配规则、
@@ -37,7 +37,14 @@
  * 7.2/... 顺次累加，是常青的设计说明，不是审计历史记录——Audit Trail 由
  * 00_Project_State.gs / Git History / Changelog 承担，本文件不重复。
  *
- * LAST_UPDATED: 2026-07-11 — 首次创建 + 新增第七节 Design Clarifications
+ * LAST_UPDATED: 2026-07-13 — V4.7 Due Time Support（00_Architecture_Review.gs
+ * 「七、Review #3」，Carson 2026-07-13 批准后实现）：C4 identity 公式
+ * 从 dueDate 改记为 dueValue（= 07_IdentityEngine.resolveIdentityDueValue
+ * 的结果），并说明"改时间等同于改 due_date"这条行为的由来；C5 的 meta
+ * 字段列表补充 due_time/due_datetime，category/priority 仍不参与自然
+ * 语言解析这条既有边界不变。
+ *
+ * 2026-07-11 — 首次创建 + 新增第七节 Design Clarifications
  * 7.1（/search Scope，见二、V11 与 G2(d)），不改动任何代码，版本号沿用
  * v4.6。
  */
@@ -303,11 +310,22 @@
  *
  *     Identity 生成（07_IdentityEngine.generateTaskIdentity，纯函数，
  *     零外部依赖）：
- *       identity = SHA256(chatId | normalizeTitle(title) | dueDate |
+ *       identity = SHA256(chatId | normalizeTitle(title) | dueValue |
  *                          repeatRule | priority | category)
  *       （priority 缺省按 'MEDIUM'，category 缺省按 'GENERAL' 参与拼接，
  *       必须跟 20_TaskEngine.createTaskDirect_ 的默认值保持一致，否则
  *       identity 会跟实际落库的字段对不上）
+ *
+ *       【V4.7 变更，Due Time Support】dueValue 不是裸 due_date，而是
+ *       07_IdentityEngine.resolveIdentityDueValue(task) 的结果——有
+ *       due_time 时取合并后的 due_datetime，否则退回 due_date。所有
+ *       identity 生成调用点（09_IdempotencyManager.createTaskIfNotExists /
+ *       20_TaskEngine.updateTask / 11_ProjectionRebuilder.gs 两处）都
+ *       统一改用这个辅助函数，不再各自裸拼 due_date。这不是新行为——
+ *       此前自然语言解析器偶尔会把时间折叠进 due_date 字符串本身，
+ *       "改时间等同于改 due_date"这条效果早就间接成立；这次只是把它
+ *       变成显式、一致的规则。全部存量任务（due_time 恒为空）的
+ *       identity 哈希因此逐字节不变。
  *
  *     normalizeTitle 标准化步骤（顺序固定）：
  *       1. 全角 ASCII → 半角（如 "ＡＢＣ"→"ABC"）
@@ -316,8 +334,9 @@
  *          其余标点全部替换成空格
  *       4. 折叠连续空白并 trim
  *       效果：「提醒我去买菜」「去买菜！」「去 买 菜」三者 identity 相同；
- *       但标题相同、due_date 不同 → identity 不同 → 视为两个独立任务
- *       （"明天买菜"和"后天买菜"不会互相拦截）。
+ *       但标题相同、dueValue 不同 → identity 不同 → 视为两个独立任务
+ *       （"明天买菜"和"后天买菜"不会互相拦截；V4.7 起，"明天10点开会"和
+ *       "明天2点开会"同理，也是两个独立任务）。
  *
  *     去重判定（08_DeduplicationEngine.findExistingTask）：
  *       只有 status === 'PENDING' 的同 identity 任务才算"已存在"——
@@ -356,12 +375,14 @@
  *
  *     **重要**：06_TaskIntentParser 的 TASK_CREATE 分支调用
  *     `IdempotencyManager.createTaskIfNotExists(parsed.title,
- *     {due_date, recurring}, chatId)`——meta 对象里**只有 due_date 和
- *     recurring 两个字段**，不传 category、不传 priority。也就是说：
- *     **目前所有通过 Telegram 自然语言创建的任务，category 永远落到
- *     默认值 GENERAL，priority 永远落到默认值 MEDIUM**，系统不会从
- *     文本内容（比如出现"买"就归到 SHOPPING，或出现"紧急"就设成
- *     CRITICAL）做任何推断。
+ *     {due_date, due_time, due_datetime, recurring}, chatId)`——meta 对象
+ *     里**只有日期/时间/重复规则相关字段**（V4.7 起新增 due_time/
+ *     due_datetime，均由 09_TemporalParser.extractDateTime() 从同一段
+ *     自然语言里解析出来，属于同一类"时间解析"能力的延伸），不传
+ *     category、不传 priority。也就是说：**目前所有通过 Telegram 自然
+ *     语言创建的任务，category 永远落到默认值 GENERAL，priority 永远
+ *     落到默认值 MEDIUM**，系统不会从文本内容（比如出现"买"就归到
+ *     SHOPPING，或出现"紧急"就设成 CRITICAL）做任何推断。
  *
  *     **【已确认为 Known Limitation，2026-07-11，非 bug】**：这是刻意的
  *     Clean Architecture 边界，不是遗漏——Productivity OS 的职责到"解析

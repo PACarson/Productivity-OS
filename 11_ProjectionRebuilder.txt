@@ -1,7 +1,17 @@
 /**
  * 11_ProjectionRebuilder.gs
- * Productivity OS v4.6 — Projection Rebuilder（从 Events 全量重建 Read Model
+ * Productivity OS v4.7 — Projection Rebuilder（从 Events 全量重建 Read Model
  * ／每日常规维护 TaskStatistics）
+ *
+ * 【V4.7 新增，Due Time Support，00_Architecture_Review.gs「七、
+ * Review #3」，Carson 2026-07-13 批准】新增 migrateSchemaDueTime()（既有
+ * 部署迁移入口，模式跟 migrateSchemaV4() 一致）与配套的
+ * _setPlainTextFormatForNewColumns_()（修复 Finding DT-2：
+ * _addColumnsIfMissing_ 本身不会给新增列设纯文本格式，due_time 这种
+ * 'HH:mm' 形状的值会被 Google Sheets 自动类型识别成 Time 类型）。
+ * rebuildTasksProjection() / rebuildActiveTasksProjection() 两处 identity
+ * 重算改用 IdentityEngine.resolveIdentityDueValue(task)，不再直接读
+ * task.due_date。
  *
  * 【V4.6 新增 recomputeStatisticsFromTasks_()】第五轮外部审计 HIGH RISK 1
  * + HIGH RISK 4：TaskStatistics 不再由 10_ProjectionEngine.gs 同步增量
@@ -95,6 +105,60 @@ function _addColumnsIfMissing_(sheetName, columnNames) {
   });
 }
 
+/**
+ * Due Time Support（V4.7，00_Architecture_Review.gs「七、Review #3」，
+ * Carson 2026-07-13 批准）——existing 部署迁移入口。跟 migrateSchemaV4()
+ * 同一种"一次性、幂等、只加列不改数据"模式，额外多做一步
+ * _setPlainTextFormatForNewColumns_（Finding DT-2 的修复：
+ * _addColumnsIfMissing_ 本身不会给新增列设纯文本格式，due_time 这种
+ * 'HH:mm' 形状的值会被 Google Sheets 自动类型识别成 Time 类型，静默
+ * 改变存储形式——这里补上 15_Setup._ensureSheet_() 对全新建表已经在做的
+ * 同一件事）。
+ */
+function migrateSchemaDueTime() {
+  Logger.log('=== migrateSchemaDueTime ===');
+  _addColumnsIfMissing_('Tasks',        ['due_time', 'due_datetime']);
+  _addColumnsIfMissing_('ActiveTasks',  ['due_time', 'due_datetime']);
+  _addColumnsIfMissing_('ArchiveTasks', ['due_time', 'due_datetime']);
+  _setPlainTextFormatForNewColumns_('Tasks',        ['due_time', 'due_datetime']);
+  _setPlainTextFormatForNewColumns_('ActiveTasks',  ['due_time', 'due_datetime']);
+  _setPlainTextFormatForNewColumns_('ArchiveTasks', ['due_time', 'due_datetime']);
+  Logger.log('✅ due_time/due_datetime 列迁移完成（含纯文本格式修复）。存量行 due_time/due_datetime 为空字符串，等价于需求方"只有 due_date 时 due_time 视为 null"。');
+}
+
+/**
+ * 对指定列的既有数据区（不含表头行）设纯文本格式，防止 Google Sheets
+ * 把形如 'HH:mm' / 'yyyy-MM-ddTHH:mm:ss' 的字符串自动识别成 Time/
+ * DateTime 类型。只处理"迁移时已经存在的行"——迁移之后新建的行走
+ * createTaskDirect_ → upsertRowByKey_ 正常写入路径，不经过这个函数。
+ */
+function _setPlainTextFormatForNewColumns_(sheetName, columnNames) {
+  var sheet;
+  try {
+    sheet = getSheet_(sheetName);
+  } catch (e) {
+    Logger.log('⚠️ Sheet 不存在，跳过: ' + sheetName);
+    return;
+  }
+
+  var headerMap = getHeaderMap_(sheet);
+  var lastRow   = sheet.getLastRow();
+  if (lastRow < 2) {
+    Logger.log('  [' + sheetName + '] 没有数据行，跳过纯文本格式设置');
+    return;
+  }
+
+  columnNames.forEach(function (col) {
+    if (!(col in headerMap)) {
+      Logger.log('  ⚠️ [' + sheetName + '] 列 "' + col + '" 不存在，跳过格式设置');
+      return;
+    }
+    var colIndex = headerMap[col] + 1; // 转 1-based
+    sheet.getRange(2, colIndex, lastRow - 1, 1).setNumberFormat('@');
+    Logger.log('  [' + sheetName + '] 列 "' + col + '" 已设为纯文本格式');
+  });
+}
+
 // ============ Step 2：全量重建 ============
 
 /**
@@ -125,7 +189,7 @@ function rebuildTasksProjection() {
       task.identity = IdentityEngine.generateTaskIdentity(
         task.chat_id   || '',
         task.title     || '',
-        task.due_date  || '',
+        IdentityEngine.resolveIdentityDueValue(task),
         task.recurring || '',
         task.priority  || 'MEDIUM',
         task.category  || 'GENERAL'
@@ -179,7 +243,7 @@ function rebuildActiveTasksProjection() {
       task.identity = IdentityEngine.generateTaskIdentity(
         task.chat_id   || '',
         task.title     || '',
-        task.due_date  || '',
+        IdentityEngine.resolveIdentityDueValue(task),
         task.recurring || '',
         task.priority  || 'MEDIUM',
         task.category  || 'GENERAL'

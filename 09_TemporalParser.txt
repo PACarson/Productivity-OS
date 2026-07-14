@@ -2,11 +2,24 @@
  * 09_TemporalParser.gs
  * Personal AI Core — V3 共用日期/时间/重复规则解析层
  *
+ * 【V4.7 新增，Due Time Support，本项目独有改动，Core 项目副本不受
+ * 影响——00_Architecture_Review.gs「七、Review #3」，Carson 2026-07-13
+ * 批准】extractDateTime() 返回对象新增 due_time（'HH:mm' 或 ''）、
+ * due_datetime（合并后的 ISO 字符串，没有具体时间时为 ''）两个字段；
+ * due_date 从此永远是纯日期，不再偶尔携带时间。computeNextDueDateFromLabel()
+ * 等内部函数未改一行——已有的"侦测输入是否带时间、保留同样格式输出"这套
+ * 逻辑对新的调用方式（外部先合并出 due_datetime 字符串再传进来）本来就
+ * 兼容，不需要跟着改。
+ *
  * 【V4.4 修复 LOW RISK 1，本项目独有改动，Core 项目副本不受影响】
  * RECURRENCE_TYPES / WEEKDAY_CHAR_MAP / WEEKDAY_NUM_TO_CHAR 三个裸全局
  * 常量收进了 TemporalConfig 命名空间（见"重复规则解析"小节的完整说明）。
- * 除此之外的函数逻辑跟 Core 项目版本逐字一致，这是本文件跟 Core 项目
- * 副本之间唯一的差异。
+ *
+ * 除以上两处（V4.4 命名空间收纳 + V4.7 due_time/due_datetime 返回字段）
+ * 之外的函数逻辑跟 Core 项目版本逐字一致，这是本文件跟 Core 项目副本
+ * 之间目前仅有的两处差异——Core 项目自己的 09_TemporalParser.gs（含
+ * 22_InventoryIntentParser.gs 消费的那一份）不会自动获得 due_time 能力，
+ * 如果 Core 项目以后也需要，需要在那一份拷贝里单独重复这次的改动。
  *
  * 来源：从 06_TaskIntentParser.gs 里抽出来的 _extractDateTime_() 及其内部
  * 依赖函数，改名 extractDateTime()（去掉下划线，明确是公开给06/22共用的
@@ -69,7 +82,14 @@
 /**
  * 解析自然语言里的日期/时间/重复规则。
  * @param {string} rawText
- * @returns {{ due_date: string, recurrence_rule: (object|null), cleanedText: string }}
+ * @returns {{ due_date: string, due_time: string, due_datetime: string,
+ *   recurrence_rule: (object|null), cleanedText: string }}
+ *   【V4.7 变更，Due Time Support，00_Architecture_Review.gs「七、
+ *   Review #3」】due_date 从此永远是纯日期 'yyyy-MM-dd' 或 ''——此前
+ *   偶尔携带时间（'yyyy-MM-ddTHH:mm:ss'）的行为到此为止，时间改由
+ *   新增的 due_time（'HH:mm' 或 ''）和 due_datetime（合并后的 ISO
+ *   字符串，没有时间时为 ''）承载。计算逻辑本身未变，只是把原来
+ *   拼进 due_date 的同一个 base 时间对象，多格式化两遍。
  */
 function extractDateTime(rawText) {
   var text = rawText;
@@ -147,6 +167,8 @@ function extractDateTime(rawText) {
   if (timeInfo) text = text.replace(timeInfo.matchedStr, '');
 
   var dueDate = '';
+  var dueTime = '';
+  var dueDatetime = '';
   if (targetDate || timeInfo) {
     var base = targetDate ? new Date(targetDate) : _startOfDay_(now);
     if (timeInfo) {
@@ -170,13 +192,23 @@ function extractDateTime(rawText) {
         base = _rollForwardOneCycle_(base, recurrenceRule);
       }
 
-      dueDate = Utilities.formatDate(base, Session.getScriptTimeZone(), "yyyy-MM-dd'T'HH:mm:ss");
+      // 【V4.7】due_date 永远是纯日期；具体时间点分别落进 due_time /
+      // due_datetime，三者都从同一个已经算好的 base 格式化而来。
+      dueDate     = Utilities.formatDate(base, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+      dueTime     = Utilities.formatDate(base, Session.getScriptTimeZone(), 'HH:mm');
+      dueDatetime = Utilities.formatDate(base, Session.getScriptTimeZone(), "yyyy-MM-dd'T'HH:mm:ss");
     } else {
       dueDate = Utilities.formatDate(base, Session.getScriptTimeZone(), 'yyyy-MM-dd');
     }
   }
 
-  return { due_date: dueDate, recurrence_rule: recurrenceRule, cleanedText: text };
+  return {
+    due_date: dueDate,
+    due_time: dueTime,
+    due_datetime: dueDatetime,
+    recurrence_rule: recurrenceRule,
+    cleanedText: text
+  };
 }
 
 // ============ 重复规则解析（新） ============

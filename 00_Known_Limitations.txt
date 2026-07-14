@@ -1,6 +1,6 @@
 /**
  * 00_Known_Limitations.gs
- * Productivity OS v4.6 — Known Limitations & Internal-Only Capabilities
+ * Productivity OS v4.7 — Known Limitations & Internal-Only Capabilities
  *
  * 目的：记录"刻意不做，或者已经实现但暂未对外暴露"的能力边界——
  * Universal Domain OS Blueprint「Governance」目录里的 Not Yet 一类。
@@ -13,7 +13,14 @@
  * 存在的直接目的是让 Claude/外部审计在做 Architecture Review 时，看到
  * 这里列出的行为，不要当成 bug 或遗漏去提修复建议。
  *
- * LAST_UPDATED: 2026-07-11 — 首次创建，收录三类：Natural Language Parser
+ * LAST_UPDATED: 2026-07-13 — V4.7 Due Time Support 落地后同步措辞：
+ * Natural Language Parser Scope 补充 due_time/due_datetime（同一类"时间
+ * 解析"能力的延伸，边界本身未变，category/priority 仍不参与自然语言
+ * 解析）；updateTask() Internal API 一节的 IDENTITY_AFFECTING_FIELDS
+ * 引用同步补充 due_time。完整设计见 00_Architecture_Review.gs「七、
+ * Review #3」。
+ *
+ * 2026-07-11 — 首次创建，收录三类：Natural Language Parser
  * Scope、updateTask() Internal API、Weekly/Monthly Dashboard +
  * suggestPriority() Internal Capability。全部由 Carson 在 2026-07-11
  * 当面确认，不是 Claude 单方面推测的"这应该是有意的吧"。
@@ -25,7 +32,9 @@
 
 /**
  * Known Limitation: Natural language parser intentionally extracts only:
- *   - due_date
+ *   - due_date / due_time / due_datetime（V4.7 起，同一类"时间解析"
+ *     能力的延伸——此前时间偶尔折叠进 due_date 字符串本身，现在拆成
+ *     显式字段，解析范围本身没有扩大）
  *   - recurring
  *
  * Category and Priority are assigned by caller or default values
@@ -35,10 +44,10 @@
  * Future AI callers may enrich these fields before createTask().
  *
  * ── 中文说明（架构理由）──────────────────────────────────────────────
- * 实现位置：06_TaskIntentParser.gs 的 TASK_CREATE 分支只把
- * `{due_date, recurring}` 传给 IdempotencyManager.createTaskIfNotExists，
- * 09_TemporalParser.gs 也只解析时间和重复规则，不解析"这句话在说什么
- * 类型的事、有多急"。
+ * 实现位置：06_TaskIntentParser.gs 的 TASK_CREATE 分支把
+ * `{due_date, due_time, due_datetime, recurring}` 传给
+ * IdempotencyManager.createTaskIfNotExists，09_TemporalParser.gs 也只
+ * 解析时间和重复规则，不解析"这句话在说什么类型的事、有多急"。
  *
  * 这是刻意的 Clean Architecture 边界，不是没写完：Productivity OS 的
  * 职责到"解析时间/重复规则、生成 identity、去重落库"为止，理解任务
@@ -48,8 +57,8 @@
  *
  *   Personal AI Core（理解"下周找律师"是什么、该多急）
  *     ↓ 决定好 category/priority 之后调用
- *   Productivity OS.createTask(title, { due_date, recurring, category,
- *                                        priority })
+ *   Productivity OS.createTask(title, { due_date, due_time, recurring,
+ *                                        category, priority })
  *     ↓
  *   （Productivity OS 自己永远不需要知道"找律师"是什么意思）
  *
@@ -57,6 +66,11 @@
  * 调用方（新的 AI Agent、批量导入脚本、另一个前端）想要更聪明的分类，
  * 只需要在调用 createTask() 之前自己算好 category/priority 传进来，
  * 不需要修改 Productivity OS 内部任何一行代码。
+ *
+ * 【V4.7 补充】Reminder OS（如果/当它开始消费本项目数据）同样适用这条
+ * 边界——它能读到 due_time/due_datetime（本项目现在会存这两个字段），
+ * 但"什么时候该提醒、提醒几次、怎么发通知"完全是 Reminder OS 自己的
+ * 职责，不会因为本项目新增了这两个字段而产生任何反向依赖。
  *
  * 如果以后 Telegram 自身想支持"关键词猜分类"这种轻量能力，那是一个新的
  * 、独立的功能决策（要不要在 Productivity OS 内部做，还是应该由
@@ -86,12 +100,12 @@
  *   - Future Batch（比如批量重新分类脚本）
  *
  * 保留原因：updateTask 已经处理好了 identity 重算（改到
- * IDENTITY_AFFECTING_FIELDS = ['title','due_date','recurring','priority',
- * 'category'] 里任一个字段都会重算 identity，避免"改了标题但 identity
- * 还是旧的"这种不一致），是一个可以直接安全复用的 Internal API，不需要
- * 现在为了"没有 Telegram 指令用它"而删掉或标记成 dead code——它本来就是
- * 设计成给"未来调用方"用的引擎层能力，不是每个 Engine 函数都必须马上
- * 对应一个 Telegram 指令才算数。
+ * IDENTITY_AFFECTING_FIELDS = ['title','due_date','due_time','recurring',
+ * 'priority','category'] 里任一个字段都会重算 identity，避免"改了标题但
+ * identity 还是旧的"这种不一致），是一个可以直接安全复用的 Internal API，
+ * 不需要现在为了"没有 Telegram 指令用它"而删掉或标记成 dead code——它
+ * 本来就是设计成给"未来调用方"用的引擎层能力，不是每个 Engine 函数都
+ * 必须马上对应一个 Telegram 指令才算数。
  */
 
 // ============================================================

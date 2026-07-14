@@ -1,6 +1,11 @@
 /**
  * 07_IdentityEngine.gs
- * JARVIS CORE v3.0 — 业务身份引擎
+ * JARVIS CORE v3.0 / Productivity OS V4.7 分支 — 业务身份引擎
+ *
+ * 【V4.7 新增，Due Time Support】新增 resolveIdentityDueValue()，供
+ * Due Time 相关的 4 个调用点统一取"identity 该用的到期值"，不改
+ * generateTaskIdentity() 本身的签名或算法。完整设计见
+ * 00_Architecture_Review.gs「七、Review #3」2.3 节。
  *
  * 职责：为每个业务对象生成确定性的 SHA-256 身份标识符（Identity）。
  * Identity 是「这个业务对象是否已经存在」的判断依据，与存储 ID（task_id / item_id）无关。
@@ -21,7 +26,9 @@
  *                           priority/category 等，按调用方传入的参数）
  *   Writes                : none
  *   Public API            : generateTaskIdentity(chatId, title, dueDate,
- *                           recurring, priority, category)
+ *                           recurring, priority, category),
+ *                           resolveIdentityDueValue(task)（V4.7 新增，
+ *                           Due Time Support 的 identity 取值辅助函数）
  *   Dependencies          : 无（GAS 内建 Utilities.computeDigest 除外）
  *   Forbidden Dependencies: Sheet, Events, Telegram/Output，任何其他 Engine
  *   Pure Function         : YES
@@ -109,6 +116,13 @@ var IdentityEngine = (function () {
    * ⚠️ 注意：相同标题 + 不同 due_date → 不同 identity → 可以共存
    *   「明天买菜」和「后天买菜」是两个不同任务，不会互相拦截。
    *   DONE / CANCELLED 不影响 identity 判断（那是 DeduplicationEngine 的事）。
+   *
+   *   【V4.7 补充，Due Time Support】dueDate 这个参数位本身的语义不变、
+   *   函数签名不变——调用方如果任务同时有 due_time，应该传入合并后的
+   *   due_datetime（而不是裸 due_date），见下方 resolveIdentityDueValue()。
+   *   这样"相同日期、不同具体时间的两个任务视为不同任务"这条已经生效的
+   *   行为（此前是因为自然语言解析器偶尔把时间折叠进 due_date 字符串
+   *   本身才间接成立）继续保持不变，而不是被新 Schema 意外改变。
    */
   function generateTaskIdentity(chatId, title, dueDate, repeatRule, priority, category) {
     var parts = [
@@ -120,6 +134,33 @@ var IdentityEngine = (function () {
       String(category || 'GENERAL')
     ];
     return sha256_(parts.join('|'));
+  }
+
+  /**
+   * 【V4.7 新增，Due Time Support，00_Architecture_Review.gs「七、
+   * Review #3」2.3 节】为 generateTaskIdentity() 的 dueDate 参数位解析
+   * 出正确的传入值——有 due_datetime 用 due_datetime，否则回退 due_date。
+   *
+   * 存在的意义：09_IdempotencyManager.gs / 20_TaskEngine.gs /
+   * 11_ProjectionRebuilder.gs（两处）共 4 个调用点都需要这个同样的
+   * 合并逻辑——写成一个共用纯函数，避免 4 处各自重复同一句
+   * `task.due_datetime || task.due_date || ''`（08_Review_Knowledge_Base.md
+   * KB-2 Duplicated fallback constants 的形状）。
+   *
+   * 对于本次迁移前就存在、due_time/due_datetime 恒为空的历史任务，这个
+   * 函数的返回值跟直接读 due_date 完全相同——所以全部存量任务的 identity
+   * 哈希在迁移前后逐字节不变。
+   *
+   * 纯函数，零依赖，符合本文件 Engine Contract 里
+   * "Forbidden Dependencies: Sheet, Events, Telegram/Output，任何其他
+   * Engine"——不需要因为新增这个函数而修改上方的 Contract 声明。
+   *
+   * @param {Object} task 任意带 due_date/due_datetime 字段的对象（Task
+   *   实体或等价的 meta/changes 对象）。
+   * @returns {string} 用于 generateTaskIdentity() dueDate 参数位的值。
+   */
+  function resolveIdentityDueValue(task) {
+    return ((task && task.due_datetime) || (task && task.due_date) || '');
   }
 
   /**
@@ -180,6 +221,24 @@ var IdentityEngine = (function () {
     var i2 = generateInventoryIdentity('123', '鸡 蛋', 'pcs');
     Logger.log('inventory i1 === i2 (whitespace)? ' + (i1 === i2) + '  (expected: true)');
 
+    // 5.【V4.7 新增，Due Time Support】向后兼容不变量：存量任务（没有
+    //    due_time）迁移前后 identity 必须逐字节不变——直接传 due_date
+    //    字符串，和通过 resolveIdentityDueValue() 对一个 due_time 为空
+    //    的 task 对象取值，两者必须给出完全相同的 identity。
+    var legacyTask = { due_date: '2026-07-30', due_time: '', due_datetime: '' };
+    var t7 = generateTaskIdentity('123', '买机票', '2026-07-30', '', 'MEDIUM', 'TRAVEL');
+    var t8 = generateTaskIdentity('123', '买机票', resolveIdentityDueValue(legacyTask), '', 'MEDIUM', 'TRAVEL');
+    Logger.log('t7 === t8 (legacy task, no due_time, backward-compat)? ' + (t7 === t8) + '  (expected: true)');
+
+    // 6. 同一天、不同 due_time → 不同 identity（延续"改时间等同于改
+    //    due_date"这条此前就已经生效的行为，见 generateTaskIdentity()
+    //    注释）。
+    var morningTask = { due_date: '2026-07-30', due_time: '10:00', due_datetime: '2026-07-30T10:00:00' };
+    var afternoonTask = { due_date: '2026-07-30', due_time: '14:00', due_datetime: '2026-07-30T14:00:00' };
+    var t9  = generateTaskIdentity('123', '开会', resolveIdentityDueValue(morningTask), '', 'MEDIUM', 'WORK');
+    var t10 = generateTaskIdentity('123', '开会', resolveIdentityDueValue(afternoonTask), '', 'MEDIUM', 'WORK');
+    Logger.log('t9 === t10 (same date, diff due_time)? ' + (t9 === t10) + '  (expected: false)');
+
     Logger.log('=== IdentityEngine Test DONE ===');
   }
 
@@ -190,6 +249,7 @@ var IdentityEngine = (function () {
     normalizeCase: normalizeCase,
     normalizeUnicode: normalizeUnicode,
     generateTaskIdentity: generateTaskIdentity,
+    resolveIdentityDueValue: resolveIdentityDueValue,
     generateInventoryIdentity: generateInventoryIdentity,
     generateReminderIdentity: generateReminderIdentity,
     testIdentity: testIdentity

@@ -1,9 +1,18 @@
 /**
  * 00_File_Map.gs
- * Productivity OS v4.6 — 文件地图
+ * Productivity OS v4.7 — 文件地图
  *
  * 本文件只放两类内容：文件职责 / 模块关系。
- * LAST_UPDATED: 2026-07-11 — 00_Architecture_Review.gs（UEF v1.0 Domain
+ * LAST_UPDATED: 2026-07-13 — V4.7 Due Time Support 落地（完整设计见
+ * 00_Architecture_Review.gs「七、Review #3」，Carson 2026-07-13 批准后
+ * 实现）：06_TaskIntentParser / 09_IdempotencyManager / 09_TemporalParser /
+ * 07_IdentityEngine / 20_TaskEngine / 21_RecurringEngine /
+ * 11_ProjectionRebuilder / 15_Setup 八个文件的条目补充本次变更说明；
+ * 「二、模块关系」新增 21_RecurringEngine.gs → 07_IdentityEngine.gs 这
+ * 一条新依赖边。「三、Architecture Layer Map」的分层结论不受影响，
+ * 未改动。
+ *
+ * 2026-07-11 — 00_Architecture_Review.gs（UEF v1.0 Domain
  * Profile Review #1）Finding D3-1 附带发现的第三个实例：「三、Architecture
  * Layer Map」开头的治理文档计数过期（写于 V4.3，未跟进 2026-07-11 新增的
  * Known Limitations / Command Reference 两份，以及本次新增的
@@ -42,17 +51,23 @@
  * 05_SheetUtils.gs — 本地副本，逐字未改（getSheet_/getHeaderMap_/
  *   upsertRowByKey_/deleteRowByKey_/batchUpsertRowsByKey_/isOverdue_/
  *   parseDueDate_/round1_/round2_/shallowCopy_/_cleanTitle_）。
- * 07_IdentityEngine.gs — 本地副本，业务逻辑逐字跟 Core 项目一致（纯函数
+ * 07_IdentityEngine.gs — 本地副本，业务逻辑基本跟 Core 项目一致（纯函数
  *   零依赖）；V4.3 起文件头新增 Engine Contract 注释块（见
- *   00_Project_Constitution.gs 零之三标准），跟 Core 项目的副本相比只有
- *   这段注释不同，不影响任何函数行为。
+ *   00_Project_Constitution.gs 零之三标准）；V4.7 新增
+ *   resolveIdentityDueValue()（Due Time Support 的 identity 取值辅助
+ *   函数，本项目独有，Core 项目副本没有这个函数），跟 Core 项目的副本
+ *   相比现在有"Engine Contract 注释块"和"这个新函数"两处不同，
+ *   generateTaskIdentity() 本身签名/算法不变。
  * 08_DeduplicationEngine.gs — 本地副本，业务逻辑逐字未改；V4.3 起文件头
  *   新增 Engine Contract 注释块，同上，只加注释不改行为。
  * 09_TemporalParser.gs — 【不再是"逐字未改"】日期/时间/重复规则解析，
- *   21_RecurringEngine.gs 包装它的重复规则相关函数对外暴露。V4.4 起唯一
- *   跟 Core 项目版本不同的地方：三个裸全局常量（RECURRENCE_TYPES/
+ *   21_RecurringEngine.gs 包装它的重复规则相关函数对外暴露。跟 Core
+ *   项目版本现在有两处差异：(1) V4.4 起三个裸全局常量（RECURRENCE_TYPES/
  *   WEEKDAY_CHAR_MAP/WEEKDAY_NUM_TO_CHAR）收进 TemporalConfig 命名空间
- *   （LOW RISK 1 修复，见文件头注释）。所有函数签名/行为不变。
+ *   （LOW RISK 1 修复）；(2) V4.7 起 extractDateTime() 返回对象新增
+ *   due_time/due_datetime，due_date 从此永远是纯日期（Due Time
+ *   Support，本项目独有，Core 项目副本不受影响，见文件头完整说明）。
+ *   computeNextDueDateFromLabel() 等内部函数未改。
  *
  * ── Runtime ─────────────────────────────────────────────────────────────
  *
@@ -69,7 +84,8 @@
  *   _alertAdminProjectionFailure_() 会在 Projection 写入失败时调用
  *   Output.sendMessage() 给管理员发告警，这是本项目唯一的调用点，且只在
  *   罕见的异常路径上触发（见 03_Output.gs 文件头 V4.5 核实说明）。
- * 06_TaskIntentParser.gs — 【V4 重写】parseTaskIntent / handleTaskIntent。
+ * 06_TaskIntentParser.gs — 【V4 重写，V4.7 新增 Due Time Support】
+ *   parseTaskIntent / handleTaskIntent。
  *   V4 变更：
  *     1. 新增指令：/today /week /month /priority /overdue /upcoming
  *        /recurring /dashboard /stats /search keyword（对应规格书
@@ -79,15 +95,22 @@
  *        改成全部经由 12_TaskQueryEngine.gs（见 00_Project_State.gs
  *        "已知Bug"第3条）。TaskIntentParser 现在不 import 05_SheetUtils.gs
  *        的任何 Sheet 读取函数，只用它的 _cleanTitle_ 纯文本工具。
- * 09_IdempotencyManager.gs — 【V4 微调】createTaskIfNotExists 内部调用改成
- *   TaskEngine.createTaskDirect_(...)（原来是裸全局 _createTaskDirect_，
- *   见 00_Project_State.gs "已知Bug"第1条修复）。
+ *   V4.7 变更：parseTaskIntent 和 TASK_CREATE 分支的 meta 对象都新增
+ *   转发 due_time/due_datetime；新增共用辅助函数 _formatDueDisplay_()，
+ *   5 处到期日展示文案统一在有 due_time 时于日期后追加"HH:mm"。
+ * 09_IdempotencyManager.gs — 【V4 微调，V4.7 新增 Due Time Support】
+ *   createTaskIfNotExists 内部调用改成 TaskEngine.createTaskDirect_(...)
+ *   （原来是裸全局 _createTaskDirect_，见 00_Project_State.gs "已知Bug"
+ *   第1条修复）。V4.7 起 identity 生成改用
+ *   IdentityEngine.resolveIdentityDueValue(meta)，不再直接读
+ *   meta.due_date。
  * 10_ProjectionEngine.gs — 【V4 扩展，V4.6 移除 TaskStatistics 维护】
  *   dispatch 新增 TASK_UPDATED case；新增对 TaskFilters（搜索用扁平表
  *   逐行 upsert）表的同步维护。V4.6 起不再对 TaskStatistics 做同步增量
  *   维护——原来的 _bumpStatistics_ 已删除，见 00_ADR.gs
  *   ADR-2026-07-06-005。
- * 11_ProjectionRebuilder.gs — 【V4 修复+扩展，V4.6 新增每日常规维护】
+ * 11_ProjectionRebuilder.gs — 【V4 修复+扩展，V4.6 新增每日常规维护，
+ *   V4.7 新增 Due Time Support 迁移入口】
  *     1. 删除 rebuildInventoryProjection() / _markRemovedItemsConsumed_()
  *        （本次审计新发现的 bug，见 00_Project_State.gs）。
  *     2. 新增 rebuildStatisticsProjection() / rebuildTaskFiltersProjection()，
@@ -98,6 +121,13 @@
  *        Events）按 chat_id 聚合重算 TaskStatistics，是这张表现在的
  *        常规维护方式，由 triggerDailyStatisticsRecompute()（15_Setup.gs
  *        每日触发器调用）触发。
+ *     4. 【V4.7新增】migrateSchemaDueTime()：既有部署的 due_time/
+ *        due_datetime 列迁移入口，模式跟既有的 migrateSchemaV4() 一致，
+ *        额外调用新增的 _setPlainTextFormatForNewColumns_() 修复
+ *        Finding DT-2（_addColumnsIfMissing_ 本身不给新列设纯文本格式，
+ *        due_time 这种 'HH:mm' 形状的值会被 Sheets 自动识别成 Time 类型）。
+ *        rebuildTasksProjection()/rebuildActiveTasksProjection() 两处
+ *        identity 重算改用 IdentityEngine.resolveIdentityDueValue(task)。
  * 12_TaskQueryEngine.gs — 【V4 改名+中心化】原 12_QueryEngine.gs。
  *   规格书要求的"centralized query API"：getTask / getTasks /
  *   getTodayTasks / getWeekTasks / getMonthTasks / getOverdueTasks /
@@ -111,22 +141,34 @@
  *   TaskStatistics 不在这个"允许直接读"的列表里——目前没有任何查询路径
  *   读取它，它只被 11_ProjectionRebuilder.gs 的两个函数写入，见
  *   00_ADR.gs ADR-2026-07-06-005。
- * 20_TaskEngine.gs — 【V4 改名+IIFE封装】原 20_ProductivityModule.gs。
+ * 20_TaskEngine.gs — 【V4 改名+IIFE封装，V4.7 新增 Due Time Support】
+ *   原 20_ProductivityModule.gs。
  *   createTask / updateTask（V4新增） / completeTask / cancelTask /
  *   createTaskDirect_（原_createTaskDirect_，改为 IIFE 内部方法，只允许
  *   09_IdempotencyManager 调用）/ deriveFromEvent / deriveTaskState_ /
  *   materializeTaskRow_（原_materializeTaskRow_）/ rebuildTasksSheet_。
  *   保留同名全局函数 createTask/completeTask/cancelTask/getPendingTasks 作
  *   向后兼容 wrapper，Core 项目 04_Main.gs 的既有 Library 调用不用改。
+ *   V4.7 变更：新增私有函数 _computeDueDatetime_（due_date+due_time 派生
+ *   出 due_datetime）；createTaskDirect_ 的 task 对象新增 due_time/
+ *   due_datetime；ProductivityConfig.IDENTITY_AFFECTING_FIELDS /
+ *   UPDATABLE_FIELDS 新增 due_time；updateTask 在 due_date/due_time 变化
+ *   时重算 due_datetime，identity 重算改用
+ *   IdentityEngine.resolveIdentityDueValue(merged)。
  *
  * ── Intelligence ────────────────────────────────────────────────────────
  *
- * 21_RecurringEngine.gs — 【V4 新增】recurring rules（包装
+ * 21_RecurringEngine.gs — 【V4 新增，V4.7 新增 Due Time Support】
+ *   recurring rules（包装
  *   09_TemporalParser.gs 的重复规则解析）/ next occurrence（
  *   computeNextDueDate，包装 computeNextDueDateFromLabel）/ recurrence
  *   lifecycle（spawnNextIfNeeded，原 20_ProductivityModule.gs 的
  *   _spawnNextRecurrenceIfNeeded_ 搬到这里，20_TaskEngine.completeTask
- *   改成调用 RecurringEngine.spawnNextIfNeeded）。
+ *   改成调用 RecurringEngine.spawnNextIfNeeded）。V4.7 起
+ *   spawnNextIfNeeded 改用 IdentityEngine.resolveIdentityDueValue(task)
+ *   取值喂给 computeNextDueDate，拿到结果后按有没有带时间拆回 next
+ *   due_date/due_time——效果是 recurring 任务如果带具体时间会正确延续
+ *   到下一次实例，不会被重置成没有时间。
  * 22_PriorityEngine.gs — 【V4 新增】computePriorityScore / computeUrgencyScore /
  *   suggestPriority。纯函数，输入是 TaskQueryEngine 已经读出的 task 对象，
  *   不读 Sheet。永不自动改任务（00_Project_Constitution.gs P5）。
@@ -156,9 +198,13 @@
  *
  * ── Testing/Setup ───────────────────────────────────────────────────────
  *
- * 15_Setup.gs — 【V4 扩展，V4.6 新增触发器】setupSheets 新增建
+ * 15_Setup.gs — 【V4 扩展，V4.6 新增触发器，V4.7 新增 Due Time
+ *   Support 表头】setupSheets 新增建
  *   TaskStatistics/TaskFilters 两张表；Tasks/ActiveTasks/ArchiveTasks
- *   表头新增 description/tags 两列（向后兼容追加列）；
+ *   表头新增 description/tags 两列（向后兼容追加列），V4.7 起再新增
+ *   due_time/due_datetime 两列（紧跟 due_date 之后，同样是向后兼容
+ *   追加列，已有部署走 11_ProjectionRebuilder.gs 的
+ *   migrateSchemaDueTime()，不需要重跑本文件）；
  *   createTriggers/repairSheetHeaders/runDiagnostics 同步更新。
  *   createTriggers() 现在挂两个每日触发器：triggerDailyArchive（凌晨2点，
  *   13_ActiveTasksEngine.gs）和 triggerDailyStatisticsRecompute（凌晨3点，
@@ -229,6 +275,7 @@
  * 21_RecurringEngine.gs
  *   → 09_TemporalParser.gs (computeNextDueDateFromLabel)
  *   → 09_IdempotencyManager.gs (createTaskIfNotExists，生成下一次实例用)
+ *   → 07_IdentityEngine.gs (resolveIdentityDueValue，V4.7 新增)
  *
  * 22_PriorityEngine.gs ← 纯函数，零 Sheet/Event 依赖
  * 23_SearchEngine.gs   ← 纯函数，零 Sheet/Event 依赖

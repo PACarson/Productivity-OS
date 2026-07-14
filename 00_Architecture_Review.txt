@@ -1239,7 +1239,18 @@
  *                调用，无一处需要修改现有函数的对外签名或删除现有
  *                行为），9 个文件被逐一核实确认不需要改动。全部存量
  *                任务的 identity 在迁移前后逐字节不变，是一条可在
- *                实现阶段直接写单元测试验证的具体不变量。
- * Status:        DESIGN — 待 Carson 批准后方可进入实现（本次未修改
- *                任何 .gs 代码文件，只完成本篇 Review/设计文档）。
+ *                实现阶段直接写单元测试验证的具体不变量——2026-07-13
+ *                实现阶段已把这条断言写进
+ *                07_IdentityEngine.testIdentity()（第5/6组用例），不是
+ *                停留在"应该没问题"。
+ * Status:        IMPLEMENTED（2026-07-13，Carson 批准设计后同日实现）——
+ *                8 个代码文件改动 + Finding DT-2 的修复已随
+ *                migrateSchemaDueTime() 一并写入，正式 ADR 记录见
+ *                00_ADR.gs ADR-2026-07-13-008。已有部署仍需手动执行一次
+ *                migrateSchemaDueTime() 完成迁移（见「四、4.4」执行顺序），
+ *                这一步不因为"设计已批准"而自动发生。「八」
+ *                Pending Design Decision 的 Semantic/UX 两项已在实现中
+ *                拍板（见 2.2/06_TaskIntentParser 的 _formatDueDisplay_
+ *                注释），Migration/Governance 两项仍待 Architecture
+ *                Owner 决定，不阻塞已完成部分。
  */

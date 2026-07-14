@@ -1,9 +1,13 @@
 /**
  * 00_Project_State.gs
- * Productivity OS v4.6 — 项目状态快照
+ * Productivity OS v4.7 — 项目状态快照
  *
  * ⚠️ 快照，不是日志。每次更新覆盖旧状态。
- * LAST_UPDATED: 2026-07-06 — V4.6：第五轮外部审计，逐条核实后处理——
+ * LAST_UPDATED: 2026-07-13 — V4.7：Due Time Support 落地，完整设计+审查
+ * 见 00_Architecture_Review.gs「七、Review #3」，Carson 2026-07-13 批准
+ * 后实现。8 个代码文件改动，1 条 MEDIUM Finding（DT-2）已一并修复，
+ * 正式 ADR 记录见 00_ADR.gs ADR-2026-07-13-008。完整细节见"一、已完成"
+ * 本条最新条目。V4.6：第五轮外部审计，逐条核实后处理——
  * 4 项确认修复（2 HIGH + 1 MEDIUM + 1 LOW，其中 HIGH1+HIGH4 是同一个
  * 架构决策解决的两个侧面：TaskStatistics 降级为每日批量重算，见
  * 00_ADR.gs ADR-2026-07-06-005）+ 1 项确认修复但判断"部分采纳"（MEDIUM1，
@@ -24,7 +28,57 @@
 // ============================================================
 
 /**
- * - 2026-07-06（V4.6，本次）：第五轮外部审计，逐条核实（"再三检查是否
+ * - 2026-07-13（V4.7，本次）：Due Time Support——Task 新增 due_time/
+ *   due_datetime 两个字段（due_date 保留、语义不变），Reminder 调度/
+ *   通知逻辑明确不在本项目范围内。完整设计+审查见
+ *   00_Architecture_Review.gs「七、Review #3」，Carson 2026-07-13 批准
+ *   后实现。核心发现：现有架构在字符串格式层面早就隐式支持时间（
+ *   09_TemporalParser.extractDateTime 偶尔把时间折叠进 due_date 字符串，
+ *   05_SheetUtils.parseDueDate_/computeNextDueDateFromLabel 都已经正确
+ *   处理这种情况，包括 recurring 任务续期时间的正确延续）——本次改动
+ *   的本质是把这个已经工作的能力提升为显式 Schema 字段，不是新建时间
+ *   处理逻辑，因此改动面比"加时间支持"字面听起来的要小。
+ *
+ *   代码改动（8 个文件，全部新增字段/新增调用，无破坏性变更）：
+ *   15_Setup.gs（表头新增两列）、11_ProjectionRebuilder.gs（新增
+ *   migrateSchemaDueTime() 既有部署迁移入口，含纯文本格式修复，见下方
+ *   Finding DT-2）、09_TemporalParser.gs（extractDateTime 返回值拆出
+ *   due_time/due_datetime，due_date 从此永远是纯日期）、
+ *   07_IdentityEngine.gs（新增 resolveIdentityDueValue() 辅助函数）、
+ *   09_IdempotencyManager.gs / 20_TaskEngine.gs / 21_RecurringEngine.gs
+ *   （identity 计算改用上述辅助函数）、06_TaskIntentParser.gs（转发
+ *   新字段+统一展示格式）。9 个文件逐一核实确认不需要改动
+ *   （02_EventBus/10_ProjectionEngine 的通用透传逻辑、
+ *   12_TaskQueryEngine 的按表头名通用读取、22-26 五个纯函数 View/
+ *   Priority/Search/Dashboard/Analytics Engine）。
+ *
+ *   【Finding DT-2，MEDIUM，已在本次一并修复】
+ *   11_ProjectionRebuilder._addColumnsIfMissing_() 本身不会给新增列设
+ *   纯文本格式，而 due_time 这种 'HH:mm' 形状的值会被 Google Sheets
+ *   自动类型识别成 Time 类型，静默改变存储形式。新增
+ *   _setPlainTextFormatForNewColumns_()，随 migrateSchemaDueTime() 一并
+ *   调用，补上 15_Setup._ensureSheet_() 对全新建表已经在做的同一件事。
+ *
+ *   【向后兼容不变量，已写进单元测试】全部存量任务（due_time 恒为空）
+ *   的 identity 哈希迁移前后逐字节不变——07_IdentityEngine.testIdentity()
+ *   新增断言直接验证这一点，不是靠人工检查。
+ *
+ *   【设计决策，正式记录见 00_ADR.gs ADR-2026-07-13-008】(1) identity
+ *   计算不改 generateTaskIdentity() 签名，改由调用方通过新增的
+ *   resolveIdentityDueValue() 辅助函数传入正确的值；(2) due_datetime
+ *   没有具体时间时为空字符串，不默认成午夜，避免"用户真说了凌晨0点"
+ *   和"根本没提时间"这两种情况无法区分。
+ *
+ *   Pending Design Decisions（不阻塞本次已完成的部分，见
+ *   00_Architecture_Review.gs「七」「八」）：due_datetime 空值语义已按
+ *   上述决策拍板；存量 due_date 里已隐含时间的历史行是否需要一次性
+ *   回填拆分（Migration 类）；06_TaskIntentParser 到期日展示格式已按
+ *   "日期 时间"直接实现（UX 类，Architecture Owner 之后如有不同偏好，
+ *   只需改 _formatDueDisplay_ 一处）；本次变更是否让 Schema Authority
+ *   （ADR-2026-07-06-002）触发条件（b）成立，需要对照本文件完整
+ *   changelog 计数确认（Governance 类，本次未做这个计数）。
+ *
+ * - 2026-07-06（V4.6，上一次）：第五轮外部审计，逐条核实（"再三检查是否
  *   需要修复"）后处理，不是照单全收：
  *
  *   【确认修复，HIGH1+HIGH4 一并解决】TaskStatistics 并发漂移

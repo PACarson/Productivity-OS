@@ -1,6 +1,6 @@
 /**
  * 00_Project_Constitution.gs
- * Productivity OS v4.6 — 项目宪法
+ * Productivity OS v4.7 — 项目宪法
  *
  * 本文件只放这个 OS 自己的东西。平台级原则（IMIOR、UDP、Engine 命名规范等）
  * 的权威定义在 Personal AI Core 项目的 00_Project_Constitution.gs，这里只做
@@ -10,7 +10,14 @@
  * 00_ADR.gs + 00_Roadmap.gs + 00_Architecture_Review.gs（后者记录了
  * 尚未关闭的 Review 发现，尤其是测试覆盖缺口，见该文件「五、待决问题」）。
  *
- * LAST_UPDATED: 2026-07-11 — 完成 UEF（Universal Engineering Framework）
+ * LAST_UPDATED: 2026-07-13 — V4.7 Due Time Support 落地（完整设计见
+ * 00_Architecture_Review.gs「七、Review #3」，Carson 2026-07-13 批准后
+ * 实现）：Event Definition Standard 的 TASK_CREATED/TASK_UPDATED 两条
+ * Payload/Example 补充 due_time/due_datetime 字段说明。Reminder 调度、
+ * 通知发送不在本项目职责范围内（Productivity OS 只负责任务自己知道
+ * 自己什么时候到期），这条边界本次未变。
+ *
+ * 2026-07-11 — 完成 UEF（Universal Engineering Framework）
  * v1.0 ratify 后本项目第一次正式 Domain Profile Architecture Review，
  * 完整记录见新增的 00_Architecture_Review.gs。Governance 目录从 7 份
  * 扩到 8 份，P4 Governance 一节相应补充引用（详见下方 P4）。同时
@@ -506,16 +513,23 @@
  * ── TASK_CREATED ──────────────────────────────────────────────────────────
  *   Purpose         : 一个新任务被创建
  *   Payload         : 完整 task 对象（task_id/identity/timestamp/title/
- *                     category/status/due_date/recurring/priority/context/
- *                     budget/notes/description/tags/chat_id/completed_at/
- *                     reminder_count/archived）
+ *                     category/status/due_date/due_time/due_datetime/
+ *                     recurring/priority/context/budget/notes/description/
+ *                     tags/chat_id/completed_at/reminder_count/archived）
+ *                     【V4.7 新增，Due Time Support】due_time（'HH:mm' 或
+ *                     ''）、due_datetime（due_date+due_time 派生的 ISO
+ *                     字符串，没有具体时间时为 ''，见 20_TaskEngine.gs
+ *                     _computeDueDatetime_）
  *   Required Fields : task_id, title, chat_id
  *   Projection Updated: Tasks（新增行）, ActiveTasks（新增行）,
  *                     TaskFilters（新增行）
  *   Example         : { task_id:"TSK-20260706-A1B2C3", title:"交房租",
  *                     category:"ADMIN", status:"PENDING",
- *                     due_date:"2026-07-10", priority:"HIGH", chat_id:"123" }
- *   Version         : V3（原 20_ProductivityModule.gs 起）
+ *                     due_date:"2026-07-10", due_time:"10:00",
+ *                     due_datetime:"2026-07-10T10:00:00", priority:"HIGH",
+ *                     chat_id:"123" }
+ *   Version         : V3（原 20_ProductivityModule.gs 起），V4.7 起新增
+ *                     due_time/due_datetime
  *   Source Module   : 20_TaskEngine.createTaskDirect_（只能被
  *                     09_IdempotencyManager.createTaskIfNotExists 间接触发）
  *   Destination Projection: 10_ProjectionEngine.projectTaskCreated_
@@ -523,16 +537,19 @@
  * ── TASK_UPDATED（V4新增）────────────────────────────────────────────────
  *   Purpose         : 一个已存在任务的可编辑字段被修改
  *   Payload         : { task_id, 以下任意子集: title/category/priority/
- *                     due_date/recurring/context/budget/notes/description/
- *                     tags/identity（identity 仅在上述字段任一变更时由
- *                     20_TaskEngine.updateTask 自动附带，见 V4.2 HIGH RISK 2
- *                     修复）}
+ *                     due_date/due_time/due_datetime/recurring/context/
+ *                     budget/notes/description/tags/identity（identity 仅
+ *                     在上述字段任一变更时由 20_TaskEngine.updateTask 自动
+ *                     附带，见 V4.2 HIGH RISK 2 修复；due_datetime 仅在
+ *                     due_date 或 due_time 任一变更时由 updateTask 自动
+ *                     重算附带，不接受外部直接传入，见 V4.7 Due Time
+ *                     Support）}
  *   Required Fields : task_id
  *   Projection Updated: Tasks（覆写变更字段）, ActiveTasks（若任务当前
  *                     非终态）, TaskFilters（重新拼 searchable_text）
  *   Example         : { task_id:"TSK-20260706-A1B2C3", priority:"CRITICAL" }
  *   Version         : V4（20_TaskEngine.updateTask 新增），V4.2 起可能带
- *                     identity 字段
+ *                     identity 字段，V4.7 起可能带 due_time/due_datetime
  *   Source Module   : 20_TaskEngine.updateTask（唯一发布方，不经过
  *                     IdempotencyManager，见 00_File_Map.gs 架构铁律5）
  *   Destination Projection: 10_ProjectionEngine.projectTaskUpdated_

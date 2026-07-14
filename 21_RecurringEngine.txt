@@ -1,6 +1,16 @@
 /**
  * 21_RecurringEngine.gs
- * Productivity OS v4.3 — Recurring Engine（V4 新增）
+ * Productivity OS v4.7 — Recurring Engine（V4 新增）
+ *
+ * 【V4.7 新增，Due Time Support，00_Architecture_Review.gs「七、
+ * Review #3」，Carson 2026-07-13 批准】spawnNextIfNeeded 改用
+ * IdentityEngine.resolveIdentityDueValue(task) 取值喂给
+ * computeNextDueDate（而不是裸 task.due_date），拿到结果后按有没有 'T'
+ * 拆回 next due_date / next due_time 两个字段。computeNextDueDate /
+ * computeNextDueDateFromLabel（09_TemporalParser.gs）本身未改一行——
+ * 已有的"侦测输入带不带时间、保留同样格式输出"逻辑对新的调用方式天然
+ * 兼容。效果：recurring 任务如果带具体时间（比如"每天早上8点"），下一次
+ * 实例会正确延续同一个时间，不会被重置成没有时间。
  *
  * 职责：recurring rules（包装 09_TemporalParser.gs 的重复规则解析）/
  * next occurrence（下一次到期日计算）/ recurrence lifecycle（完成后自动
@@ -14,7 +24,8 @@
  * 要支持 ND/NW/interval>1 的完整续期，只需要改这个文件，不影响 TaskEngine）。
  *
  * 依赖：09_TemporalParser.gs（computeNextDueDateFromLabel）、
- * 09_IdempotencyManager.gs（createTaskIfNotExists）
+ * 09_IdempotencyManager.gs（createTaskIfNotExists）、
+ * 07_IdentityEngine.gs（resolveIdentityDueValue，V4.7 新增）
  */
 
 /**
@@ -33,7 +44,9 @@
  *                           describeRule(recurringLabel),
  *                           spawnNextIfNeeded(task, chatId)
  *   Dependencies          : 09_TemporalParser.gs（computeNextDueDateFromLabel）、
- *                           09_IdempotencyManager.gs（createTaskIfNotExists）
+ *                           09_IdempotencyManager.gs（createTaskIfNotExists）、
+ *                           07_IdentityEngine.gs（resolveIdentityDueValue，
+ *                           V4.7 新增，Due Time Support）
  *   Forbidden Dependencies: Sheet 直接读写、Events 直接发布、Telegram/Output
  *   Pure Function         : NO（spawnNextIfNeeded 间接触发写入；
  *                           ruleToLegacyString/computeNextDueDate/
@@ -121,10 +134,11 @@ var RecurringEngine = (function () {
    *
    * 幂等性说明：不需要单独加锁/去重保护。走的是
    * IdempotencyManager.createTaskIfNotExists同一条路径，算出来的
-   * identity=hash(chat_id+title+due_date+recurring+priority+category)——
-   * 只要task.due_date没变，两次调用（比如webhook重试导致completeTask被
-   * 调两次）算出的nextDueDate完全一样，DeduplicationEngine会把第二次识别
-   * 成"已存在"直接跳过。
+   * identity=hash(chat_id+title+resolveIdentityDueValue(task)+recurring+
+   * priority+category)——【V4.7】resolveIdentityDueValue 取 due_datetime
+   * （若有 due_time）或 due_date，只要task这两个字段没变，两次调用（比如
+   * webhook重试导致completeTask被调两次）算出的nextDueValue完全一样，
+   * DeduplicationEngine会把第二次识别成"已存在"直接跳过。
    *
    * @param {object} task  完成前的task快照（TaskQueryEngine.getTask的返回值）
    * @param {string} chatId
@@ -134,13 +148,27 @@ var RecurringEngine = (function () {
     if (!task || !task.recurring || !task.due_date) return null;
 
     try {
-      var nextDueDate = computeNextDueDate(task.due_date, task.recurring);
-      if (!nextDueDate) return null;
+      // 【V4.7，Due Time Support】取 due_datetime（若有 due_time）或
+      // due_date——09_TemporalParser.computeNextDueDateFromLabel() 本身
+      // 就是格式保留的（侦测输入带不带时间，输出保持同样格式），不需要
+      // 改那个函数一行。
+      var prevDueValue = IdentityEngine.resolveIdentityDueValue(task);
+      var nextDueValue = computeNextDueDate(prevDueValue, task.recurring);
+      if (!nextDueValue) return null;
+
+      // nextDueValue 可能是纯日期，也可能是带时间的 ISO 字符串——按有没有
+      // 'T' 拆回 next due_date / next due_time 两个字段，喂给下面的
+      // meta；due_datetime 由 TaskEngine.createTaskDirect_ 内部从这两者
+      // 派生，这里不需要单独算。
+      var hasTime    = /T\d{2}:\d{2}:\d{2}/.test(nextDueValue);
+      var nextDueDate = hasTime ? nextDueValue.split('T')[0]            : nextDueValue;
+      var nextDueTime = hasTime ? nextDueValue.split('T')[1].slice(0, 5) : '';
 
       var result = IdempotencyManager.createTaskIfNotExists(
         task.title,
         {
           due_date:    nextDueDate,
+          due_time:    nextDueTime,
           recurring:   task.recurring,
           category:    task.category,
           priority:    task.priority,

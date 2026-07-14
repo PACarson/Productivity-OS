@@ -1,6 +1,15 @@
 /**
  * 06_TaskIntentParser.gs
- * Productivity OS v4.5 — 任务意图解析器
+ * Productivity OS v4.7 — 任务意图解析器
+ *
+ * 【V4.7 新增，Due Time Support，00_Architecture_Review.gs「七、
+ * Review #3」，Carson 2026-07-13 批准】parseTaskIntent() 的 TASK_CREATE
+ * 分支和 createTaskIfNotExists 的 meta 对象都新增转发 due_time/
+ * due_datetime（此前只转发 due_date）——沿用
+ * 00_Known_Limitations.gs"自然语言解析范围止于 due_date/recurring"这条
+ * 既有边界，这里是同一类"时间解析"能力的延伸，不是新增 category/
+ * priority 这类语义推断。新增共用辅助函数 _formatDueDisplay_()，5 处
+ * 展示文案统一在有 due_time 时于日期后追加"HH:mm"。
  *
  * 【V4.4 配套 HIGH RISK 1 修复】TASK_DONE/TASK_CANCEL 分支新增对
  * completeTask/cancelTask 新返回信号（already_done/already_cancelled/
@@ -126,6 +135,8 @@ function parseTaskIntent(rawText) {
     intent:          'TASK_CREATE',
     title:           title,
     due_date:        dt.due_date        || '',
+    due_time:        dt.due_time        || '',
+    due_datetime:    dt.due_datetime    || '',
     recurrence_rule: dt.recurrence_rule || null
   };
 }
@@ -156,7 +167,12 @@ function handleTaskIntent(rawText, chatId) {
       try {
         result = IdempotencyManager.createTaskIfNotExists(
           parsed.title,
-          { due_date: parsed.due_date, recurring: recurringLabel },
+          {
+            due_date:     parsed.due_date,
+            due_time:     parsed.due_time,
+            due_datetime: parsed.due_datetime,
+            recurring:    recurringLabel
+          },
           chatId
         );
       } catch (e) {
@@ -276,7 +292,7 @@ function handleTaskIntent(rawText, chatId) {
       var doneReply = '✅ 完成: ' + parsed.task_id;
       if (completeResult && completeResult.next_task) {
         doneReply += '\n🔁 已自动创建下一次: ' + completeResult.next_task.task_id +
-                     '（' + completeResult.next_task.due_date + '）';
+                     '（' + _formatDueDisplay_(completeResult.next_task) + '）';
       }
       return { matched: true, intent: 'TASK_DONE', data: { task_id: parsed.task_id }, replyText: doneReply };
     }
@@ -316,9 +332,23 @@ function handleTaskIntent(rawText, chatId) {
 
 // ============ 回复文案 ============
 
+/**
+ * 【V4.7 新增，Due Time Support】统一到期日展示格式——有 due_time 就在
+ * 日期后面加 "HH:mm"，没有就只显示日期。5 处展示位置共用，避免各自
+ * 重复同一句判断。具体展示格式属于 00_Architecture_Review.gs「七、
+ * Review #3」「八」Pending Design Decision #3（Decision Type: UX，
+ * 当时标注"本次不预先定稿"）——这里先按最直白的"日期 时间"实现，以后
+ * 如果 Architecture Owner 有不同偏好，只需要改这一个函数，不用改 5 个
+ * 调用点。
+ */
+function _formatDueDisplay_(task) {
+  if (!task || !task.due_date) return '';
+  return task.due_time ? (task.due_date + ' ' + task.due_time) : task.due_date;
+}
+
 function _buildCreateReply_(task) {
   var lines = ['✅ 已建任务', 'ID: ' + task.task_id, '标题: ' + task.title];
-  if (task.due_date) lines.push('到期: ' + task.due_date);
+  if (task.due_date) lines.push('到期: ' + _formatDueDisplay_(task));
   if (task.recurring) lines.push('🔁 重复: ' + task.recurring);
   return lines.join('\n');
 }
@@ -330,7 +360,7 @@ function _buildDuplicateTaskReply_(task) {
     '标题: ' + task.title,
     '状态: ' + (task.status || 'PENDING')
   ];
-  if (task.due_date) lines.push('到期: ' + task.due_date);
+  if (task.due_date) lines.push('到期: ' + _formatDueDisplay_(task));
   lines.push('');
   lines.push('如需再建一个，请改变标题或日期。');
   return lines.join('\n');
@@ -340,7 +370,7 @@ function _buildListReply_(tasks) {
   if (!tasks || tasks.length === 0) return '🎉 没有待办任务';
   var lines = ['📋 待办任务（' + tasks.length + '）'];
   tasks.forEach(function (t, idx) {
-    var due = t.due_date ? (' | 到期: ' + t.due_date) : '';
+    var due = t.due_date ? (' | 到期: ' + _formatDueDisplay_(t)) : '';
     lines.push((idx + 1) + '. [' + t.task_id + '] ' + t.title + ' (' + (t.priority || 'MEDIUM') + ')' + due);
   });
   return lines.join('\n');
@@ -375,7 +405,7 @@ function _buildSimpleListReply_(label, tasks) {
   if (!tasks || tasks.length === 0) return label + '：没有任务';
   var lines = [label + '（' + tasks.length + '）'];
   tasks.forEach(function (t, idx) {
-    var due = t.due_date ? (' | ' + t.due_date) : '';
+    var due = t.due_date ? (' | ' + _formatDueDisplay_(t)) : '';
     lines.push((idx + 1) + '. [' + t.task_id + '] ' + t.title + due);
   });
   return lines.join('\n');
