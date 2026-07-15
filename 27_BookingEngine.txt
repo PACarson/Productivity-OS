@@ -1,0 +1,799 @@
+// ============================================================
+// 27_BookingEngine.gs — Layer 4: Booking Strategy Engine
+// Tracks + scores Grab slot bookings for next 28 days
+// Slots: S1-S8 per day, scored by time + day-of-week value
+// MAX 15 booked slots at any time
+// ============================================================
+
+const BookingEngine = (() => {
+
+  // ── /book — pending slots sorted by score ────────────────
+
+  function dashboard(event) {
+    const { chatId } = event;
+
+    try {
+      const pending = _getPendingSlots();
+      const stats   = _getBookingStats();
+      const tz      = Session.getScriptTimeZone();
+      const now     = new Date();
+      const tmStr   = _dateStr(new Date(now.getTime() + 86400000),  tz);
+      const daStr   = _dateStr(new Date(now.getTime() + 172800000), tz);
+      const tmRate  = _getDayRate(tmStr);
+      const daRate  = _getDayRate(daStr);
+
+      let msg = `📅 <b>BOOKING DASHBOARD</b>\n\n`;
+
+      // Overview
+      msg += `<b>Overview</b>\n`;
+      msg += `Tomorrow:     ${_rateBar(tmRate)} ${tmRate}%\n`;
+      msg += `Day After:    ${_rateBar(daRate)} ${daRate}%\n`;
+      msg += `Total Booked: ${stats.booked} / ${CONFIG.BOOKING.MAX_SLOTS}\n`;
+
+      if (stats.booked >= CONFIG.BOOKING.MAX_SLOTS) {
+        msg += `🚨 SLOT LIMIT REACHED\n`;
+      } else if (stats.booked >= CONFIG.BOOKING.WARN_THRESHOLD) {
+        msg += `⚠️ Approaching slot limit\n`;
+      }
+
+      msg += `\n`;
+
+      if (pending.length === 0) {
+        msg += `✅ All upcoming slots booked!\n`;
+        TelegramService.send(chatId, msg);
+        return;
+      }
+
+      // Split by priority, already sorted by score desc
+      const critical = pending.filter(p => p.priority === CONFIG.BOOKING.PRIORITY.CRITICAL);
+      const optional = pending.filter(p => p.priority === CONFIG.BOOKING.PRIORITY.OPTIONAL);
+
+      if (critical.length > 0) {
+        msg += `🚨 <b>Critical Missing</b>\n`;
+        critical.forEach((p, i) => {
+          msg += `${i + 1}. ${_slotLine(p)}\n`;
+        });
+      }
+
+      if (optional.length > 0) {
+        const offset = critical.length;
+        msg += `\n⚪ <b>Optional Missing</b>\n`;
+        optional.forEach((p, i) => {
+          msg += `${offset + i + 1}. ${_slotLine(p)}\n`;
+        });
+      }
+
+      msg += `\n/booked &lt;n&gt; to mark booked`;
+      msg += `\n/unbook &lt;n&gt; to cancel`;
+
+      TelegramService.send(chatId, msg);
+
+    } catch (err) {
+      AlertService.log(CONFIG.ALERT_LEVEL.ERROR, 'BookingEngine', 'dashboard', '/book', err.message);
+      TelegramService.send(chatId, `⚠️ Error: ${err.message}`);
+    }
+  }
+
+  // ── /bookall — all slots next 7 days ─────────────────────
+
+  function all(event) {
+    const { chatId } = event;
+
+    try {
+      const tz   = Session.getScriptTimeZone();
+      const now  = new Date();
+      const rows = _getUpcomingRows(7);
+
+      if (rows.length === 0) {
+        TelegramService.send(chatId, '— No booking data. Run /booksetup first.');
+        return;
+      }
+
+      const C      = CONFIG.COL.BOOKING_PLAN;
+      const byDate = {};
+
+      for (const row of rows) {
+        const date = _fmtRowDate(row[C.DATE - 1], tz);
+        if (!byDate[date]) byDate[date] = [];
+        byDate[date].push(row);
+      }
+
+      let msg = `📅 <b>ALL SLOTS (Next 7 Days)</b>\n`;
+
+      for (const [date, dayRows] of Object.entries(byDate)) {
+        const label = _dateLabel(date, now, tz);
+        msg += `\n<b>${label}</b>\n`;
+        for (const row of dayRows) {
+          const slotCode  = row[C.SLOT_CODE      - 1];
+          const timeRange = row[C.TIME_RANGE      - 1];
+          const priority  = row[C.PRIORITY        - 1];
+          const score     = row[C.BOOKING_SCORE   - 1];
+          const booked    = String(row[C.BOOKED   - 1]).toUpperCase() === 'TRUE';
+          const icon      = booked ? '✅' : (priority === CONFIG.BOOKING.PRIORITY.CRITICAL ? '🔴' : '⚪');
+          msg += `${icon} ${slotCode} ${timeRange}  [${score}]\n`;
+        }
+      }
+
+      TelegramService.send(chatId, msg);
+
+    } catch (err) {
+      AlertService.log(CONFIG.ALERT_LEVEL.ERROR, 'BookingEngine', 'all', '/bookall', err.message);
+      TelegramService.send(chatId, `⚠️ Error: ${err.message}`);
+    }
+  }
+
+  // ── /bookweek — 今天起到周日，周五显示当天+7天───────────────────────────
+
+  function week(event) {
+    const { chatId } = event;
+
+    try {
+      const tz       = Session.getScriptTimeZone();
+      const now      = new Date();
+      const dayNum   = Number(Utilities.formatDate(now, tz, 'u')); // 1=Mon 7=Sun
+      const isFriday = dayNum === 5;
+
+      // Days to show: today → Sunday (end of current week)
+      // On Friday: show today + next 7 days
+      const daysUntilSun = 7 - dayNum; // 0 if Sunday
+      const totalDays    = isFriday ? 7 : daysUntilSun;
+
+      let msg = `📅 <b>BOOKING WEEK</b>\n\n`;
+
+      if (totalDays === 0) {
+        msg += `Today is Sunday — new week starts tomorrow.\n`;
+        TelegramService.send(chatId, msg);
+        return;
+      }
+
+      for (let d = 0; d <= totalDays; d++) {
+        const date    = new Date(now.getTime() + d * 86400000);
+        const dateStr = _dateStr(date, tz);
+        const label   = d === 0 ? `Today (${Utilities.formatDate(date, tz, 'EEE dd/MM')})` :
+                        _dateLabel(dateStr, now, tz);
+        const rate    = _getDayRate(dateStr);
+        const crit    = _getCriticalMissing(dateStr);
+
+        msg += `<b>${label}</b>\n`;
+        msg += `${_rateBar(rate)} ${rate}%`;
+        if (crit > 0) msg += `  🚨 ${crit} critical missing`;
+        msg += `\n`;
+      }
+
+      const stats = _getBookingStats();
+      msg += `\n<b>Total booked:</b> ${stats.booked} / ${CONFIG.BOOKING.MAX_SLOTS}`;
+
+      // Friday special reminder
+      if (isFriday) {
+        msg += `\n\n🚨 <b>Friday — Next week opens tonight!</b>\n`;
+        msg += `Use /bookscore to see top opportunities.`;
+      }
+
+      TelegramService.send(chatId, msg);
+
+    } catch (err) {
+      AlertService.log(CONFIG.ALERT_LEVEL.ERROR, 'BookingEngine', 'week', '/bookweek', err.message);
+      TelegramService.send(chatId, `⚠️ Error: ${err.message}`);
+    }
+  }
+
+  // ── /bookscore — top value missing slots ─────────────────
+
+  function score(event) {
+    const { chatId } = event;
+
+    try {
+      const pending = _getPendingSlots(14); // next 14 days
+      const top     = pending.slice(0, 10); // top 10 by score
+
+      if (top.length === 0) {
+        TelegramService.send(chatId, '✅ All high-value slots already booked!');
+        return;
+      }
+
+      let msg = `🏆 <b>TOP BOOKING OPPORTUNITIES</b>\n`;
+      msg    += `(Next 14 days, by value)\n\n`;
+
+      top.forEach((p, i) => {
+        const icon = p.priority === CONFIG.BOOKING.PRIORITY.CRITICAL ? '🔴' : '⚪';
+        msg += `${i + 1}. ${icon} ${_dateLabel(p.date, new Date(), Session.getScriptTimeZone())} ${p.time}\n`;
+        msg += `   Score: ${p.score}\n`;
+      });
+
+      msg += `\nBook with: /booked &lt;n&gt;`;
+
+      TelegramService.send(chatId, msg);
+
+    } catch (err) {
+      AlertService.log(CONFIG.ALERT_LEVEL.ERROR, 'BookingEngine', 'score', '/bookscore', err.message);
+      TelegramService.send(chatId, `⚠️ Error: ${err.message}`);
+    }
+  }
+
+  // ── /booked <n> [n2 n3] ───────────────────────────────────
+
+  function mark(event) {
+    const { chatId, payload } = event;
+    const { indices } = payload;
+
+    try {
+      const pending = _getPendingSlots();
+
+      if (pending.length === 0) {
+        TelegramService.send(chatId, '✅ No pending slots to book.');
+        return;
+      }
+
+      const stats = _getBookingStats();
+      if (stats.booked >= CONFIG.BOOKING.MAX_SLOTS) {
+        TelegramService.send(chatId,
+          `🚨 Slot limit reached (${stats.booked}/${CONFIG.BOOKING.MAX_SLOTS})\n` +
+          `Use /unbook to free up slots first.\n\n` +
+          `${_suggestRelease()}`
+        );
+        return;
+      }
+
+      const tz      = Session.getScriptTimeZone();
+      const ts      = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HH:mm');
+      const results = [];
+      const C       = CONFIG.COL.BOOKING_PLAN;
+
+      for (const idx of indices) {
+        const slot = pending[idx - 1];
+        if (!slot) { results.push(`❌ #${idx} not found`); continue; }
+
+        const rows = TruthEngine.getRows(CONFIG.SHEETS.BOOKING_PLAN);
+        for (let i = 0; i < rows.length; i++) {
+          const rowDate = _fmtRowDate(rows[i][C.DATE - 1], tz);
+          const rowSlot = rows[i][C.SLOT_CODE - 1];
+          if (rowDate === slot.date && rowSlot === slot.slotCode) {
+            TruthEngine.updateRow(CONFIG.SHEETS.BOOKING_PLAN, i + 1, {
+              [C.BOOKED]:      'TRUE',
+              [C.BOOKED_TIME]: ts,
+            });
+            results.push(`✅ ${_dateLabel(slot.date, new Date(), tz)} ${slot.time} [${slot.score}]`);
+            break;
+          }
+        }
+      }
+
+      const newStats = _getBookingStats();
+      let   capNote  = '';
+
+      if (newStats.booked >= CONFIG.BOOKING.MAX_SLOTS) {
+        capNote = `\n\n🚨 Slot limit reached: ${newStats.booked}/${CONFIG.BOOKING.MAX_SLOTS}\n` +
+                  _suggestRelease();
+      } else if (newStats.booked >= CONFIG.BOOKING.WARN_THRESHOLD) {
+        capNote = `\n\n⚠️ ${newStats.booked}/${CONFIG.BOOKING.MAX_SLOTS} slots used\n` +
+                  _suggestRelease();
+      }
+
+      AlertService.log(CONFIG.ALERT_LEVEL.INFO, 'BookingEngine', 'mark', event.rawText,
+        `Marked: ${indices.join(',')}`);
+
+      TelegramService.send(chatId,
+        `<b>Booking Updated</b>\n\n` +
+        results.join('\n') +
+        capNote
+      );
+
+    } catch (err) {
+      AlertService.log(CONFIG.ALERT_LEVEL.ERROR, 'BookingEngine', 'mark', event.rawText, err.message);
+      TelegramService.send(chatId, `⚠️ Error: ${err.message}`);
+    }
+  }
+
+  // ── /unbook <n> ───────────────────────────────────────────
+
+  function unmark(event) {
+    const { chatId, payload } = event;
+    const { indices } = payload;
+
+    try {
+      const booked  = _getBookedSlots();
+      const tz      = Session.getScriptTimeZone();
+      const results = [];
+      const C       = CONFIG.COL.BOOKING_PLAN;
+
+      for (const idx of indices) {
+        const slot = booked[idx - 1];
+        if (!slot) { results.push(`❌ #${idx} not found`); continue; }
+
+        const rows = TruthEngine.getRows(CONFIG.SHEETS.BOOKING_PLAN);
+        for (let i = 0; i < rows.length; i++) {
+          const rowDate = _fmtRowDate(rows[i][C.DATE - 1], tz);
+          const rowSlot = rows[i][C.SLOT_CODE - 1];
+          if (rowDate === slot.date && rowSlot === slot.slotCode) {
+            TruthEngine.updateRow(CONFIG.SHEETS.BOOKING_PLAN, i + 1, {
+              [C.BOOKED]:      'FALSE',
+              [C.BOOKED_TIME]: '',
+            });
+            results.push(`❌ Unbooked: ${_dateLabel(slot.date, new Date(), tz)} ${slot.time}`);
+            break;
+          }
+        }
+      }
+
+      AlertService.log(CONFIG.ALERT_LEVEL.INFO, 'BookingEngine', 'unmark', event.rawText,
+        `Unbooked: ${indices.join(',')}`);
+
+      TelegramService.send(chatId,
+        `<b>Booking Cancelled</b>\n\n` +
+        results.join('\n')
+      );
+
+    } catch (err) {
+      AlertService.log(CONFIG.ALERT_LEVEL.ERROR, 'BookingEngine', 'unmark', event.rawText, err.message);
+      TelegramService.send(chatId, `⚠️ Error: ${err.message}`);
+    }
+  }
+
+  // ── /booksetup — generate 28 days with scores ────────────
+
+  function setup(event) {
+    const { chatId } = event;
+
+    try {
+      const tz         = Session.getScriptTimeZone();
+      const now        = new Date();
+      const slots      = CONFIG.BOOKING.SLOTS;
+      const multipliers = CONFIG.BOOKING.DAY_MULTIPLIER;
+      let   added      = 0;
+      let   skipped    = 0;
+
+      const existing    = TruthEngine.getRows(CONFIG.SHEETS.BOOKING_PLAN);
+      const existingSet = new Set();
+      const C           = CONFIG.COL.BOOKING_PLAN;
+
+      for (const row of existing) {
+        const date = _fmtRowDate(row[C.DATE - 1], tz);
+        const slot = row[C.SLOT_CODE - 1];
+        if (date && slot) existingSet.add(`${date}_${slot}`);
+      }
+
+      for (let d = 1; d <= CONFIG.BOOKING.SETUP_DAYS; d++) {
+        const date    = new Date(now.getTime() + d * 86400000);
+        const dateStr = _dateStr(date, tz);
+        const dayStr  = Utilities.formatDate(date, tz, 'EEE'); // Mon Tue etc
+        const mult    = multipliers[dayStr] || 1.0;
+
+        for (const slot of slots) {
+          const key = `${dateStr}_${slot.code}`;
+          if (existingSet.has(key)) { skipped++; continue; }
+
+          const score = Math.round(slot.baseScore * mult);
+
+          TruthEngine.append(CONFIG.SHEETS.BOOKING_PLAN, [
+            dateStr,
+            dayStr,
+            slot.code,
+            slot.time,
+            slot.priority,
+            score,
+            'FALSE',
+            '',
+            '',
+          ]);
+          added++;
+        }
+      }
+
+      AlertService.log(CONFIG.ALERT_LEVEL.INFO, 'BookingEngine', 'setup', '/booksetup',
+        `Added ${added}, skipped ${skipped}`);
+
+      TelegramService.send(chatId,
+        `✅ <b>Booking Setup Complete</b>\n\n` +
+        `Generated: ${added} slots\n` +
+        `Skipped (existing): ${skipped}\n` +
+        `Period: Next ${CONFIG.BOOKING.SETUP_DAYS} days\n\n` +
+        `Scores calculated by slot × day value.\n` +
+        `Fri 11am-1pm = highest priority.\n\n` +
+        `Use /book to see pending slots.\n` +
+        `Use /bookscore to see top opportunities.`
+      );
+
+    } catch (err) {
+      AlertService.log(CONFIG.ALERT_LEVEL.ERROR, 'BookingEngine', 'setup', '/booksetup', err.message);
+      TelegramService.send(chatId, `⚠️ Setup error: ${err.message}`);
+    }
+  }
+
+  // ── Auto check trigger ────────────────────────────────────
+
+  function autoCheck(event) {
+    const chatId = CONFIG.TELEGRAM_CHAT_ID;
+
+    try {
+      const tz       = Session.getScriptTimeZone();
+      const now      = new Date();
+      const hour     = Number(Utilities.formatDate(now, tz, 'H'));
+      const todayStr = _dateStr(now, tz);
+      const tmStr    = _dateStr(new Date(now.getTime() + 86400000),  tz);
+      const daStr    = _dateStr(new Date(now.getTime() + 172800000), tz);
+
+      // 7AM — today's critical missing (last chance)
+      if (hour === 7) {
+        const todayCrit = _getCriticalMissingSlots(todayStr);
+        if (todayCrit.length > 0) {
+          TelegramService.send(chatId,
+            `☀️ <b>Morning Booking Check</b>\n\n` +
+            `🚨 Today Critical Missing:\n` +
+            todayCrit.map(s => `• ${s.time}`).join('\n') +
+            `\n\nLast chance to book! /book for list.`
+          );
+        }
+        return;
+      }
+
+      // 8PM — tomorrow + day after critical check
+      if (hour === 20) {
+        const tmCrit = _getCriticalMissingSlots(tmStr);
+        const daCrit = _getCriticalMissingSlots(daStr);
+
+        if (tmCrit.length > 0 || daCrit.length > 0) {
+          let msg = `🚨 <b>BOOKING ALERT</b>\n\n`;
+          if (tmCrit.length > 0) {
+            msg += `<b>Tomorrow Missing:</b>\n`;
+            tmCrit.forEach(s => { msg += `• ${s.time}\n`; });
+          }
+          if (daCrit.length > 0) {
+            msg += `\n<b>Day After Missing:</b>\n`;
+            daCrit.forEach(s => { msg += `• ${s.time}\n`; });
+          }
+          msg += `\n/book to see numbered list.`;
+          TelegramService.send(chatId, msg);
+        }
+        return;
+      }
+
+      // 10PM — capacity warning + low score suggestions
+      if (hour === 22) {
+        const stats = _getBookingStats();
+        if (stats.booked >= CONFIG.BOOKING.MAX_SLOTS) {
+          TelegramService.send(chatId,
+            `🚨 <b>SLOT LIMIT REACHED</b>\n\n` +
+            `Booked: ${stats.booked} / ${CONFIG.BOOKING.MAX_SLOTS}\n\n` +
+            _suggestRelease()
+          );
+        } else if (stats.booked >= CONFIG.BOOKING.WARN_THRESHOLD) {
+          TelegramService.send(chatId,
+            `⚠️ <b>SLOT CAP WARNING</b>\n\n` +
+            `Booked: ${stats.booked} / ${CONFIG.BOOKING.MAX_SLOTS}\n\n` +
+            _suggestRelease()
+          );
+        }
+      }
+
+    } catch (err) {
+      AlertService.log(CONFIG.ALERT_LEVEL.ERROR, 'BookingEngine', 'autoCheck', 'trigger', err.message);
+    }
+  }
+
+  // ── P16 — Escalating reminder for unbooked Critical slots ──
+  // Called every masterTrigger tick (15 min) within active hours.
+  // Self-gates on ReminderQueue's timestamp trail instead of a fixed
+  // trigger time, so frequency actually increases as the deadline
+  // approaches, per Business_Rules.gs P16 — rather than autoCheck()'s
+  // fixed 8PM/10PM checks.
+  function checkEscalation() {
+    try {
+      const summary = getSummary();
+      if (!summary || summary.escalationIntervalMin === null) return;
+
+      const matchKey = {
+        source:   CONFIG.REMINDER_SOURCE.BOOKING,
+        category: 'critical_escalation',
+        bike:     'ALL',
+      };
+
+      const lastMinsAgo = ReminderQueue.getMinutesSinceLastMatch(matchKey);
+      if (!_shouldFireEscalation(lastMinsAgo, summary.escalationIntervalMin)) return;
+
+      const chatId = CONFIG.TELEGRAM_CHAT_ID;
+      const missingToday    = summary.todayMissing.length    > 0 ? summary.todayMissing    : null;
+      const missingTomorrow = summary.tomorrowMissing.length  > 0 ? summary.tomorrowMissing : null;
+
+      let msg = `🚨 <b>Critical Slot Still Unbooked</b>\n\n`;
+      if (missingToday)    msg += `<b>Today:</b> ${missingToday.join(', ')}\n`;
+      if (missingTomorrow) msg += `<b>Tomorrow:</b> ${missingTomorrow.join(', ')}\n`;
+      msg += `\n/book to see the full list.`;
+
+      TelegramService.send(chatId, msg);
+
+      // Log to the queue as already-SENT — this row IS the timestamp
+      // trail getMinutesSinceLastMatch() reads on the next tick.
+      // bypassDedup: true because we already did our own interval gating
+      // above (the fixed CONFIG.REMINDER.DEDUP_HOURS window doesn't apply
+      // to this category).
+      ReminderQueue.enqueue({
+        source:   matchKey.source,
+        type:     CONFIG.MAINTENANCE_STATUS.URGENT,
+        category: matchKey.category,
+        bike:     matchKey.bike,
+        priority: 200,
+        message:  msg,
+      }, { bypassDedup: true, sentImmediately: true });
+
+    } catch (err) {
+      AlertService.log(CONFIG.ALERT_LEVEL.ERROR, 'BookingEngine', 'checkEscalation', 'trigger', err.message);
+    }
+  }
+
+  // ── Public summary for DecisionEngine ────────────────────
+
+  function getSummary() {
+    try {
+      const tz       = Session.getScriptTimeZone();
+      const now      = new Date();
+      const todayStr = _dateStr(now, tz);
+      const tmStr    = _dateStr(new Date(now.getTime() + 86400000), tz);
+
+      const todayCrit = _getCriticalMissingSlots(todayStr);
+      const tmCrit    = _getCriticalMissingSlots(tmStr);
+      const tmRate    = _getDayRate(tmStr);
+      const todayRate = _getDayRate(todayStr);
+      const stats     = _getBookingStats();
+      const topMiss   = _getPendingSlots(7).slice(0, 3);
+
+      console.log('Today missing:', JSON.stringify(_getCriticalMissingSlots(todayStr)));
+      console.log('Tomorrow missing:', JSON.stringify(_getCriticalMissingSlots(tmStr)));
+
+      // Risk based on both today and tomorrow
+      const totalMissing = todayCrit.length + tmCrit.length;
+      const riskLevel    = totalMissing >= 3 ? 'HIGH' :
+                           totalMissing >= 1 ? 'MEDIUM' : 'LOW';
+
+      return {
+        todayRate,
+        todayMissing:    todayCrit.map(s => s.time),
+        tomorrowRate:    tmRate,
+        tomorrowMissing: tmCrit.map(s => s.time),
+        totalBooked:     stats.booked,
+        maxSlots:        CONFIG.BOOKING.MAX_SLOTS,
+        riskLevel,
+        // P16 — minutes required between escalation pings right now, or
+        // null if nothing Critical is missing (no escalation needed).
+        // Single source: computed here from the same todayCrit/tmCrit
+        // this function already derived — ReminderEngine/DecisionEngine
+        // read this field, they never compute urgency themselves.
+        escalationIntervalMin: _escalationIntervalFor(todayCrit.length, tmCrit.length),
+        topMissing:      topMiss.map(s => ({
+          time:  s.time,
+          score: s.score,
+          date:  s.date,
+        })),
+      };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // P16 — pure decision: which escalation interval applies given how many
+  // Critical slots are missing today vs tomorrow. No I/O, so this is
+  // directly unit-testable (see 33_Tests_P16.gs) without touching Sheets.
+  function _escalationIntervalFor(todayCritCount, tmCritCount) {
+    if (todayCritCount > 0) return CONFIG.BOOKING.ESCALATION.TODAY_MIN;
+    if (tmCritCount > 0)    return CONFIG.BOOKING.ESCALATION.TOMORROW_MIN;
+    return null;
+  }
+
+  // P16 — pure decision: is it time to fire the next escalation ping,
+  // given minutes since the last one (or null if there's never been one)
+  // and the interval currently required. No I/O — see 33_Tests_P16.gs.
+  function _shouldFireEscalation(lastMinsAgoOrNull, intervalMinOrNull) {
+    if (intervalMinOrNull === null) return false; // nothing Critical missing
+    return lastMinsAgoOrNull === null || lastMinsAgoOrNull >= intervalMinOrNull;
+  }
+
+  // ── Private — Data readers ────────────────────────────────
+
+  // Returns pending slots sorted by score desc
+  // critical first, then optional, within each group sorted by score desc
+  function _getPendingSlots(days) {
+    days = days || 28;
+    const tz      = Session.getScriptTimeZone();
+    const now     = new Date();
+    const cutoff  = new Date(now.getTime() + days * 86400000);
+    const rows    = TruthEngine.getRows(CONFIG.SHEETS.BOOKING_PLAN);
+    const C       = CONFIG.COL.BOOKING_PLAN;
+    const result  = [];
+
+    for (const row of rows) {
+      const date    = _fmtRowDate(row[C.DATE - 1], tz);
+      const dateObj = new Date(date + 'T00:00:00');
+      if (dateObj <= now || dateObj > cutoff) continue;
+      if (String(row[C.BOOKED - 1]).toUpperCase() === 'TRUE') continue;
+
+      result.push({
+        date:      date,
+        day:       row[C.DAY          - 1],
+        slotCode:  row[C.SLOT_CODE    - 1],
+        time:      row[C.TIME_RANGE   - 1],
+        priority:  row[C.PRIORITY     - 1],
+        score:     Number(row[C.BOOKING_SCORE - 1]) || 0,
+      });
+    }
+
+    // Sort: Critical first by score desc, then Optional by score desc
+    result.sort((a, b) => {
+      const aCrit = a.priority === CONFIG.BOOKING.PRIORITY.CRITICAL ? 1 : 0;
+      const bCrit = b.priority === CONFIG.BOOKING.PRIORITY.CRITICAL ? 1 : 0;
+      if (aCrit !== bCrit) return bCrit - aCrit;
+      if (b.score !== a.score) return b.score - a.score;
+      if (a.date !== b.date) return a.date.localeCompare(b.date);
+      return a.slotCode.localeCompare(b.slotCode);
+    });
+
+    return result;
+  }
+
+  function _getBookedSlots() {
+    const tz   = Session.getScriptTimeZone();
+    const now  = new Date();
+    const rows = TruthEngine.getRows(CONFIG.SHEETS.BOOKING_PLAN);
+    const C    = CONFIG.COL.BOOKING_PLAN;
+    const result = [];
+
+    for (const row of rows) {
+      const date    = _fmtRowDate(row[C.DATE - 1], tz);
+      const dateObj = new Date(date + 'T00:00:00');
+      if (dateObj < now) continue;
+      if (String(row[C.BOOKED - 1]).toUpperCase() !== 'TRUE') continue;
+
+      result.push({
+        date:      date,
+        day:       row[C.DAY          - 1],
+        slotCode:  row[C.SLOT_CODE    - 1],
+        time:      row[C.TIME_RANGE   - 1],
+        priority:  row[C.PRIORITY     - 1],
+        score:     Number(row[C.BOOKING_SCORE - 1]) || 0,
+      });
+    }
+
+    // Sort by score asc (lowest score first — for release suggestions)
+    result.sort((a, b) => {
+      if (a.score !== b.score) return a.score - b.score;
+      return a.date.localeCompare(b.date);
+    });
+
+    return result;
+  }
+
+  function _getUpcomingRows(days) {
+    const tz      = Session.getScriptTimeZone();
+    const now     = new Date();
+    const cutoff  = new Date(now.getTime() + days * 86400000);
+    const rows    = TruthEngine.getRows(CONFIG.SHEETS.BOOKING_PLAN);
+    const C       = CONFIG.COL.BOOKING_PLAN;
+    const result  = [];
+
+    for (const row of rows) {
+      const date    = _fmtRowDate(row[C.DATE - 1], tz);
+      const dateObj = new Date(date + 'T00:00:00');
+      if (dateObj <= now || dateObj > cutoff) continue;
+      result.push(row);
+    }
+
+    return result;
+  }
+
+  function _getBookingStats() {
+    const tz   = Session.getScriptTimeZone();
+    const now  = new Date();
+    // Set to start of today (midnight)
+    const todayStart = new Date(
+      Utilities.formatDate(now, tz, 'yyyy-MM-dd') + 'T00:00:00'
+    );
+
+    const rows = TruthEngine.getRows(CONFIG.SHEETS.BOOKING_PLAN);
+    const C    = CONFIG.COL.BOOKING_PLAN;
+    let   booked = 0;
+
+    for (const row of rows) {
+      const dateStr = _fmtRowDate(row[C.DATE - 1], tz);
+      if (!dateStr) continue;
+      const dateObj = new Date(dateStr + 'T00:00:00');
+      // Count ALL future booked slots including today
+      if (dateObj < todayStart) continue;
+      if (String(row[C.BOOKED - 1]).toUpperCase() === 'TRUE') booked++;
+    }
+
+    return { booked };
+  }
+
+  function _getDayRate(dateStr) {
+    const tz   = Session.getScriptTimeZone();
+    const rows = TruthEngine.getRows(CONFIG.SHEETS.BOOKING_PLAN);
+    const C    = CONFIG.COL.BOOKING_PLAN;
+    let   total = 0, booked = 0;
+
+    for (const row of rows) {
+      if (_fmtRowDate(row[C.DATE - 1], tz) !== dateStr) continue;
+      total++;
+      if (String(row[C.BOOKED - 1]).toUpperCase() === 'TRUE') booked++;
+    }
+
+    return total === 0 ? 0 : Math.round((booked / total) * 100);
+  }
+
+  function _getCriticalMissing(dateStr) {
+    return _getCriticalMissingSlots(dateStr).length;
+  }
+
+  function _getCriticalMissingSlots(dateStr) {
+    const tz   = Session.getScriptTimeZone();
+    const rows = TruthEngine.getRows(CONFIG.SHEETS.BOOKING_PLAN);
+    const C    = CONFIG.COL.BOOKING_PLAN;
+    const result = [];
+
+    for (const row of rows) {
+      if (_fmtRowDate(row[C.DATE - 1], tz) !== dateStr) continue;
+      if (row[C.PRIORITY - 1] !== CONFIG.BOOKING.PRIORITY.CRITICAL) continue;
+      // This line is critical — must exclude booked slots
+      if (String(row[C.BOOKED - 1]).toUpperCase() === 'TRUE') continue;
+      result.push({
+        slotCode: row[C.SLOT_CODE  - 1],
+        time:     row[C.TIME_RANGE - 1],
+        score:    Number(row[C.BOOKING_SCORE - 1]) || 0,
+      });
+    }
+
+    return result;
+  }
+
+  // Suggest lowest-score booked slots to release
+  function _suggestRelease() {
+    const booked = _getBookedSlots(); // sorted by score asc
+    const lowest = booked.slice(0, 3);
+    if (lowest.length === 0) return '';
+
+    const tz  = Session.getScriptTimeZone();
+    const now = new Date();
+    let   msg = `\n<b>Consider releasing (lowest value):</b>\n`;
+    lowest.forEach((s, i) => {
+      msg += `${i + 1}. ${_dateLabel(s.date, now, tz)} ${s.time}  [${s.score}]\n`;
+    });
+    return msg;
+  }
+
+  // ── Private — Formatting ──────────────────────────────────
+
+  function _slotLine(slot) {
+    const tz    = Session.getScriptTimeZone();
+    const now   = new Date();
+    const label = _dateLabel(slot.date, now, tz);
+    const icon  = slot.priority === CONFIG.BOOKING.PRIORITY.CRITICAL ? '🔴' : '⚪';
+    return `${icon} ${label} ${slot.time}  [${slot.score}]`;
+  }
+
+  function _rateBar(pct) {
+    const filled = Math.round(pct / 25);
+    return '█'.repeat(filled) + '░'.repeat(4 - filled);
+  }
+
+  function _dateStr(date, tz) {
+    return Utilities.formatDate(date, tz, 'yyyy-MM-dd');
+  }
+
+  function _dateLabel(dateStr, now, tz) {
+    const tmStr = _dateStr(new Date(now.getTime() + 86400000),  tz);
+    if (dateStr === tmStr) return 'Tomorrow';
+    const d = new Date(dateStr + 'T00:00:00');
+    return Utilities.formatDate(d, tz, 'EEE dd/MM');
+  }
+
+  function _fmtRowDate(raw, tz) {
+    if (!raw) return '';
+    if (raw instanceof Date) return Utilities.formatDate(raw, tz, 'yyyy-MM-dd');
+    return String(raw).substring(0, 10);
+  }
+
+  return {
+    dashboard, all, week, score, mark, unmark, setup, autoCheck, checkEscalation, getSummary,
+    // Exposed for unit testing only (33_Tests_P16.gs) — pure functions, no
+    // I/O. Application code reads getSummary().escalationIntervalMin and
+    // calls checkEscalation() instead, per CR13 single-source rule.
+    _escalationIntervalFor, _shouldFireEscalation,
+  };
+})();

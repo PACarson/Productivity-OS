@@ -1,0 +1,130 @@
+// ============================================================
+// 14_Main.gs — Webhook + Triggers
+// Weather: every 15 min during 11AM-9PM when shift active
+// Reward: every 15 min during peak sessions
+// Booking escalation (P16): every 15 min, 7AM-11PM (self-gated)
+// ============================================================
+
+function doGet(e) {
+  return ContentService.createTextOutput('OK')
+    .setMimeType(ContentService.MimeType.TEXT);
+}
+
+function doPost(e) {
+  const lock = LockService.getScriptLock();
+
+  try {
+    lock.waitLock(10000);
+    if (!e || !e.postData || !e.postData.contents) return;
+
+    const body     = JSON.parse(e.postData.contents);
+    const message  = body.message || body.edited_message;
+    const updateId = String(body.update_id || '');
+
+    if (updateId) {
+      const props  = PropertiesService.getScriptProperties();
+      const lastId = props.getProperty('LAST_UPDATE_ID');
+      if (lastId === updateId) return;
+      props.setProperty('LAST_UPDATE_ID', updateId);
+    }
+
+    if (!message || !message.text) return;
+
+    const chatId = String(message.chat.id);
+    const text   = message.text.trim();
+
+    Router.route(chatId, text);
+
+  } catch (err) {
+    try {
+      AlertService.log(CONFIG.ALERT_LEVEL.ERROR, 'Main', 'doPost', '', err.message);
+    } catch (e2) {
+      console.error('Main.doPost fatal: ' + err.message);
+    }
+  } finally {
+    try { lock.releaseLock(); } catch (e3) {}
+  }
+}
+
+// ── Master trigger — runs every 15 minutes ────────────────
+// Only active during 11AM-9PM
+
+function masterTrigger() {
+  try {
+    const tz   = Session.getScriptTimeZone();
+    const hour = Number(Utilities.formatDate(new Date(), tz, 'H'));
+
+    // P16 (2026-07-14) — Critical-booking escalation, every tick.
+    // Runs BEFORE the hour-gated branches below (which early-return) so
+    // it always fires regardless of which branch this tick lands in.
+    // Its own frequency is self-limited by ReminderQueue's timestamp
+    // trail (CONFIG.BOOKING.ESCALATION), not by trigger cadence — this
+    // call is just "check if it's due," safe to run every 15 min.
+    if (hour >= CONFIG.BOOKING.ESCALATION.ACTIVE_HOUR_START &&
+        hour <  CONFIG.BOOKING.ESCALATION.ACTIVE_HOUR_END) {
+      BookingEngine.checkEscalation();
+    }
+
+    // 7AM — Morning Brief (all sources)
+    if (hour === 7) {
+      ReminderEngine.morningBrief();
+      return;
+    }
+
+    // 8PM — Booking check (tomorrow + day after)
+    if (hour === 20) {
+      BookingEngine.autoCheck({});
+      return;
+    }
+
+    // 10PM — Booking capacity + archive old reminders
+    if (hour === 22) {
+      BookingEngine.autoCheck({});
+      ReminderQueue.archive();
+      return;
+    }
+
+    // 11AM-9PM — Weather + Reward (every 15 min)
+    if (hour >= 11 && hour < 21) {
+      WeatherService.runWeatherTrigger();
+      RewardService.runRewardTrigger();
+    }
+
+  } catch (err) {
+    AlertService.log(CONFIG.ALERT_LEVEL.ERROR, 'Main', 'masterTrigger', 'trigger', err.message);
+  }
+}
+
+// ── Setup master trigger (run once manually) ──────────────
+
+function setupTriggers() {
+  // Remove all existing triggers
+  const triggers = ScriptApp.getProjectTriggers();
+  for (const t of triggers) {
+    if (['masterTrigger', 'weatherTrigger'].includes(t.getHandlerFunction())) {
+      ScriptApp.deleteTrigger(t);
+    }
+  }
+
+  // Create single master trigger every 15 minutes
+  // Every 15 minutes for Weather + Reward during peak hours
+  ScriptApp.newTrigger('masterTrigger')
+    .timeBased()
+    .everyMinutes(15)
+    .create();
+
+  console.log('✅ Master trigger created — every 15 minutes');
+  console.log('   Booking checks: 7AM, 8PM, 10PM');
+  console.log('   Booking escalation (P16): every tick, 7AM-11PM, self-gated by urgency');
+  console.log('   Weather + Reward: 11AM-9PM');
+}
+
+function removeTriggers() {
+  const triggers = ScriptApp.getProjectTriggers();
+  let   count    = 0;
+  for (const t of triggers) {
+    ScriptApp.deleteTrigger(t);
+    count++;
+  }
+  console.log(`Removed ${count} trigger(s)`);
+}

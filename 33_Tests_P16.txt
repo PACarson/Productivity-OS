@@ -1,0 +1,137 @@
+// ============================================================
+// 33_Tests_P16.gs — Regression tests for P16 escalating booking
+// reminders (Business_Rules.gs P16, implemented 2026-07-14)
+//
+// Run manually from the Apps Script editor: select runAllP16Tests
+// in the function dropdown and click Run. Check View > Logs (or
+// View > Executions) for PASS/FAIL output.
+//
+// Scope: only the PURE, I/O-free decision functions are covered by
+// automated assertions here — _escalationIntervalFor() and
+// _shouldFireEscalation() in 27_BookingEngine.gs. They were also
+// verified standalone in plain JS (Node) during design, with the
+// same cases, before being written into this file.
+//
+// checkEscalation() itself touches Sheets + Telegram (via
+// ReminderQueue and TelegramService) and is NOT run by this file —
+// faking those would either mean hitting your real Reminder_Queue
+// sheet and real Telegram chat from an automated test, or building
+// a mocking layer this project doesn't have. See the MANUAL
+// VERIFICATION CHECKLIST at the bottom instead — that's the honest
+// way to cover the I/O-dependent half of this feature.
+// ============================================================
+
+function runAllP16Tests() {
+  let pass = 0, fail = 0;
+  const results = [];
+
+  function check(actual, expected, label) {
+    const ok = JSON.stringify(actual) === JSON.stringify(expected);
+    results.push(`${ok ? 'PASS' : 'FAIL'} — ${label} (got ${JSON.stringify(actual)}, expected ${JSON.stringify(expected)})`);
+    if (ok) pass++; else fail++;
+  }
+
+  // ── _escalationIntervalFor(todayCritCount, tmCritCount) ──
+  check(BookingEngine._escalationIntervalFor(1, 0), CONFIG.BOOKING.ESCALATION.TODAY_MIN,
+    'today critical present -> TODAY_MIN');
+  check(BookingEngine._escalationIntervalFor(2, 3), CONFIG.BOOKING.ESCALATION.TODAY_MIN,
+    'today AND tomorrow critical -> today wins (shorter interval)');
+  check(BookingEngine._escalationIntervalFor(0, 1), CONFIG.BOOKING.ESCALATION.TOMORROW_MIN,
+    'tomorrow-only critical -> TOMORROW_MIN');
+  check(BookingEngine._escalationIntervalFor(0, 0), null,
+    'nothing critical missing -> null (no escalation)');
+
+  // ── _shouldFireEscalation(lastMinsAgoOrNull, intervalMinOrNull) ──
+  check(BookingEngine._shouldFireEscalation(null, 30), true,
+    'no prior escalation ever sent -> fire');
+  check(BookingEngine._shouldFireEscalation(45, 30), true,
+    '45min since last vs 30min interval -> fire (overdue)');
+  check(BookingEngine._shouldFireEscalation(10, 30), false,
+    '10min since last vs 30min interval -> hold');
+  check(BookingEngine._shouldFireEscalation(30, 30), true,
+    'exactly at the interval boundary -> fire');
+  check(BookingEngine._shouldFireEscalation(5, null), false,
+    'interval is null (nothing critical) -> never fire, regardless of elapsed time');
+
+  // ── End-to-end walk of the pure logic only: today-critical persists
+  // across simulated 15-min ticks for 2 hours — confirms the interval
+  // is actually respected tick over tick, not just in isolation.
+  (function simulateTicks() {
+    let lastFireAt = null;
+    const fired = [];
+    for (let minute = 0; minute <= 120; minute += 15) {
+      const interval = BookingEngine._escalationIntervalFor(1, 0);
+      const elapsed = lastFireAt === null ? null : minute - lastFireAt;
+      if (BookingEngine._shouldFireEscalation(elapsed, interval)) {
+        fired.push(minute);
+        lastFireAt = minute;
+      }
+    }
+    check(fired, [0, 30, 60, 90, 120],
+      'simulated 2h of ticks with today-critical open -> fires every 30min, not every 15min');
+  })();
+
+  Logger.log(results.join('\n'));
+  Logger.log(`\n${pass} passed, ${fail} failed.`);
+  if (fail > 0) {
+    Logger.log('=== SOME TESTS FAILED — do not consider P16 verified until this is clean ===');
+  } else {
+    Logger.log('=== ALL PURE-LOGIC TESTS PASSED ===');
+  }
+  return { pass, fail };
+}
+
+/*
+=====================================
+MANUAL VERIFICATION CHECKLIST — I/O-dependent half
+=====================================
+Run these against a real (ideally non-production, if you have one)
+deployment after pushing this change. Nothing above touches Sheets
+or Telegram, so this is the only way the integration actually gets
+checked.
+
+1. Baseline — nothing critical missing
+   - Make sure no Critical slot is unbooked today or tomorrow.
+   - Run BookingEngine.checkEscalation() manually from the editor.
+   - Expect: no Telegram message, no new Reminder_Queue row.
+
+2. Today-critical, first ping
+   - Leave one Critical slot for TODAY unbooked.
+   - Run checkEscalation() manually.
+   - Expect: one Telegram message ("Critical Slot Still Unbooked"),
+     one new row in Reminder_Queue with category=critical_escalation,
+     status=SENT, priority=200, SENT_AT populated.
+
+3. Today-critical, re-run immediately
+   - Immediately run checkEscalation() again (same minute).
+   - Expect: NO new message, NO new row — should be held by the
+     30-min interval (CONFIG.BOOKING.ESCALATION.TODAY_MIN).
+
+4. Today-critical, re-run after the interval
+   - Manually edit the Reminder_Queue row from step 2 — set its
+     Timestamp back 31+ minutes — then run checkEscalation() again.
+   - Expect: a new message + new row (interval elapsed).
+
+5. Book the slot, confirm it stops
+   - Mark the Critical slot as booked (/book flow).
+   - Run checkEscalation() again.
+   - Expect: no message — escalationIntervalMin should now be null
+     (or shift to TOMORROW_MIN if a different slot is still open
+     tomorrow — check which applies to your test data).
+
+6. Trigger wiring
+   - After setupTriggers() runs, confirm via
+     Apps Script > Triggers that masterTrigger still shows one
+     15-min time trigger (unchanged — checkEscalation piggybacks on
+     the existing trigger, it doesn't add a new one. Rider OS is
+     already close to the 20-trigger GAS quota per Reminder OS
+     notes, so this was a deliberate design constraint, not an
+     oversight).
+   - At an hour outside 7AM-11PM (e.g. manually fake the hour check,
+     or just reason through the code), confirm checkEscalation is
+     NOT invoked — no 3AM pings.
+
+Once all 6 pass on your actual deployment, P16 can move from
+"implemented, pending manual verification" to fully closed in
+00_Project_State.gs.
+*/

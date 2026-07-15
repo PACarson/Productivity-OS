@@ -1,0 +1,336 @@
+// ============================================================
+// 00_Business_Rules.gs
+// Rider OS — Business Rules & Operational Timeline  v1.0
+// Companion to 00_Project_Constitution.gs
+// DO NOT modify without checking against the Constitution
+// Last updated: 2026-07-14
+// ============================================================
+
+/*
+=====================================
+WHY THIS FILE EXISTS
+=====================================
+
+00_Project_Constitution.gs owns SYSTEM ARCHITECTURE (P1-P14,
+CR1-CR13): truth layer, event flow, coding conventions — things
+that are true regardless of what business Rider OS runs.
+
+This file owns DOMAIN / BUSINESS RULES: Reward forecasting, Booking
+priority, Maintenance cost tracking, the platform's operational
+timeline. These change if the business changes (e.g. Grab changes
+its reward scheme); the Constitution doesn't.
+
+Both files share one P-numbering series — this file continues at
+P15. Read both before touching RewardService / DecisionEngine /
+BookingEngine / MaintenanceIntelligence / ReminderEngine.
+
+=====================================
+STATUS KEY — READ THIS FIRST
+=====================================
+Every rule below was checked against the actual Rider-main codebase
+(snapshot dated 2026-06-25) before being written down, per the
+project's own audit-first convention. Per the 2026-07-14 governance
+review, every rule (or sub-item) carries exactly one of these three
+states — never write a future plan down in a way that reads as
+already-existing:
+
+  ACTIVE RULE     — already true in the current code today. Locked
+                    in: a future fix must not regress it.
+  PLANNED RULE    — does not exist yet, AND has been explicitly
+                    scheduled/greenlit for build (tracked in
+                    00_Project_State.gs NEXT STEPS). None of P15-P22
+                    are at this stage yet as of 2026-07-14.
+  NOT IMPLEMENTED — does not exist yet and nothing has greenlit
+                    building it. A design sketch may be included
+                    below for whoever eventually picks it up — that
+                    sketch is not itself a commitment to build.
+
+Separately, some items are none of the above — they are an EXISTING,
+INTENTIONAL design choice that a proposal wants to CHANGE. That is
+not a bug and not "not implemented"; it gets its own flag:
+
+  ⚠ BEHAVIOUR CHANGE (proposed) — current code is working as
+    designed; changing it is a product decision, evaluated on its
+    own, separately from this document.
+
+Do not treat a PLANNED RULE as enforced — check 00_Project_State.gs
+"NEXT STEPS" before relying on any of these existing.
+
+=====================================
+P15 — REWARD FORECAST CONSISTENCY   [NOT IMPLEMENTED]
+=====================================
+
+Reward prediction MUST use a fixed calculation checkpoint:
+
+  Before 2:00 PM   → Lunch progress predicts today's Dinner target.
+  After  2:00 PM   → Dinner progress predicts tomorrow's target.
+  After  9:00 PM   → Freeze today's reward.
+                     Calculate tomorrow's Daily/Weekday/Weekend target.
+
+  Never mix Lunch and Dinner progress in one prediction.
+  RewardEngine is the single authority for forecast calculations.
+  DecisionEngine, ReminderEngine and /ai MUST consume RewardEngine
+  output only.
+
+Status: nothing like this exists today. RewardService's forecasting
+(_calcProbability) only projects forward WITHIN the current session
+against that session's own target — there is no lunch→dinner or
+today→tomorrow projection, and no 9PM freeze. Session boundaries
+already line up with this rule (CONFIG.PEAK_SESSIONS: Lunch 11-14,
+Dinner 17-21), so the checkpoints can hang off existing session
+config. Build as new RewardService functions
+(forecastDinnerFromLunch(), forecastTomorrow(), freezeToday()) —
+do not let DecisionEngine or ReminderEngine derive these themselves.
+
+Note on "never mix lunch and dinner": today's Daily-tier total
+(_getTodayPeakTotal().total = lunch + dinner) is a legitimate SUM of
+actuals, not a prediction — the Daily tier is designed to cover the
+whole day. That's fine and should stay. This rule is about not
+letting a *forecast* borrow one session's pace to predict the
+other's outcome.
+
+=====================================
+P16 — BOOKING HAS HIGHEST OPERATIONAL PRIORITY   [MOSTLY ACTIVE]
+=====================================
+
+Critical Booking slots directly affect rider income.
+If today or tomorrow contains an unbooked Critical Slot:
+  DecisionEngine  → Priority Score = Maximum.
+  ReminderEngine  → Escalation = Highest.
+  Reminder frequency increases until booked.
+  Optional slots never override Critical slots.
+
+Status, precisely — decision 2026-07-14: this is real behaviour, not
+a bug. Nothing below gets silently changed in either direction (code
+to fit the doc, or doc to fit the code):
+
+  ACTIVE RULE — BookingEngine already has a full Critical/Optional
+     system: CONFIG.BOOKING.PRIORITY.CRITICAL/OPTIONAL,
+     _getPendingSlots() sorts critical-first, /book already splits
+     into "Critical Missing" / "Optional Missing".
+  ACTIVE RULE — BookingEngine.getSummary().tomorrowMissing is ALREADY
+     critical-only (built from _getCriticalMissingSlots()) — Optional
+     slots never reach DecisionEngine or ReminderEngine in the first
+     place, so they already can't override Critical ones.
+  ACTIVE RULE — ReminderEngine._enqueueBooking() already gives
+     HIGH-risk booking priority 200 — the highest fixed value anywhere
+     in the reminder system today (Maintenance scales by
+     weight×multiplier up to ×3.0; Reward is a flat 80).
+  ⚠ BEHAVIOUR CHANGE (proposed) — DecisionEngine._buildActions() gives
+     ANY critical-missing booking a fixed score of 90 today, by
+     design. That can lose to Maintenance-overdue (up to 100) or a
+     Thunderstorm alert (95), so it is not literally "Maximum."
+     Making it dynamically the highest score (e.g. a named constant
+     CONFIG.PRIORITY.CRITICAL_BOOKING above every other action's
+     ceiling, replacing the current magic 90) is a real change to
+     current ranking behaviour — queued for separate evaluation, not
+     bundled into this governance pass.
+  ACTIVE RULE — "Reminder frequency increases until booked" —
+     IMPLEMENTED 2026-07-14. BookingEngine.checkEscalation(), called
+     every masterTrigger tick (15 min) within 7AM-11PM
+     (CONFIG.BOOKING.ESCALATION.ACTIVE_HOUR_START/END), sends a
+     direct Telegram ping whenever a Critical slot is still unbooked
+     AND enough time has passed since the last ping:
+       Today has an unbooked Critical slot    → every 30 min
+       Tomorrow does (today clear)            → every 3 hours (180 min)
+       Neither                                → no ping
+     Interval ownership stays with BookingEngine
+     (escalationIntervalMin on getSummary(), CR13 single source);
+     ReminderQueue only stores the SENT timestamp trail
+     (getMinutesSinceLastMatch()) that gates the next ping — it does
+     not decide urgency itself. Pure decision logic
+     (_escalationIntervalFor, _shouldFireEscalation) is unit-tested
+     in 33_Tests_P16.gs; the Sheet/Telegram-touching half is not
+     automated — see that file's MANUAL VERIFICATION CHECKLIST.
+     Until that checklist is run once against a real deployment,
+     treat this as "implemented, pending manual verification," not
+     fully closed.
+
+=====================================
+P17 — MAINTENANCE IS A LIFECYCLE RECORD   [NOT IMPLEMENTED]
+=====================================
+
+Maintenance records are not limited to mileage. Every maintenance
+event MUST support: Bike, Category, KM, Date, Parts Cost, Labour
+Cost, Total Cost, Workshop, Notes.
+
+Maintenance Intelligence calculates: Total Cost, Monthly Cost, Cost
+per KM, Category Cost, Bike Lifetime Cost.
+
+Status: does NOT exist. The current Maintenance_Log sheet
+(15_Setup.gs) has 6 columns only — Timestamp, Bike, Category, KM,
+Date, Notes. No cost or workshop field anywhere in CONFIG.COL,
+20_MaintenanceService.gs, or 29_MaintenanceIntelligence.gs.
+
+This is a real schema change, not a doc update — needed before it's
+true:
+  1. Maintenance_Log: add PartsCost, LabourCost, TotalCost, Workshop
+     columns (15_Setup.gs headers + CONFIG.COL.MAINTENANCE_LOG).
+  2. 06_Parser.gs parseService() / 20_MaintenanceService.gs record():
+     accept the new fields (decide required vs optional, and the
+     input syntax for /service).
+  3. 29_MaintenanceIntelligence.gs: add the five cost aggregations
+     listed above.
+Treat this as its own scoped implementation task — column-index
+changes touch CR3/CR10 (1-based indices must match sheet headers
+exactly) and are easy to get subtly wrong under time pressure.
+
+=====================================
+P18 — BOOKING DASHBOARD SHOWS ONLY ACTIONABLE DATA   [MOSTLY ACTIVE]
+=====================================
+
+/book displays only slots that can currently be booked.
+  Current week: show remaining available days only.
+  Sunday: do not display next week.
+  Friday 4:00 PM onwards: automatically switch to next week's
+    booking window.
+  Critical Missing / Optional Missing — both sorted chronologically.
+
+Status, precisely — decision 2026-07-14: real behaviour, not a bug.
+Not changing code to fit the doc, or the doc to fit the code:
+
+  ACTIVE RULE — /bookweek already shows remaining-days-only
+     (daysUntilSun = 7 - dayNum) and already refuses to show next
+     week on Sunday ("Today is Sunday — new week starts tomorrow") —
+     an exact match to the rule as written.
+  ⚠ BEHAVIOUR CHANGE (proposed) — /bookweek's Friday extension is
+     keyed to the whole day (dayNum === 5) today, by design. Narrowing
+     it to specifically "4:00 PM onwards" is a real change to that
+     existing choice — queued for separate evaluation.
+  ⚠ BEHAVIOUR CHANGE (proposed) — /book's Critical/Optional lists
+     (BookingEngine.dashboard()) sort by BookingScore desc today — the
+     existing code's explicit documented intent ("pending slots
+     sorted by score desc"), not an oversight. Switching to
+     chronological-date ordering is a real, deliberate change to
+     existing behaviour, not a bug fix — queued for separate
+     evaluation before touching 27_BookingEngine.gs
+     _getPendingSlots()'s sort comparator.
+
+=====================================
+P19 — REWARD PROGRESS MUST NEVER RESET INCORRECTLY   [ACTIVE RULE — CLOSED]
+=====================================
+
+Reward percentage always reflects current tier progress. If rider
+already entered reward data, progress > 0%. Never display 0% unless
+no reward target exists. RewardEngine owns all percentage
+calculations — UI modules never calculate percentages independently.
+
+RESOLVED 2026-07-14 — closed, no open question remains. The live
+/rewards code (RewardService.dashboard(), the only exported dashboard
+function) computes this correctly and inline —
+pctDone = weekTotal / topTier.orders — so a real weekTotal of 66
+against a target of 75 cannot render as 0% in this codebase. The
+"Dinner 9 / Week 66/75 / 0%" pattern this rule guards against traces
+to _buildPeakDashboard() / _buildNonPeakDashboard() — older builder
+functions still present in the file but NOT called by the exported
+dashboard() (already flagged as legacy in 00_Project_State.gs
+BUG-07). The rule stays written down as a locked invariant, and the
+two dead functions are a deletion candidate — see CR13 in the
+Constitution.
+
+=====================================
+P20 — WEEKLY REWARD CONFIG ROLLOVER   [NOT IMPLEMENTED]
+=====================================
+
+Every Monday 00:00, automatically generate Weekday Reward, Weekend
+Reward, and Daily Reward using the previous week's TierString.
+Manual setup only required when Grab changes the reward structure.
+Historical configurations are never modified.
+
+Status: fully manual today. RewardService.setConfig() (/rewardset)
+is the only writer to Rewards_Config, and 00_Project_State.gs "IN
+PROGRESS" already lists "/rewardset needs to be run for current
+week" as an open manual task. _getActiveConfig() already supports
+multiple dated rows and picks the latest one ≤ today — so the
+lookup side is ready; only the auto-write side is missing.
+Build as a new RewardService.rolloverWeeklyConfig(), triggered by a
+new Monday-00:00 trigger (see P22) — read the ending week's active
+TierString per cycle type, append a new row dated for the new week.
+"Historical configurations are never modified" is already satisfied
+by setConfig()'s append-or-update-by-ID pattern as long as the
+rollover always writes a NEW reward ID rather than reusing the old
+one.
+
+=====================================
+P21 — AI COMMAND PROVIDES OPERATIONAL VIEW   [DECIDED — REJECTED AS PROPOSED]
+=====================================
+
+Proposed: /ai is not limited to Top Priorities. It may provide
+operational dashboards — Reward View (Daily/Weekday/Weekend target,
+Required Pace, Current Pace, Remaining Orders, Forecast).
+DecisionEngine owns dashboard composition; RewardEngine owns reward
+calculations.
+
+DECISION (2026-07-14): Accepted: Preserve P13. Full dashboard will
+use a separate command if implemented in the future.
+
+/ai keeps showing top-priority actions only — P13 in the Constitution
+is not being reopened. This was a deliberate v2.2 product decision
+(00_Project_State.gs v2.2 changelog: "/ai redesigned — top 3
+priorities only, no more wall of text"), and there isn't sufficient
+reason on the table today to reverse it. If a full operational
+dashboard is wanted later, it gets its OWN command (e.g. /aidash) —
+/ai's existing semantics do not change.
+
+Background kept for context, not as an open question: the current
+advise() (/ai) already isn't strictly "3" in practice —
+Reward/Booking/Maintenance show only if present, but Weather is
+ALWAYS appended as its own numbered action, so a fully-loaded day
+already renders 4 actions plus a Recommendation block. That drift is
+a separate, smaller observation from the P21 question and doesn't
+change the decision above — noted here in case it's worth tightening
+back to a real top-3 cap later, on its own.
+
+This rule is CLOSED. Do not implement operational-dashboard behaviour
+inside 26_DecisionEngine.gs advise() / /ai. A future /aidash (or
+similar) is a new, separate command — see 00_Project_State.gs NEXT
+STEPS if and when that gets scheduled.
+
+=====================================
+P22 — OPERATIONAL TIMELINE   [MOSTLY NOT IMPLEMENTED]
+=====================================
+
+Rider OS follows the rider's working timeline:
+  07:00        Morning Brief
+  11:00        Lunch begins
+  14:00        Lunch closes — generate Dinner forecast
+  17:00        Dinner begins
+  21:00        Dinner closes — generate Tomorrow forecast
+  Friday 16:00 Open next booking week
+  Monday 00:00 Generate reward configuration
+  00:00        Reset daily counters, archive previous day
+
+Status against the actual masterTrigger() (14_Main.gs, runs every 15
+min) and 00_Project_State.gs's Trigger Schedule:
+  ACTIVE RULE — 07:00 Morning Brief — exact match
+     (ReminderEngine.morningBrief()).
+  ACTIVE RULE — 11:00-21:00 window — matches PEAK_SESSIONS (Lunch
+     11-14, Dinner 17-21) and the existing Weather/Reward trigger
+     window (11AM-9PM).
+  NOT IMPLEMENTED — 14:00 "close Lunch, generate Dinner forecast" —
+     no such trigger exists; depends on P15 being built first.
+  NOT IMPLEMENTED — 21:00 "close Dinner, generate Tomorrow forecast"
+     — the reward trigger window currently just ENDS at hour<21 with
+     no explicit close/freeze/forecast action. Depends on P15.
+  NOT IMPLEMENTED — Friday 16:00 "open next booking week" — no
+     time-based trigger for this exists; the closest today is
+     /bookweek's same-day (all-day, not 4PM-gated) Friday extension
+     when a rider manually checks it. 00_Project_State.gs already
+     lists this exact idea under "NEXT STEPS P2 (not started)":
+     "/booksetup auto-trigger on Friday" — P18/P22 formalize that
+     existing backlog item; still not implemented.
+  NOT IMPLEMENTED — Monday 00:00 "generate reward configuration" —
+     see P20.
+  NOT IMPLEMENTED — 00:00 "reset daily counters, archive previous
+     day" — partially resembles the existing 10PM
+     ReminderQueue.archive() call, but that runs at 10PM as part of
+     the booking-check trigger, not at midnight, and there's no
+     explicit "reset daily counters" step (daily totals are already
+     computed fresh per date on every read, so there may be nothing
+     to "reset" — worth confirming intent before building this one;
+     it may already be satisfied by design).
+
+This is the master TODO list for new masterTrigger() branches once
+scheduled — implementing 14:00/21:00/Monday branches ahead of
+P15/P20 would mean calling functions that don't exist yet.
+*/
