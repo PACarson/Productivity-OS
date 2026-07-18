@@ -3,6 +3,12 @@
  * Productivity OS v4.7 — Projection Rebuilder（从 Events 全量重建 Read Model
  * ／每日常规维护 TaskStatistics）
  *
+ * 【2026-07-17 新增，ADR-2026-07-17-009，Carson 批准】新增
+ * migrateSchemaReminderPolicy()（既有部署迁移入口，模式跟
+ * migrateSchemaDueTime() 一致）——给 Tasks/ActiveTasks/ArchiveTasks 三张表
+ * 新增 reminder_policy 一列。不需要新的纯文本格式修复函数，复用既有的
+ * _setPlainTextFormatForNewColumns_()。
+ *
  * 【V4.7 新增，Due Time Support，00_Architecture_Review.gs「七、
  * Review #3」，Carson 2026-07-13 批准】新增 migrateSchemaDueTime()（既有
  * 部署迁移入口，模式跟 migrateSchemaV4() 一致）与配套的
@@ -124,6 +130,26 @@ function migrateSchemaDueTime() {
   _setPlainTextFormatForNewColumns_('ActiveTasks',  ['due_time', 'due_datetime']);
   _setPlainTextFormatForNewColumns_('ArchiveTasks', ['due_time', 'due_datetime']);
   Logger.log('✅ due_time/due_datetime 列迁移完成（含纯文本格式修复）。存量行 due_time/due_datetime 为空字符串，等价于需求方"只有 due_date 时 due_time 视为 null"。');
+}
+
+/**
+ * 【2026-07-17 新增，ADR-2026-07-17-009，Carson 批准】给已经存在的部署
+ * 新增 reminder_policy 一列，不需要跑完整的 setupSheets()。幂等——多次
+ * 运行、列已存在时会跳过。运行方式：Apps Script 编辑器里选中这个函数，
+ * 手动执行一次。跟 migrateSchemaDueTime 是同一个模式——只是"加列"，不是
+ * "填数据"：存量任务的 reminder_policy 留空即可，_parseJsonSafe_（
+ * Reminder OS 那边）和本项目这边的 falsy 检查都会把空字符串当成 null
+ * 处理，等价于"没有覆盖，用 Reminder OS 默认策略"，不需要额外回填。
+ */
+function migrateSchemaReminderPolicy() {
+  Logger.log('=== migrateSchemaReminderPolicy ===');
+  _addColumnsIfMissing_('Tasks',        ['reminder_policy']);
+  _addColumnsIfMissing_('ActiveTasks',  ['reminder_policy']);
+  _addColumnsIfMissing_('ArchiveTasks', ['reminder_policy']);
+  _setPlainTextFormatForNewColumns_('Tasks',        ['reminder_policy']);
+  _setPlainTextFormatForNewColumns_('ActiveTasks',  ['reminder_policy']);
+  _setPlainTextFormatForNewColumns_('ArchiveTasks', ['reminder_policy']);
+  Logger.log('✅ reminder_policy 列迁移完成（含纯文本格式修复——JSON 字符串通常不会被 Sheets 误判类型，这里只是保持跟 due_time/due_datetime 一致的防御性处理）。存量行 reminder_policy 为空字符串，等价于"没有覆盖，用 Reminder OS 默认策略"。');
 }
 
 /**
