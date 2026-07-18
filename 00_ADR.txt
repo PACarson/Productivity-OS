@@ -1,6 +1,6 @@
 /**
  * 00_ADR.gs
- * Productivity OS v4.7 — Architecture Decision Records
+ * Productivity OS v4.8 — Architecture Decision Records
  *
  * 本文件收录本项目"影响后续所有开发判断"的重大架构决策，格式固定为
  * Metadata（V4.3 新增，见下方字段定义） + Context / Decision /
@@ -12,6 +12,19 @@
  * 本文件对应 Universal Domain OS Blueprint「0. Governance → ADR (Optional)」
  * 这一格（00_Project_Constitution.gs P4 之前原本写"暂无"，V4.1 起改为
  * 指向本文件）。
+ *
+ * 【2026-07-15 新增】第六轮外部审计两项架构级修复的正式记录：
+ *   - ADR-2026-07-15-009——Soft Lock 粒度从 chatId 收紧到
+ *     identity（细化 ADR-2026-07-06-003，不是取代——Gate/Soft Lock
+ *     两层结构和"per-user 不再互相排队"的核心决定不变，只是把 Soft Lock
+ *     的 key 从"每用户一把"进一步收紧到"每条创建请求本身一把"）。
+ *   - ADR-2026-07-15-010——EventBus.publish 与 ProjectionEngine.dispatch
+ *     的调用关系从硬编码改成 Subscriber 模式，注册逻辑放在
+ *     15_Setup.gs（Composition Root）。
+ * 两条都源自同一次外部审计（原文档 HIGH RISK 1 / MEDIUM RISK 5），完整
+ * 代码改动见 09_IdempotencyManager.gs / 21_RecurringEngine.gs /
+ * 20_TaskEngine.gs / 02_EventBus.gs / 10_ProjectionEngine.gs /
+ * 15_Setup.gs 各自的文件头。
  *
  * 【2026-07-13 新增】ADR-2026-07-13-008——Due Time Support（完整设计见
  * 00_Architecture_Review.gs「七、Review #3」）的两项设计决策正式记录：
@@ -740,4 +753,283 @@
  *     Reminder OS/其他 Domain OS 也有类似"精确到期时刻"的需求，需要
  *     各自评估是否适用同样的空值语义，不能假设这条 ADR 自动约束别的
  *     项目。
+ */
+
+/**
+ * ── Metadata ──────────────────────────────────────────────────────────────
+ *   ADR Number      : ADR-2026-07-15-009
+ *   Status          : Accepted
+ *   Decision Date   : 2026-07-15
+ *   Supersedes      : （无——细化 ADR-2026-07-06-003，不是取代）
+ *   Superseded By   : （无）
+ *   Affected Modules: 09_IdempotencyManager.gs（Soft Lock key）、
+ *                     21_RecurringEngine.gs（spawnNextIfNeeded 重试与失败
+ *                     信号）、20_TaskEngine.gs（completeTask 转发失败信号）、
+ *                     06_TaskIntentParser.gs（TASK_DONE 回复文案）
+ *   Related ADR     : ADR-2026-07-06-003（Per-User Soft Lock，本条在此基础
+ *                     上进一步收紧粒度）、ADR-2026-07-06-004（Projection
+ *                     幂等消费，同一套"防止重复"的纵深防御体系里的另一层）
+ *   Consequences    : 见下方正文
+ *   Notes           : 第六轮外部审计 HIGH RISK 1 的正式记录
+ *
+ * ── Context ───────────────────────────────────────────────────────────────
+ *
+ * ADR-2026-07-06-003 把 Soft Lock 从全局 ScriptLock 收紧到 per-chatId，
+ * 解决了"不同用户互相阻塞"的问题。但第六轮外部审计指出一个当时没有被
+ * 覆盖到的场景：同一个 chatId 在短时间内并发触发两次*不同*任务的创建——
+ * 最典型的例子是 21_RecurringEngine.spawnNextIfNeeded 在几乎同一时刻为
+ * 同一用户的两个不同 recurring 任务生成下一次实例（比如用户在 Telegram
+ * 上几乎同时点击完成了两个不同的重复任务）。这两次调用会因为共用同一把
+ * chatId 级别的锁而互相拦截，其中一次会拿到
+ * SYSTEM_BUSY_RETRY_IN_PROGRESS。
+ *
+ * 真正的问题不是"被锁挡住"本身（ADR-003 的原始设计里，同一用户内部的
+ * 并发请求本来就应该被严格拦截，这是"Telegram 重试同一条消息"场景需要的
+ * 行为）——而是 spawnNextIfNeeded 内部有一个宽泛的 try/catch，把包括
+ * SYSTEM_BUSY 在内的所有异常一律静默吞掉。ADR-003 设计的"拦截+fail-fast，
+ * 让上游重试"这个模式，隐含假设是"调用方是一次外部 webhook 请求，fail
+ * 之后外部会自然重试"——但 spawnNextIfNeeded 是系统内部调用，没有任何
+ * 外部重试机制，fail-fast 在这里等于永久丢弃。
+ *
+ * ── Decision ──────────────────────────────────────────────────────────────
+ *
+ * 分两部分修复，缺一不可：
+ *
+ * (1) 09_IdempotencyManager.gs：Soft Lock 的 key 从 chatId 改成 identity。
+ *     identity 本身的哈希组成就包含 chatId（07_IdentityEngine.
+ *     generateTaskIdentity 的第一个分量），所以这个改动只会让锁"更精确"：
+ *     同一 identity 的真正重复请求（比如 Telegram 对同一条消息的 webhook
+ *     重试）仍然会争用同一把锁、仍然严格串行，行为跟 ADR-003 设计的
+ *     "防止重复创建"这个初衷完全一致；唯一变化的是"同一用户但不同
+ *     identity"的两个请求不再需要互相排队。Gate（瞬时全局锁，保护
+ *     CacheService 检查+占位这一步的原子性）不受影响。
+ *
+ * (2) 21_RecurringEngine.gs：spawnNextIfNeeded 作为纵深防御，对
+ *     SYSTEM_BUSY 类错误做有限次数（3次）的线性退避重试——(1) 的修复
+ *     之后，本来就该很少见的场景变得更加罕见，重试主要是给 Gate 层极端
+ *     并发这种更罕见的残余情况兜底。重试仍然失败、或者遇到任何非
+ *     SYSTEM_BUSY 的错误（不重试——对确定性失败没有意义），不再返回
+ *     跟"这本来就不适用"完全无法区分的裸 null，而是返回
+ *     { spawn_error: true, message }。这个信号沿 20_TaskEngine.
+ *     completeTask → 06_TaskIntentParser.gs 一路转发，最终让用户在
+ *     "完成"回复里看到"续期没成功"的提示——但"完成这一次"本身依然保证
+ *     成功，不受续期失败影响，这条 ADR-003 就已经确立的原则不变。
+ *
+ * ── Consequences ──────────────────────────────────────────────────────────
+ *
+ * 正面：
+ *   - 同一用户的不同 recurring 任务并发续期不再互相阻塍，这是本次审计
+ *     描述的主要场景，由 (1) 直接解决。
+ *   - 即使收紧粒度之后仍然理论上可能撞见的残余 SYSTEM_BUSY（Gate 层
+ *     极端并发），由 (2) 的重试兜住，绝大多数情况下用户根本不会看到
+ *     任何影响。
+ *   - 万一重试仍然失败，用户第一次能够看到"续期失败"这件事本身（此前
+ *     是完全静默的），可以自己决定要不要手动补建下一次任务——这是本条
+ *     ADR 相对 ADR-003 的关键改进：不只是"减少冲突"，还把"冲突之后
+ *     怎么办"这件事从"悄悄丢弃"变成"用户可见、可行动"。
+ *
+ * 需要接受的代价（不回避）：
+ *   - identity 级别的锁比 chatId 级别的锁多了一次
+ *     IdentityEngine.resolveIdentityDueValue() 的计算成本——这个计算本身
+ *     很轻量（字符串拼接+哈希），可以忽略不计。
+ *   - spawnNextIfNeeded 的重试会让 completeTask 的响应时间在遇到繁忙冲突
+ *     时增加最多约 2.4 秒（3次重试的线性退避总和）——这是有意识的取舍：
+ *     用偶尔增加的一点延迟换取"续期不会无声丢失"，对一个 Telegram Bot
+ *     场景来说，多等 2 秒远比"任务默默消失、用户自己都不知道该去查"
+ *     划算。
+ *   - 这条 ADR 不改变"同一个 identity 的重复请求仍然被严格拦截"这个
+ *     ADR-003 就已经确立的行为——如果未来出现"同一用户需要真正并行地
+ *     创建两个逐字相同的任务"这种此前从未设想过的新需求，需要重新评估，
+ *     不能假设这条 ADR 自动允许那种场景。
+ */
+
+/**
+ * ── Metadata ──────────────────────────────────────────────────────────────
+ *   ADR Number      : ADR-2026-07-15-010
+ *   Status          : Accepted
+ *   Decision Date   : 2026-07-15
+ *   Supersedes      : （无——EventBus.publish 与 Read Model 同步更新这个
+ *                     核心行为本身不变，只改变"内部怎么找到该通知谁"这个
+ *                     实现细节）
+ *   Superseded By   : （无）
+ *   Affected Modules: 02_EventBus.gs（新增 subscribe/_subscribers，publish
+ *                     内部改为订阅者循环）、10_ProjectionEngine.gs（文档
+ *                     说明，dispatch 函数本体不变）、15_Setup.gs（新增
+ *                     Composition Root 小节，注册
+ *                     EventBus.subscribe(ProjectionEngine.dispatch)）
+ *   Related ADR     : （无直接前置 ADR——这是 EventBus/ProjectionEngine
+ *                     关系第一次被正式记录为 ADR，此前这层耦合只在两个
+ *                     文件各自的 Engine Contract 里以 Dependencies/
+ *                     Forbidden Dependencies 字段隐含存在）
+ *   Consequences    : 见下方正文
+ *   Notes           : 第六轮外部审计 MEDIUM RISK（原文档5）的正式记录
+ *
+ * ── Context ───────────────────────────────────────────────────────────────
+ *
+ * EventBus.publish() 原来的实现里，硬编码检查
+ * `typeof ProjectionEngine !== 'undefined'` 再直接调用
+ * `ProjectionEngine.dispatch(event)`。EventBus 作为本项目"发布事件"这个
+ * 概念的唯一入口，因此必须在源码层面"认识"ProjectionEngine 这个具体
+ * 名字——如果未来想接入除 Projection 以外的第二个消费方（比如异步队列、
+ * 中间件、离线场景只发布不投影），或者想把 Projection 换成完全不同的
+ * 实现，都得回来改这份"本该是通用总线"的代码，这是一种不必要的架构
+ * 刚性。
+ *
+ * ── Decision ──────────────────────────────────────────────────────────────
+ *
+ * EventBus 新增通用的 subscribe(handler) / _subscribers 订阅者列表，
+ * publish() 内部改成遍历订阅者依次调用（每个订阅者独立 try/catch）。
+ * EventBus 自己不再在任何地方出现"ProjectionEngine"这个字面名字——
+ * 依赖方向彻底反过来，变成"谁关心 Event 就自己（或者由 Composition Root
+ * 代为）来订阅"，不是"EventBus 主动认识谁"。
+ *
+ * ProjectionEngine 的注册代码不能放在 10_ProjectionEngine.gs 自己文件里
+ * ——该文件的 Engine Contract 明确写着 Forbidden Dependencies 包含
+ * 02_EventBus.gs（不得反向调用），这是为了防止
+ * publish→dispatch→（万一）反过来调 publish 形成调用环，这条既有规则
+ * 本条 ADR 不改变。注册逻辑改放在 15_Setup.gs（Application 层，被
+ * 00_Project_Constitution.gs 零之四明确允许同时依赖 EventBus 和
+ * ProjectionEngine 两个 Infrastructure 层模块），作为本项目的
+ * Composition Root，不需要为此新增一条"已知例外"。
+ *
+ * ── Consequences ──────────────────────────────────────────────────────────
+ *
+ * 正面：
+ *   - EventBus 变成真正通用的总线，未来注册额外订阅者（比如异步处理、
+ *     多播到其它系统）不需要再改 EventBus.gs 本身一行代码。
+ *   - 依赖方向符合 Clean Architecture 的一般原则：底层组件（EventBus）
+ *     不认识上层/同层的具体消费者，消费者自己注册。
+ *   - 运行时行为完全向后兼容——目前只注册了 ProjectionEngine 一个订阅者，
+ *     event.projection_ok 字段的语义、_alertAdminProjectionFailure_ 的
+ *     告警文案和触发条件都不变。
+ *
+ * 需要接受的代价（不回避）：
+ *   - 15_Setup.gs 新增了一段不属于任何函数体、直接写在顶层的可执行
+ *     wiring 语句——这是该文件目前唯一一处这种写法（其余全部是需要手动
+ *     调用的函数），依赖 GAS"每次执行都会先跑一遍全部顶层代码"这个隐含
+ *     行为。这不是本项目第一次依赖这个假设（编号前缀 00/01/02.../26 本来
+ *     就是刻意利用文件加载顺序），但确实是第一次利用它来做"跨文件方法
+ *     注册"而不只是"定义好独立可用的模块"，需要在 15_Setup.gs 里保留
+ *     足够的注释说明，避免以后被误当成可以随意删除的死代码。
+ *   - event.projection_ok 这个字段名保留了"projection"这个具体字眼，
+ *     没有跟着这次通用化改成更抽象的名字（比如 subscribers_ok）——目前
+ *     确实只有 ProjectionEngine 一个订阅者，字段名语义完全准确，属于
+ *     "不为了理论上的通用性提前抽象"的刻意选择；如果未来注册了第二个
+ *     订阅者并且它也可能失败，需要重新评估这个字段是否还够精确，届时
+ *     再改，不是现在就要解决的问题。
+ *   - 本文件是跟 Personal AI Core 独立演进的本地副本（见 02_EventBus.gs
+ *     文件头），本条 ADR 和这次改动只覆盖 Productivity OS 自己这份
+ *     副本，不影响 Core 项目的独立副本——Core 是否有同样的耦合、是否
+ *     需要同样的修复，需要在 Core 项目里单独评估，本条 ADR 不能替 Core
+ *     项目下结论。
+ */
+
+/**
+ * ── Metadata ──────────────────────────────────────────────────────────────
+ *   ADR Number      : ADR-2026-07-17-011
+ *   Status          : Accepted
+ *   Decision Date   : 2026-07-17
+ *   Supersedes      : （无）
+ *   Superseded By   : （无，仍然生效）
+ *   Affected Modules: 06_TaskIntentParser.gs, 09_TemporalParser.gs,
+ *                     20_TaskEngine.gs, 15_Setup.gs,
+ *                     11_ProjectionRebuilder.gs, 00_Known_Limitations.gs
+ *   Related ADR     : ADR-2026-07-06-002（Schema Authority——本次新增
+ *                     reminder_policy 一列走的是该 ADR 定义好的"向后兼容
+ *                     追加列"迁移模式）；ADR-2026-07-13-008（Due Time
+ *                     Support——这次解析范围扩展沿用同一套"确定性时间
+ *                     解析 vs. 语义判断"测试）；Reminder OS 侧
+ *                     00_ADR_006_Reminder_Policy_Override.gs（对称的另
+ *                     一半决策，覆盖 Reminder OS 如何消费这个字段）
+ *   Consequences    : 见下方正文
+ *   Notes           : 完整跨项目架构审查见
+ *                     Reminder-Policy-Override_Architecture-Review.md，
+ *                     Carson 2026-07-17 批准后实现。
+ *
+ * ── Context ──────────────────────────────────────────────────────────────
+ *
+ * 原始需求：用户创建任务时可以直接覆盖 Reminder OS 的默认提醒策略
+ * （"remind me 30 minutes before"这类短语）。三个需要正式记录的设计点：
+ *
+ * (1) 覆盖信息（reminder_policy）该长在哪——Task 记录上，还是 Reminder OS
+ *     自己的表？
+ *
+ * (2) 识别"提前N分钟/小时/天提醒"这类短语，算不算这份文档
+ *     00_Known_Limitations.gs 里"自然语言解析范围止于 due_date/recurring"
+ *     这条既有边界该扩展的对象？
+ *
+ * (3) 这个字段该不该影响 IDENTITY_AFFECTING_FIELDS / UPDATABLE_FIELDS？
+ *
+ * ── Options Considered ───────────────────────────────────────────────────
+ *
+ * 关于 (1)：
+ *   A. reminder_policy 作为 Task 的一个新字段，Productivity OS 负责解析
+ *      和存储，Reminder OS 通过既有只读通道（QueryEngine.getPendingTasks()）
+ *      读取。
+ *   B. Personal AI Core 直接调用 Reminder OS 的 Connector，写入 Reminder
+ *      OS 自己的规则表——需要先给 Reminder OS 的 Connector 打开写能力
+ *      （现状六个写操作全部 supported:false，且 Reminder OS Constitution
+ *      P2 明确"不接受被当 Library 调用、不接 webhook"）。
+ *
+ * 关于 (2)：
+ *   A. 沿用跟 due_time 那次一样的判断标准（是否需要语义/领域判断），
+ *      认定 offset 短语属于确定性时间解析，扩展既有边界。
+ *   B. 认定这是一种新的、不同类的能力，需要一条全新的、独立的边界定义。
+ *
+ * 关于 (3)：
+ *   A. 加入 IDENTITY_AFFECTING_FIELDS 和/或 UPDATABLE_FIELDS。
+ *   B. 都不加——本次只覆盖 Create 流程，且提醒策略不是任务的身份特征。
+ *
+ * ── Decision ──────────────────────────────────────────────────────────────
+ *
+ * (1) 选项 A——reminder_policy 长在 Task 上。理由：ActiveTasks 投影是
+ *     通用透传（10_ProjectionEngine.projectTaskCreated_ 整个 event
+ *     payload upsert），Reminder OS 的 QueryEngine 按表头通用转成扁平
+ *     对象——新字段不需要改这两处代码就能读到，不需要打开 Reminder OS
+ *     的 Connector 写能力，也不违反该项目 Constitution P2 的独立运作
+ *     原则。选项 B 影响面大得多，且是一个独立于本次需求、需要单独评估
+ *     的更大决策（是否打破 Reminder OS 的自主运作原则），不应该被这次
+ *     需求顺带触发。
+ *
+ * (2) 选项 A——扩展既有边界，不新开一条。"提前30分钟"和"tomorrow 3pm"
+ *     是同一类可枚举、可正则匹配的确定性时间表达式，用的判断标准跟
+ *     due_time 那次完全一样，不是新引入一条。
+ *
+ * (3) 选项 B——两个字段列表都不加。reminder_policy 跟 budget/notes/
+ *     description/tags 同类，是元信息不是身份特征；UPDATABLE_FIELDS
+ *     的排除是范围决定（本次只做 Create），不是能力缺陷。
+ *
+ * ── Consequences ──────────────────────────────────────────────────────────
+ *
+ * 正面：
+ *   - 本次改动完全不涉及 Personal AI Core、Connector Layer（08_ 前缀
+ *     六个文件）——Core 现有的"整句原文转发给
+ *     ProductivityConnector.execute('HandleTaskIntent', ...)"这条既有
+ *     路径不需要改一行代码，offset 短语识别自然落在已经在做全部原文
+ *     解析的 06_TaskIntentParser.gs/09_TemporalParser.gs 里。
+ *   - reminder_policy 为 null 时（存量任务、以及本次改动之前创建的任何
+ *     任务）行为逐字节不变，不需要数据回填，只需要一次 schema 迁移
+ *     （migrateSchemaReminderPolicy()，模式跟 migrateSchemaDueTime()
+ *     完全一致）。
+ *   - _buildCreateReply_() 新增的确认文案（用户显式覆盖时才显示）是
+ *     纯展示层改动，不影响任何持久化或 Reminder OS 行为，且是用户唯一
+ *     能在创建当下确认"覆盖有没有被听懂"的地方。
+ *
+ * 需要接受的代价（不回避）：
+ *   - 09_TemporalParser.gs 的 offset 短语识别是本项目独有改动（跟
+ *     V4.7 due_time 那次一样），不会同步到 Personal-AI-main 自己的
+ *     同名文件——如果那边以后也需要识别同样的短语，需要单独重复这次
+ *     改动，不会自动生效。
+ *   - 英文形式要求"remind me"字面出现、中文形式要求"提前"字面出现，
+ *     都不识别裸的"30 minutes before"/"30分钟前"——这是刻意收窄换取
+ *     更低的误伤率，不是遗漏（经 Node 沙盒实测确认，见
+ *     09_TemporalParser.gs 函数头注释的"已知限制"）。
+ *   - 多个 offset 之间必须有连接词（and / 和 / 、 / ，/ ,）——没有连接词
+ *     的短语只会识别出第一个，其余留在清洗后的 title 里。原始需求文档
+ *     举的例子都带连接词，这个限制不影响需求本身，但如果 Carson 实际
+ *     使用中发现这个说法很常见，需要另外评估要不要放宽。
+ *   - reminder_policy 不支持创建后修改（Carson 2026-07-17 决定 #2）——
+ *     这不是本 ADR 的范围缺陷，是刻意的范围收窄，未来需要时应该另开
+ *     ADR/Phase，不要把 UPDATABLE_FIELDS 加上这个字段当成"补一个遗漏"
+ *     去做。
  */
