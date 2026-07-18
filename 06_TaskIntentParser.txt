@@ -2,6 +2,16 @@
  * 06_TaskIntentParser.gs
  * Productivity OS v4.7 — 任务意图解析器
  *
+ * 【2026-07-17 新增，ADR-2026-07-17-009，Carson 批准】parseTaskIntent()
+ * 的 TASK_CREATE 分支新增转发 reminder_policy（09_TemporalParser.gs
+ * extractDateTime() 新增的返回字段，null｜{offsets:[]}｜
+ * {offsets:[{value,unit}]}），createTaskIfNotExists 的 meta 对象同步
+ * 新增这个字段。新增 _formatReminderPolicyDisplay_()，在建任务回复里
+ * 只在用户显式覆盖提醒策略时追加一行确认文案（沿用 recurring 字段"只在
+ * 有值时才显示"的既有惯例）。完整跨项目设计见
+ * Reminder-Policy-Override_Architecture-Review.md 和本项目
+ * 00_Known_Limitations.gs 本次新增的解析范围扩展条目。
+ *
  * 【V4.7 新增，Due Time Support，00_Architecture_Review.gs「七、
  * Review #3」，Carson 2026-07-13 批准】parseTaskIntent() 的 TASK_CREATE
  * 分支和 createTaskIfNotExists 的 meta 对象都新增转发 due_time/
@@ -137,7 +147,8 @@ function parseTaskIntent(rawText) {
     due_date:        dt.due_date        || '',
     due_time:        dt.due_time        || '',
     due_datetime:    dt.due_datetime    || '',
-    recurrence_rule: dt.recurrence_rule || null
+    recurrence_rule: dt.recurrence_rule || null,
+    reminder_policy: dt.reminder_policy || null
   };
 }
 
@@ -168,10 +179,11 @@ function handleTaskIntent(rawText, chatId) {
         result = IdempotencyManager.createTaskIfNotExists(
           parsed.title,
           {
-            due_date:     parsed.due_date,
-            due_time:     parsed.due_time,
-            due_datetime: parsed.due_datetime,
-            recurring:    recurringLabel
+            due_date:        parsed.due_date,
+            due_time:        parsed.due_time,
+            due_datetime:    parsed.due_datetime,
+            recurring:       recurringLabel,
+            reminder_policy: parsed.reminder_policy
           },
           chatId
         );
@@ -350,7 +362,36 @@ function _buildCreateReply_(task) {
   var lines = ['✅ 已建任务', 'ID: ' + task.task_id, '标题: ' + task.title];
   if (task.due_date) lines.push('到期: ' + _formatDueDisplay_(task));
   if (task.recurring) lines.push('🔁 重复: ' + task.recurring);
+  var reminderLine = _formatReminderPolicyDisplay_(task);
+  if (reminderLine) lines.push(reminderLine);
   return lines.join('\n');
+}
+
+/**
+ * 【2026-07-17 新增，ADR-2026-07-17-009】只在这次创建时用户显式覆盖了
+ * 提醒策略（reminder_policy 非空）才显示这一行——沿用上面 recurring
+ * "只在有值时才显示"的既有惯例，reminder_policy 为 null（用 Reminder OS
+ * 默认策略）时保持沉默，不给每条建任务回复都加一行没有信息量的"提醒:
+ * 默认"文案。这也是用户唯一能在创建当下确认"我说的覆盖有没有被听懂"的
+ * 地方，不是可有可无的装饰——所以即使原始需求文档没有明确要求这行回复
+ * 文案，这里还是加了，纯展示层改动，不影响任何持久化或 Reminder OS 行为。
+ */
+function _formatReminderPolicyDisplay_(task) {
+  if (!task || !task.reminder_policy) return '';
+  var policy;
+  try {
+    policy = JSON.parse(task.reminder_policy);
+  } catch (e) {
+    return ''; // 解析失败不影响主回复，静默跳过这一行
+  }
+  if (!policy || !policy.offsets) return '';
+  if (policy.offsets.length === 0) return '⏰ 提醒: 不提前提醒（到期提醒不受影响）';
+
+  var unitLabels = { minutes: '分钟', hours: '小时', days: '天' };
+  var labels = policy.offsets.map(function (o) {
+    return o.value + (unitLabels[o.unit] || o.unit) + '前';
+  });
+  return '⏰ 提醒: ' + labels.join('、');
 }
 
 function _buildDuplicateTaskReply_(task) {
