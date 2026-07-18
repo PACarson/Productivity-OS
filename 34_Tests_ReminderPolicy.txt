@@ -1,0 +1,212 @@
+// ============================================================
+// 34_Tests_ReminderPolicy.gs — Regression tests for Reminder Policy
+// Override (06_TaskIntentParser.gs / 09_TemporalParser.gs,
+// ADR-2026-07-17-009)
+//
+// Run manually from the Apps Script editor: select
+// runAllReminderPolicyTests in the function dropdown and click Run.
+// Check View > Logs (or View > Executions) for PASS/FAIL output.
+//
+// Scope: only the PURE, I/O-free functions are covered here —
+// _extractReminderOffsets_() in 09_TemporalParser.gs and
+// _formatReminderPolicyDisplay_() in 06_TaskIntentParser.gs. All 19
+// assertions below were also verified standalone in plain JS (Node)
+// during design, same cases, before being written into this file.
+//
+// parseTaskIntent()/handleTaskIntent() end-to-end (actual task
+// creation, actual Sheet persistence, actual forwarding to Reminder
+// OS's Offset Engine) touch Sheets + cross-project data and are NOT
+// run by this file — same reasoning as 33_Tests_P16.gs: faking those
+// would mean hitting real Sheets or building a mocking layer this
+// project doesn't have. See the MANUAL VERIFICATION CHECKLIST at the
+// bottom instead.
+// ============================================================
+
+function runAllReminderPolicyTests() {
+  let pass = 0, fail = 0;
+  const results = [];
+
+  function check(actual, expected, label) {
+    const ok = JSON.stringify(actual) === JSON.stringify(expected);
+    results.push(`${ok ? 'PASS' : 'FAIL'} — ${label} (got ${JSON.stringify(actual)}, expected ${JSON.stringify(expected)})`);
+    if (ok) pass++; else fail++;
+  }
+
+  // ── _extractReminderOffsets_(text) — 原始需求文档的三个例子（英文）──
+  check(
+    _extractReminderOffsets_('Pay rent tomorrow 3pm remind me 30 minutes before').reminderPolicy,
+    { offsets: [{ value: 30, unit: 'minutes' }] },
+    'EN: "remind me 30 minutes before" -> 单个offset'
+  );
+  check(
+    _extractReminderOffsets_('Doctor appointment Friday 9am remind me 3 days before and 2 hours before').reminderPolicy,
+    { offsets: [{ value: 3, unit: 'days' }, { value: 2, unit: 'hours' }] },
+    'EN: "3 days before and 2 hours before" -> 两个offset，顺序保留'
+  );
+  check(
+    _extractReminderOffsets_('Meeting tomorrow 2pm no advance reminder').reminderPolicy,
+    { offsets: [] },
+    'EN: "no advance reminder" -> 空数组'
+  );
+
+  // ── 中文等价表达 ──
+  check(
+    _extractReminderOffsets_('还房贷 明天下午3点 提前30分钟提醒我').reminderPolicy,
+    { offsets: [{ value: 30, unit: 'minutes' }] },
+    'ZH: "提前30分钟提醒我"（后缀形式）-> 单个offset'
+  );
+  check(
+    _extractReminderOffsets_('还房贷 明天下午3点 提醒我提前30分钟').reminderPolicy,
+    { offsets: [{ value: 30, unit: 'minutes' }] },
+    'ZH: "提醒我提前30分钟"（前缀形式）-> 单个offset'
+  );
+  check(
+    _extractReminderOffsets_('医生预约 周五上午9点 提前3天和2小时提醒我').reminderPolicy,
+    { offsets: [{ value: 3, unit: 'days' }, { value: 2, unit: 'hours' }] },
+    'ZH: "提前3天和2小时提醒我" -> 两个offset'
+  );
+  check(
+    _extractReminderOffsets_('医生预约 周五上午9点 提前3天、2小时提醒我').reminderPolicy,
+    { offsets: [{ value: 3, unit: 'days' }, { value: 2, unit: 'hours' }] },
+    'ZH: 顿号连接 -> 两个offset'
+  );
+  check(
+    _extractReminderOffsets_('开会 明天下午2点 不用提前提醒').reminderPolicy,
+    { offsets: [] },
+    'ZH: "不用提前提醒" -> 空数组'
+  );
+  check(
+    _extractReminderOffsets_('开会 明天下午2点 不提前提醒').reminderPolicy,
+    { offsets: [] },
+    'ZH: "不提前提醒"（不带"用"）-> 空数组'
+  );
+
+  // ── 完全没提到提醒 -> null（沿用 Reminder OS 默认策略）──
+  check(
+    _extractReminderOffsets_('还房贷 明天下午3点').reminderPolicy,
+    null,
+    '没有提醒短语 -> null'
+  );
+
+  // ── 已知的误伤规避（见 09_TemporalParser.gs 函数头注释"已知限制"）──
+  check(
+    _extractReminderOffsets_('Buy 30 items tomorrow').reminderPolicy,
+    null,
+    '"30"和"tomorrow"共存但没有before/提前 -> 不应误判为offset'
+  );
+  check(
+    _extractReminderOffsets_('Submit report before Friday').reminderPolicy,
+    null,
+    '"before"存在但没有remind me和数字单位 -> 不应误判'
+  );
+
+  // ── matchedStr 应该完整覆盖引导词，清洗后不留残渣 ──
+  (function checkTitleCleanup() {
+    const text = 'Pay rent tomorrow 3pm remind me 30 minutes before';
+    const result = _extractReminderOffsets_(text);
+    const remaining = result.matchedStr ? text.replace(result.matchedStr, '') : text;
+    const cleaned = _cleanTitle_(remaining);
+    check(cleaned.indexOf('remind') === -1 && cleaned.indexOf('before') === -1, true,
+      'matchedStr剥离后，title残留里不应该还有remind/before字样');
+  })();
+
+  // ── _formatReminderPolicyDisplay_(task) ──
+  check(
+    _formatReminderPolicyDisplay_({ reminder_policy: '' }),
+    '',
+    '_formatReminderPolicyDisplay_: reminder_policy为空字符串 -> 不显示（跟null等价）'
+  );
+  check(
+    _formatReminderPolicyDisplay_({ reminder_policy: null }),
+    '',
+    '_formatReminderPolicyDisplay_: reminder_policy为null -> 不显示'
+  );
+  check(
+    _formatReminderPolicyDisplay_({ reminder_policy: JSON.stringify({ offsets: [] }) }),
+    '⏰ 提醒: 不提前提醒（到期提醒不受影响）',
+    '_formatReminderPolicyDisplay_: 空数组 -> 显示"不提前提醒"'
+  );
+  check(
+    _formatReminderPolicyDisplay_({ reminder_policy: JSON.stringify({ offsets: [{ value: 30, unit: 'minutes' }] }) }),
+    '⏰ 提醒: 30分钟前',
+    '_formatReminderPolicyDisplay_: 单个offset -> 中文展示文案'
+  );
+  check(
+    _formatReminderPolicyDisplay_({ reminder_policy: JSON.stringify({ offsets: [{ value: 3, unit: 'days' }, { value: 2, unit: 'hours' }] }) }),
+    '⏰ 提醒: 3天前、2小时前',
+    '_formatReminderPolicyDisplay_: 多个offset -> 顿号连接'
+  );
+  check(
+    _formatReminderPolicyDisplay_({ reminder_policy: '不是合法JSON{{{' }),
+    '',
+    '_formatReminderPolicyDisplay_: 无法解析的字符串 -> 安全返回空字符串，不抛错'
+  );
+
+  Logger.log(results.join('\n'));
+  Logger.log(`\n${pass} passed, ${fail} failed.`);
+  if (fail > 0) {
+    Logger.log('=== SOME TESTS FAILED — do not consider Reminder Policy Override verified until this is clean ===');
+  } else {
+    Logger.log('=== ALL PURE-LOGIC TESTS PASSED ===');
+  }
+  return { pass, fail };
+}
+
+/*
+=====================================
+MANUAL VERIFICATION CHECKLIST — I/O-dependent + 跨项目部分
+=====================================
+上面的自动化测试只覆盖纯函数（文本解析、展示文案格式化）。下面这些涉及
+真实 Sheet 写入、以及 Reminder OS 那边的消费逻辑，两个项目分开部署、
+分开测试，这里给出跨过这条边界之后该验证什么。
+
+1. 端到端：单个 offset override
+   - 发送 "Pay rent tomorrow 3pm remind me 30 minutes before"（或中文
+     等价表达）。
+   - 预期：任务创建成功，回复文案里出现"⏰ 提醒: 30分钟前"这一行。
+   - 打开 Tasks/ActiveTasks 表，确认新增的 reminder_policy 列存的是
+     '{"offsets":[{"value":30,"unit":"minutes"}]}'。
+
+2. 端到端：多个 offset override
+   - 发送 "Doctor appointment Friday 9am remind me 3 days before and
+     2 hours before"。
+   - 预期：回复文案里出现"⏰ 提醒: 3天前、2小时前"，reminder_policy 列
+     存两个 offset。
+
+3. 端到端：显式关闭提前提醒
+   - 发送 "Meeting tomorrow 2pm no advance reminder"。
+   - 预期：回复文案里出现"⏰ 提醒: 不提前提醒（到期提醒不受影响）"，
+     reminder_policy 列存 '{"offsets":[]}'。
+
+4. 端到端：完全不提提醒（走默认策略）
+   - 发送一个不含任何提醒短语的任务。
+   - 预期：回复文案里不出现"⏰ 提醒"这一行（沿用既有 recurring 字段
+     "只在有值时才显示"的惯例），reminder_policy 列为空字符串。
+
+5. 跨项目：Reminder OS 侧真的按 reminder_policy 生成规则
+   - 完成步骤1-4任一个之后，等 Reminder OS 下一次 checkOffsetReminders()
+     轮询（最多5分钟），打开 Reminder OS 的 ReminderRules 表，确认：
+     - 步骤1/2创建的任务：对应行的 source 是 user_override，
+       offset_minutes 匹配预期换算值。
+     - 步骤3创建的任务：完全没有对应的规则行。
+     - 步骤4创建的任务：对应行的 source 是 auto_default，三条
+       （1440/60/15分钟）都在。
+   - 这一步验证的是两个项目之间通过共享 Sheet 的实际集成，不是任何一个
+     项目单独能自动化测出来的——具体断言逻辑见 Reminder OS 自己的
+     50_ReminderOffsetEngine_Tests.gs 场景 G/H/I（用 mock task 验证同样
+     的三种情况，但那边测的是"给定 reminder_policy 字段值，规则生成
+     结果对不对"，不是"这个字段真的能从 Telegram 消息一路传到 Reminder
+     OS"）。
+
+6. 回归：schema 迁移
+   - 在一个已有存量任务的部署上手动跑一次 migrateSchemaReminderPolicy()
+     （11_ProjectionRebuilder.gs）。
+   - 预期：Tasks/ActiveTasks/ArchiveTasks 三张表都新增 reminder_policy
+     列，存量行该列为空字符串，其余列/数据不受影响。
+   - 跑现有的建任务流程，确认新任务能正常写入 reminder_policy（不需要
+     额外的 setupSheets()）。
+
+Once all 6 pass on your actual deployment, Reminder Policy Override
+can move from "implemented, pending manual verification" to fully
+closed in the relevant governance file.
+*/
