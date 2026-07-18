@@ -2,6 +2,16 @@
  * 20_TaskEngine.gs
  * Productivity OS v4.7 — Task Engine（create / update / complete / cancel）
  *
+ * 【2026-07-17 新增，ADR-2026-07-17-009，Carson 批准】createTaskDirect_
+ * 的 task 对象新增 reminder_policy（JSON 字符串，透传 meta.reminder_policy，
+ * 没有值时存空字符串——空字符串和 null 在 Reminder OS 那边的
+ * _parseJsonSafe_ 里都会被当成"没有覆盖"，效果一致）。刻意不加入
+ * IDENTITY_AFFECTING_FIELDS（跟 budget/notes/description/tags 同类，是
+ * 提醒元信息，不是任务本身的身份特征）；刻意不加入 updateTask 的
+ * UPDATABLE_FIELDS（本次范围只覆盖创建流程，创建后修改提醒策略是独立能力，
+ * 见 Carson 2026-07-17 决定 #2，未来需要时再评估）。Reminder OS 侧的消费
+ * 逻辑见该项目 26_ReminderOffsetEngine.gs 和 00_ADR_006。
+ *
  * 【V4.7 新增，Due Time Support，00_Architecture_Review.gs「七、
  * Review #3」，Carson 2026-07-13 批准】
  *  - createTaskDirect_ 的 task 对象新增 due_time（透传 meta.due_time）、
@@ -179,6 +189,7 @@ var TaskEngine = (function () {
       notes:          meta.notes        || '',
       description:    meta.description  || '',
       tags:           meta.tags          || '',
+      reminder_policy: meta.reminder_policy ? JSON.stringify(meta.reminder_policy) : '',
       chat_id:        chatId             || '',
       completed_at:   '',
       reminder_count: 0,
