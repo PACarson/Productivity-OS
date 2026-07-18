@@ -1,372 +1,465 @@
+/**
+ * 00_File_Map.gs
+ * Productivity OS v4.8 — 文件地图
+ *
+ * 本文件只放两类内容：文件职责 / 模块关系。
+ * LAST_UPDATED: 2026-07-15 — V4.8 第六轮外部审计：02_EventBus /
+ * 10_ProjectionEngine / 15_Setup / 12_TaskQueryEngine / 05_SheetUtils /
+ * 11_ProjectionRebuilder / 09_IdempotencyManager / 21_RecurringEngine /
+ * 20_TaskEngine / 06_TaskIntentParser 十个文件的条目补充本次变更说明；
+ * 「二、模块关系」更新 EventBus↔ProjectionEngine 的依赖方向（不再是
+ * EventBus 硬编码认识 ProjectionEngine，改成 ProjectionEngine 通过
+ * 15_Setup.gs 这个 Composition Root 注册为订阅者）、新增
+ * 12_TaskQueryEngine.gs → ActiveTasks（读）这一条依赖边（此前这条边在
+ * 架构铁律里已被允许但未被实际使用）。「三、Architecture Layer Map」的
+ * 分层结论不受影响，未改动。
+ *
+ * 2026-07-13 — V4.7 Due Time Support 落地（完整设计见
+ * 00_Architecture_Review.gs「七、Review #3」，Carson 2026-07-13 批准后
+ * 实现）：06_TaskIntentParser / 09_IdempotencyManager / 09_TemporalParser /
+ * 07_IdentityEngine / 20_TaskEngine / 21_RecurringEngine /
+ * 11_ProjectionRebuilder / 15_Setup 八个文件的条目补充本次变更说明；
+ * 「二、模块关系」新增 21_RecurringEngine.gs → 07_IdentityEngine.gs 这
+ * 一条新依赖边。「三、Architecture Layer Map」的分层结论不受影响，
+ * 未改动。
+ *
+ * 2026-07-11 — 00_Architecture_Review.gs（UEF v1.0 Domain
+ * Profile Review #1）Finding D3-1 附带发现的第三个实例：「三、Architecture
+ * Layer Map」开头的治理文档计数过期（写于 V4.3，未跟进 2026-07-11 新增的
+ * Known Limitations / Command Reference 两份，以及本次新增的
+ * Architecture Review 本身），本次修正为实际的八份。不改变本节的分层
+ * 结论本身。
+ *
+ * 2026-07-06 — V4.6：第五轮外部审计修复（TaskStatistics
+ * 从事件驱动实时投影降级为每日批量重算，见 00_ADR.gs ADR-2026-07-06-005；
+ * 另有 Events 表动态表头映射、getTask 单行查找、归档列数一致性等修复，
+ * 完整清单见 00_Project_State.gs）。01/02/03/05/13 五个"逐字未改"/共享
+ * 副本文件的描述已按实际改动更新。V4.5：第四轮外部审计修复（Gate 等待
+ * 时间、Projection 幂等、归档有界扫描、SecureConfig/Spreadsheet 缓存、
+ * SYSTEM_BUSY 错误细分）。V4.4：第三轮外部审计修复（3 HIGH + 1 MEDIUM
+ * 在本项目范围内可修，1 HIGH + 1 MEDIUM 涉及的文件不在本项目——见
+ * 00_Project_State.gs 完整清单和范围说明）。V4.3（第二部分，代码落地）：
+ *   1. 新增「三、Architecture Layer Map」，把全部 21 个可执行文件归类到
+ *      Presentation/Application/Domain/Infrastructure 四层中的唯一一层，
+ *      对应 00_Project_Constitution.gs「零之四、Dependency Rules」。
+ *   2. 把 00_Project_Constitution.gs「零之三、Engine Contract Standard」
+ *      的正式字段，实际写入以下 12 个 Engine 文件的文件头（只加注释，不改
+ *      任何函数行为，纯文档落地）：07_IdentityEngine / 08_DeduplicationEngine /
+ *      10_ProjectionEngine / 12_TaskQueryEngine / 13_ActiveTasksEngine /
+ *      20_TaskEngine / 21_RecurringEngine / 22_PriorityEngine /
+ *      23_SearchEngine / 24_ViewEngine / 25_DashboardEngine /
+ *      26_AnalyticsEngine。
+ */
+
 // ============================================================
-// 00_File_Map.gs
-// Rider OS v2.5 — File Map & Module Relationships
-// Reference this when deciding which file to edit
-// Last updated: 2026-07-14
+// 一、文件详情
 // ============================================================
 
-/*
-=====================================
-FILE INDEX (28 files + 4 meta)
-=====================================
-
-── META ──────────────────────────────────────────────────────
-00_Project_Constitution.gs  Core principles, architecture rules, coding rules
-00_Business_Rules.gs        Domain/business rules — Reward, Booking, Maintenance,
-                            Operational Timeline (P15-P22, added 2026-07-14)
-00_Project_State.gs         Current status, bugs, next steps, command reference
-00_File_Map.gs              This file — module map and relationships
-
-── FOUNDATION ────────────────────────────────────────────────
-01_Config.gs          ALL constants: SHEETS, COL indices (1-based),
-                      EVENT types, BOOKING slots, PEAK_SESSIONS,
-                      MAINTENANCE_CONFIG, LIMITS, REMINDER config
-                      FUEL_TYPE.RON95 kept as internal constant
-                      NEXT_REQUESTED added; REWARD_DAY/WEEK_RPT removed
-                      → Edit here when adding new sheets or events
-
-02_TelegramService.gs send(chatId, text) only
-                      HTML parse mode. No return value ever.
-                      → Never add logic here
-
-03_AlertService.gs    log(level, module, func, input, msg)
-                      getLastError()
-                      → Writes to Alerts_Log sheet
-
-04_TruthEngine.gs     getRows(), append(), updateRow(), getSheet()
-                      now(), today(), time(), formatTimeHuman()
-                      → Single interface for all sheet operations
-                      → formatTimeHuman() handles Date objects AND "HH:mm:ss"
-                         strings safely (Bug-2 fix: no NaN:31 AM)
-
-── STATE LAYER ───────────────────────────────────────────────
-05_StateService.gs    getActiveShift(bike)          ← always pass bike
-                      getLastClosedShift(bike)       ← always pass bike
-                      getTruthKM(bike)                ← KM TRUTH SYSTEM v2:
-                                                          Fuel+Daily+Maint+Bikes MAX
-                      getLastTruthRecord(bike)        ← {km,source,backups}, for /diag
-                      validateKM(inputKM, bike)       ← {REJECT|CONFIRM|OK,truthKm,gap}
-                      getHighestKmForBike(bike)      ← deprecated alias of getTruthKM()
-                      getLastCumulativeForBike(bike, dateStr)
-                      getTodaySummary(), getYesterdaySummary()
-                      getWeekSummary(), getBikes()
-
-21_MaintenanceState.gs  buildReport(bike), calcAllItems(bike)
-                        Legacy 3-level status (OVERDUE/WARNING/GOOD)
-                        Used as fallback if MaintenanceIntelligence fails
-
-23_BikeState.gs       getCurrentBike(chatId), setCurrentBike(chatId, bike)
-                      switchBike(event), showCurrent(event)
-                      → Stored in ScriptProperties: CURRENT_BIKE_{chatId}
-
-32_UserProfile.gs     getAvgDailyKm()     ← 30-day working average
-                      getProfile()         ← 7/30/90 day averages
-                      show(chatId)         ← /profile command
-                      → Used by MaintenanceIntelligence for ETA calculation
-
-33_Tests_P16.gs       runAllP16Tests()     ← unit tests for P16 escalation
-                      (added 2026-07-14, Business_Rules.gs P16)
-                      → Pure-logic only; see file's own MANUAL
-                        VERIFICATION CHECKLIST for the Sheet/Telegram half
-
-── EVENT LAYER ───────────────────────────────────────────────
-06_Parser.gs          All parseXxx() functions
-                      parseFuel: NO fuelType — all RON95 (v2.2)
-                      parseStart, parseStop (cumulative)
-                      parseService (alias support), parseStatus
-                      parseMaint, parseBookingMark, parseBookingUnmark
-                      parseRewardSet_cmd, parseRewardAdd, parseRewardSet
-                      → Returns {ok, ...data} or {ok:false, error}
-                      → Duplicate parseRewardSet_cmd/Add/Set removed
-
-07_EventEngine.gs     create(type, chatId, rawText, payload)
-                      dispatch(event) → routes to correct service
-                      → Logs every dispatch to Event_Log
-                      → REWARD_DAY/WEEK_RPT removed; NEXT_REQUESTED added
-
-08_Router.gs          text → EventEngine.dispatch()
-                      ORDER-SENSITIVE — longer prefixes first
-                      Critical order: /yest before /y
-                                      /next before /ai
-                                      /rewardset before /rewards before /reward+ before /reward
-                                      /booksetup→/bookweek→/bookall→
-                                      /bookscore→/booked→/unbook→/book
-                      REMOVED: /rewardday, /rewardweek routes
-
-── SERVICE LAYER ─────────────────────────────────────────────
-09_DailyService.gs    startShift(event) — validates against getHighestKmForBike()
-                      stopShift(event)  — cumulative delta, triggers scan()
-                      today(), yest(), week(), bike()
-                      confirmAny() — handles all /y confirmations
-
-10_FuelService.gs     record(event) — KM validation, no fuelType (all RON95)
-                      confirmYes(), confirmNo()
-                      getRowsForBike(bike), getAllRows()
-                      → Triggers MaintenanceIntelligence.scan() after record
-
-12_TaskService.gs     create(), list() (numbered), markDone() (index+fuzzy)
-                      showVote(), setVote(), filter(), priority()
-
-20_MaintenanceService.gs  record(event) — reads next interval from
-                          Maintenance_Profile sheet first (Bug-4 fix)
-                          _getMaintenanceProfile(bike, category) helper
-                          status(event), check(event), getOverdueCount()
-                          confirmService(), cancelService()
-
-22_FuelIntelligence.gs  stats(event)    — /fuelstats [bike]
-                         quota(event)    — /fuelquota
-                         scenario(event) — /fuelscenario
-
-24_RewardService.gs   set(event)        — /reward <n> [session] (no /y)
-                      add(event)        — /reward+ <n> [session] (no /y)
-                      dashboard(event)  — /rewards REDESIGNED v2.2:
-                                          Daily + Weekday/Weekend + Tonight + Potential
-                      setConfig(event)  — /rewardset (with weekStart)
-                      runRewardTrigger() — called by masterTrigger
-                      getSummary()      — used by DecisionEngine
-                      REMOVED: dayReport(), weekReport()
-
-25_WeatherService.gs  check(event), autoCheck(event), runWeatherTrigger()
-                      getStatus() — for /diag
-                      getSummary() — for DecisionEngine
-
-27_BookingEngine.gs   dashboard(), all(), week(), score()
-                      mark(), unmark(), setup(), autoCheck()
-                      checkEscalation() ← NEW 2026-07-14 (P16): escalating
-                        reminder for unbooked Critical slots, called every
-                        masterTrigger tick — see 14_Main.gs
-                      getSummary() — used by DecisionEngine + HealthMonitor
-                        now also carries escalationIntervalMin (P16)
-
-29_MaintenanceIntelligence.gs
-                      dashboard(event)  — /maint [bike]
-                      due(event)        — /maintdue
-                      scan(bike, chatId, trigger):
-                        → clearPendingByBike() before enqueue (Bug-3 fix)
-                        → flush() only on SHIFT_CLOSED
-                      getSummary(bike):
-                        → returns topUrgent item (most urgent by etaDays)
-                        → overdue, urgent, critical, warning lists
-                      _calcAllStatus(): adds etaDays + dueDateStr to each item
-                      _formatItem(): Due Date as primary, KM as secondary
-                      _minNotNull(), _addDaysToToday() helpers
-                      → 6-level: OVERDUE URGENT CRITICAL WARNING GOOD UNRECORDED
-                      → ETA = ceil(remainingKm / avgDailyKm)
-                      → Items sorted by etaDays ascending
-
-26_DecisionEngine.gs  advise(event) — /ai REDESIGNED v2.2:
-                        Top 3 priorities only (Reward, Booking, Maintenance)
-                        One clear recommendation
-                      next(event) — /next NEW v2.2:
-                        5 quick actions sorted by urgency score
-                      _buildPriorities(), _buildActions() private helpers
-
-── OBSERVABILITY ─────────────────────────────────────────────
-13_DiagnosticService.gs  /diag — sheets, shift state, maintenance, last event
-16_EventLogger.gs        /inspect (last 10 events), getTodayStats()
-17_HealthMonitor.gs      /health, health score 0-100
-18_MetricsEngine.gs      /metrics per-bike earnings/km/fuel
-19_AnomalyEngine.gs      checkAll() — KM anomaly, duplicate shift, fuel gap
-
-── REMINDER SYSTEM ───────────────────────────────────────────
-30_ReminderEngine.gs  flush(chatId), morningBrief(), stats(event)
-                      Sources: MAINTENANCE BOOKING REWARD WEATHER DOCUMENT
-
-31_ReminderQueue.gs   enqueue(item, opts) — dedup check (6hr window v2.2)
-                      opts.sentImmediately ← NEW 2026-07-14 (P16): logs
-                        the row as already-SENT instead of PENDING, for
-                        callers that send via TelegramService directly
-                      getPending(), markSent(rowIndices), archive()
-                      getMinutesSinceLastMatch(item) ← NEW 2026-07-14:
-                        shared scan _isDuplicate() now delegates to;
-                        used by BookingEngine.checkEscalation() (P16)
-                        for its dynamic (non-fixed-window) interval check
-                      clearPendingByBike(bike, source) ← NEW v2.2
-                        Clears stale PENDING items before fresh scan enqueue
-                        Prevents duplicate RIDER BRIEF on /stop
-
-── ENTRY + SETUP ─────────────────────────────────────────────
-14_Main.gs            doPost(e) — webhook, NO return value
-                      masterTrigger() — 15-min dispatcher
-                      setupTriggers(), removeTriggers()
-                      registerWebhook(), checkWebhook(), deleteWebhook()
-
-15_Setup.gs           setupRiderOS() — all sheets + seed data
-                      Bikes schema: 9 cols (BUG-E fix: +RoadtaxExpiry +InsuranceExpiry)
-                      _seedBikes(), _seedFuelConfig(), _seedRewardsConfig()
-                      _seedMaintenanceProfile(), _seedMaintenanceWeight()
-                      _seedWeatherZones()
-
-=====================================
-SHEET → FILE MAPPING
-=====================================
-
-Sheet               Written by              Read by
-─────               ──────────              ───────
-Daily               09_DailyService         05_StateService
-                                            18_MetricsEngine
-                                            24_RewardService (via StateService)
-                                            32_UserProfile
-
-Fuel                10_FuelService          22_FuelIntelligence
-                                            21_MaintenanceState
-                                            18_MetricsEngine
-
-Fuel_Config         15_Setup (seed)         22_FuelIntelligence
-
-Maintenance         20_MaintenanceService   21_MaintenanceState
-                                            29_MaintenanceIntelligence
-
-Maintenance_Profile 15_Setup (seed)         29_MaintenanceIntelligence
-                                            20_MaintenanceService (next interval)
-Maintenance_Weight  15_Setup (seed)         29_MaintenanceIntelligence
-
-Tasks               12_TaskService          12_TaskService
-
-Bikes               15_Setup (seed)         05_StateService
-                    (RoadtaxExpiry+         21_MaintenanceState
-                    InsuranceExpiry added)  29_MaintenanceIntelligence
-                                            20_MaintenanceService
-
-Config              15_Setup (seed)         (manual reference)
-Alerts_Log          03_AlertService         03_AlertService (getLastError)
-Event_Log           07_EventEngine          16_EventLogger, 13_DiagnosticService
-
-Rewards_Config      24_RewardService        24_RewardService
-Rewards_Log         24_RewardService        24_RewardService
-
-Weather_State       25_WeatherService       25_WeatherService
-Weather_Zones       15_Setup (seed)         25_WeatherService
-
-Booking_Plan        27_BookingEngine        27_BookingEngine
-
-Reminder_Queue      31_ReminderQueue        30_ReminderEngine
-Reminder_History    31_ReminderQueue        30_ReminderEngine (stats)
-Reminder_Rules      15_Setup (seed)         (future use)
-User_Profile        32_UserProfile          (future use)
-
-=====================================
-EVENT → SERVICE MAPPING (v2.2)
-=====================================
-
-SHIFT_STARTED        → DailyService.startShift()
-SHIFT_ENDED          → DailyService.stopShift()
-CONFIRM_YES          → DailyService.confirmAny()
-TODAY_REQUESTED      → DailyService.today()
-YEST_REQUESTED       → DailyService.yest()
-WEEK_REQUESTED       → DailyService.week()
-BIKE_REQUESTED       → DailyService.bike()
-
-FUEL_LOGGED          → FuelService.record()
-FUEL_CONFIRM_YES     → FuelService.confirmYes()
-FUEL_CONFIRM_NO      → FuelService.confirmNo()
-FUEL_STATS_REQUESTED → FuelIntelligence.stats()
-FUEL_QUOTA_REQUESTED → FuelIntelligence.quota()
-FUEL_SCENARIO_REQUESTED → FuelIntelligence.scenario()
-
-SERVICE_LOGGED       → MaintenanceService.record()
-SERVICE_CONFIRM_YES  → MaintenanceService.confirmService()
-SERVICE_CONFIRM_NO   → MaintenanceService.cancelService()
-STATUS_REQUESTED     → MaintenanceService.status()
-MAINT_DASHBOARD      → MaintenanceIntelligence.dashboard()
-MAINT_DUE            → MaintenanceIntelligence.due()
-
-TASK_CREATED         → TaskService.create()
-TASK_LIST_REQUESTED  → TaskService.list()
-TASK_DONE            → TaskService.markDone()
-TASK_VOTE_REQUESTED  → TaskService.showVote()
-TASK_VOTE_SET        → TaskService.setVote()
-TASK_FILTER          → TaskService.filter()
-TASK_PRIORITY        → TaskService.priority()
-
-REWARD_SET           → RewardService.set()
-REWARD_ADD           → RewardService.add()
-REWARDS_REQUESTED    → RewardService.dashboard()   ← unified Reward Center
-REWARD_CONFIG_SET    → RewardService.setConfig()
-[REMOVED] REWARD_DAY     → RewardService.dayReport()   ← deleted in v2.2
-[REMOVED] REWARD_WEEK_RPT → RewardService.weekReport() ← deleted in v2.2
-
-BOOKING_DASHBOARD    → BookingEngine.dashboard()
-BOOKING_ALL          → BookingEngine.all()
-BOOKING_WEEK         → BookingEngine.week()
-BOOKING_SCORE        → BookingEngine.score()
-BOOKING_MARK         → BookingEngine.mark()
-BOOKING_UNMARK       → BookingEngine.unmark()
-BOOKING_SETUP        → BookingEngine.setup()
-
-WEATHER_REQUESTED    → WeatherService.check()
-AI_REQUESTED         → DecisionEngine.advise()     ← top 3 priorities (v2.2)
-NEXT_REQUESTED       → DecisionEngine.next()       ← NEW v2.2 — 5 quick actions
-PROFILE_REQUESTED    → UserProfile.show()
-REMINDER_STATS       → ReminderEngine.stats()
-
-DIAGNOSTIC_REQUESTED → DiagnosticService.run()
-INSPECT_REQUESTED    → EventLogger.inspect()
-HEALTH_REQUESTED     → HealthMonitor.run()
-METRICS_REQUESTED    → MetricsEngine.run()
-
-=====================================
-COMMON EDIT SCENARIOS
-=====================================
-
-"Add new Telegram command"
-  1. 06_Parser.gs    — add parseXxx()
-  2. 01_Config.gs    — add EVENT.NEW_EVENT
-  3. 07_EventEngine  — add case in switch
-  4. 08_Router.gs    — add route (check order! P5 in Constitution)
-  5. XX_Service.gs   — add handler function + update return {}
-  6. 00_File_Map.gs  — update EVENT→SERVICE mapping
-  7. 00_Project_State.gs — update command reference
-
-"Change maintenance interval for a bike"
-  → Edit Maintenance_Profile sheet directly (col 3 = KM_Interval)
-  → MaintenanceService.record() and MaintenanceIntelligence both
-     read from this sheet first (CR11)
-
-"Add new Google Sheet"
-  1. 01_Config.gs    — add SHEETS.NAME + COL.NAME
-  2. 15_Setup.gs     — add to SCHEMA array + seed function
-  3. Run setupRiderOS()
-
-"Fix a bug in shift logic"
-  → 09_DailyService.gs + 05_StateService.gs
-
-"Fix maintenance ETA wrong"
-  → 29_MaintenanceIntelligence.gs (_calcAllStatus etaDays logic)
-  → 32_UserProfile.gs (getAvgDailyKm source data)
-
-"Fix reward calculation"
-  → 24_RewardService.gs (dashboard, _getWeekPeakTotal, _parseTiers)
-
-"Fix booking count wrong"
-  → 27_BookingEngine.gs (_getBookingStats, _getCriticalMissingSlots)
-
-"Telegram not responding"
-  → 14_Main.gs (check doPost has NO return statement)
-  → Run registerWebhook() or checkWebhook()
-
-"NaN:31 AM showing in shift message"
-  → 04_TruthEngine.gs formatTimeHuman() — should handle Date objects
-  → Verify START_TIME column is TIME-formatted in Daily sheet
-
-"Duplicate RIDER BRIEF on /stop"
-  → 29_MaintenanceIntelligence.gs scan() — check clearPendingByBike() call
-  → 31_ReminderQueue.gs — check DEDUP_HOURS (should be 6)
-
-"1899 date showing"
-  → Use TruthEngine.formatTimeHuman() for time strings
-  → Never: new Date('HH:mm:ss')
-  → Never: new Date(`${date}T${time}`) — parses as UTC
-
-"Wrong interval after /service"
-  → 20_MaintenanceService.gs _getMaintenanceProfile() — reads Maintenance_Profile
-  → Verify Maintenance_Profile sheet has correct KM_Interval for bike+category
-
-"Cross-bike KM contamination"
-  → 05_StateService.gs (ensure bike param passed to getActiveShift)
-  → 09_DailyService.gs (ensure curBike used in stopShift)
-
-"Weekend reward shows wrong days left"
-  → 24_RewardService.gs dashboard():
-     daysLeft = dayNum >= 5 ? 8 - dayNum : 4 - dayNum + 1
-*/
+/**
+ * ── Foundation ──────────────────────────────────────────────────────────
+ *
+ * 01_SecureConfig.gs — 本地副本，逐字未改。
+ * 05_SheetUtils.gs — 【不再是"逐字未改"，V4.8 修复】getSheet_/
+ *   getHeaderMap_/upsertRowByKey_/deleteRowByKey_/isOverdue_/parseDueDate_/
+ *   round1_/round2_/shallowCopy_/_cleanTitle_ 仍然逐字未改。
+ *   batchUpsertRowsByKey_ 本次重写：新增 SHEET_IO_CHUNK_ROWS=5000 分块
+ *   读写（HIGH RISK 原文档4 修复），顺带修复同批次重复新 key 会抛
+ *   TypeError 的问题（实现时发现，不在本轮审计范围内）。新增
+ *   replaceSheetDataAtomic_()（LOW RISK 原文档6 修复，供
+ *   11_ProjectionRebuilder.gs 三处调用）。完整设计取舍见该文件头。
+ *   （MEDIUM RISK 原文档3：本文件裸全局函数的命名空间扁平化风险，第三次
+ *   被提出，复核后维持不变，见该文件头。）
+ * 07_IdentityEngine.gs — 本地副本，业务逻辑基本跟 Core 项目一致（纯函数
+ *   零依赖）；V4.3 起文件头新增 Engine Contract 注释块（见
+ *   00_Project_Constitution.gs 零之三标准）；V4.7 新增
+ *   resolveIdentityDueValue()（Due Time Support 的 identity 取值辅助
+ *   函数，本项目独有，Core 项目副本没有这个函数），跟 Core 项目的副本
+ *   相比现在有"Engine Contract 注释块"和"这个新函数"两处不同，
+ *   generateTaskIdentity() 本身签名/算法不变。
+ * 08_DeduplicationEngine.gs — 本地副本，业务逻辑逐字未改；V4.3 起文件头
+ *   新增 Engine Contract 注释块，同上，只加注释不改行为。
+ * 09_TemporalParser.gs — 【不再是"逐字未改"】日期/时间/重复规则解析，
+ *   21_RecurringEngine.gs 包装它的重复规则相关函数对外暴露。跟 Core
+ *   项目版本现在有两处差异：(1) V4.4 起三个裸全局常量（RECURRENCE_TYPES/
+ *   WEEKDAY_CHAR_MAP/WEEKDAY_NUM_TO_CHAR）收进 TemporalConfig 命名空间
+ *   （LOW RISK 1 修复）；(2) V4.7 起 extractDateTime() 返回对象新增
+ *   due_time/due_datetime，due_date 从此永远是纯日期（Due Time
+ *   Support，本项目独有，Core 项目副本不受影响，见文件头完整说明）。
+ *   computeNextDueDateFromLabel() 等内部函数未改。
+ *
+ * ── Runtime ─────────────────────────────────────────────────────────────
+ *
+ * 02_EventBus.gs — 【不再是"逐字未改"】Events 表唯一写入口，本项目负责
+ *   的事件类型：TASK_CREATED / TASK_UPDATED（V4新增）/ TASK_COMPLETED /
+ *   TASK_CANCELLED / REMINDER_SENT。相比 Core 项目的原始版本，本项目副本
+ *   目前有四处实质差异：(1) _sheet_() 用 SpreadsheetApp.openById()（本项目
+ *   是 standalone 脚本，见文件头拆分说明）；(2) V4.2 起 publish() 返回的
+ *   event 新增 projection_ok 字段；(3) V4.4 起新增 getEventCount_() 和
+ *   Events 表过大时的警告（HIGH RISK 3 修复）；(4) 【V4.8新增，
+ *   ADR-2026-07-15-010】新增 subscribe()/_subscribers，publish() 不再
+ *   硬编码调用 ProjectionEngine.dispatch，改成通用订阅者循环——
+ *   ProjectionEngine 通过 15_Setup.gs 注册为订阅者，EventBus 自身不再
+ *   在源码里出现"ProjectionEngine"这个字面名字。差异仅限这四处，其余
+ *   逻辑跟 Core 项目版本一致。
+ * 03_Output.gs — 本地副本，逐字未改。【V4.5 修正】之前这里写"本项目目前
+ *   不直接调用"是不准确的——02_EventBus.gs 的
+ *   _alertAdminProjectionFailure_() 会在 Projection 写入失败时调用
+ *   Output.sendMessage() 给管理员发告警，这是本项目唯一的调用点，且只在
+ *   罕见的异常路径上触发（见 03_Output.gs 文件头 V4.5 核实说明）。
+ * 06_TaskIntentParser.gs — 【V4 重写，V4.7 新增 Due Time Support，V4.8
+ *   两处修复】parseTaskIntent / handleTaskIntent。
+ *   V4 变更：
+ *     1. 新增指令：/today /week /month /priority /overdue /upcoming
+ *        /recurring /dashboard /stats /search keyword（对应规格书
+ *        Telegram Commands 小节）。
+ *     2. 【架构违规修复】_getActiveTasksForDisplay_ /
+ *        _getCompletedTasksForDisplay_ 不再直接调 getSheet_/getHeaderMap_，
+ *        改成全部经由 12_TaskQueryEngine.gs（见 00_Project_State.gs
+ *        "已知Bug"第3条）。TaskIntentParser 现在不 import 05_SheetUtils.gs
+ *        的任何 Sheet 读取函数，只用它的 _cleanTitle_ 纯文本工具。
+ *   V4.7 变更：parseTaskIntent 和 TASK_CREATE 分支的 meta 对象都新增
+ *   转发 due_time/due_datetime；新增共用辅助函数 _formatDueDisplay_()，
+ *   5 处到期日展示文案统一在有 due_time 时于日期后追加"HH:mm"。
+ *   V4.8 变更（第六轮外部审计，见 00_ADR.gs ADR-2026-07-15-009 / 原文档
+ *   LOW RISK 7）：(1) parseTaskIntent 最前置新增 _looksLikeOwnReply_()
+ *   防御检查，命中本 OS 已知输出前缀 emoji 直接判定不适用创建任务；
+ *   (2) TASK_DONE 分支新增对 completeResult.recurring_spawn_failed 的
+ *   处理，续期失败时用户第一次能看到提示。
+ * 09_IdempotencyManager.gs — 【V4 微调，V4.7 新增 Due Time Support，
+ *   V4.8 收紧锁粒度】createTaskIfNotExists 内部调用改成
+ *   TaskEngine.createTaskDirect_(...)（原来是裸全局 _createTaskDirect_，
+ *   见 00_Project_State.gs "已知Bug"第1条修复）。V4.7 起 identity 生成
+ *   改用 IdentityEngine.resolveIdentityDueValue(meta)，不再直接读
+ *   meta.due_date。V4.8 起 Soft Lock 的 key 从 chatId 改成
+ *   identity（细化 ADR-2026-07-06-003），正式记录见 00_ADR.gs
+ *   ADR-2026-07-15-009。
+ * 10_ProjectionEngine.gs — 【V4 扩展，V4.6 移除 TaskStatistics 维护，
+ *   V4.8 接线方式变更】dispatch 新增 TASK_UPDATED case；新增对
+ *   TaskFilters（搜索用扁平表逐行 upsert）表的同步维护。V4.6 起不再对
+ *   TaskStatistics 做同步增量维护——原来的 _bumpStatistics_ 已删除，见
+ *   00_ADR.gs ADR-2026-07-06-005。V4.8 起 dispatch() 函数本体不变，但
+ *   不再被 02_EventBus.gs 硬编码调用，改成由 15_Setup.gs 注册为
+ *   EventBus 的订阅者（见 00_ADR.gs ADR-2026-07-15-010）——对本文件
+ *   而言只是"被谁调用"的接线方式变了，运行时行为不变。
+ * 11_ProjectionRebuilder.gs — 【V4 修复+扩展，V4.6 新增每日常规维护，
+ *   V4.7 新增 Due Time Support 迁移入口，V4.8 修复整表替换的原子性】
+ *     1. 删除 rebuildInventoryProjection() / _markRemovedItemsConsumed_()
+ *        （本次审计新发现的 bug，见 00_Project_State.gs）。
+ *     2. 新增 rebuildStatisticsProjection() / rebuildTaskFiltersProjection()，
+ *        rebuildAllProjections() 改成依次调用 Tasks→ActiveTasks→
+ *        Statistics→TaskFilters 四个重建函数（rebuildStatisticsProjection
+ *        是从 Events 全量重放，V4.6 起定位为"灾难恢复"专用）。
+ *     3. 【V4.6新增】recomputeStatisticsFromTasks_()：从 Tasks 表（不是
+ *        Events）按 chat_id 聚合重算 TaskStatistics，是这张表现在的
+ *        常规维护方式，由 triggerDailyStatisticsRecompute()（15_Setup.gs
+ *        每日触发器调用）触发。
+ *     4. 【V4.7新增】migrateSchemaDueTime()：既有部署的 due_time/
+ *        due_datetime 列迁移入口，模式跟既有的 migrateSchemaV4() 一致，
+ *        额外调用新增的 _setPlainTextFormatForNewColumns_() 修复
+ *        Finding DT-2（_addColumnsIfMissing_ 本身不给新列设纯文本格式，
+ *        due_time 这种 'HH:mm' 形状的值会被 Sheets 自动识别成 Time 类型）。
+ *        rebuildTasksProjection()/rebuildActiveTasksProjection() 两处
+ *        identity 重算改用 IdentityEngine.resolveIdentityDueValue(task)。
+ *     5. 【V4.8修复，见 00_ADR.gs 关联说明 / 05_SheetUtils.gs
+ *        replaceSheetDataAtomic_ 文件头】recomputeStatisticsFromTasks_ /
+ *        rebuildActiveTasksProjection / rebuildStatisticsProjection 三处
+ *        原本"先 clearContent() 清空、再整表写回"的非原子模式，统一改用
+ *        新增的 replaceSheetDataAtomic_；recomputeStatisticsFromTasks_
+ *        原本一次性读整张 Tasks 表算聚合，也改成按
+ *        SHEET_IO_CHUNK_ROWS 分块读取。
+ * 12_TaskQueryEngine.gs — 【V4 改名+中心化，V4.8 部分查询改读 ActiveTasks】
+ *   原 12_QueryEngine.gs。规格书要求的"centralized query API"：getTask /
+ *   getTasks / getTodayTasks / getWeekTasks / getMonthTasks /
+ *   getOverdueTasks / getUpcomingTasks / getRecurringTasks /
+ *   getPriorityTasks / searchTasks / getDashboard / getStatistics。V4.6 起
+ *   getTask() 改成先定位行号、再读单行，不再全表扫描（LOW RISK 1 修复）。
+ *   V4.8 起（见 00_Project_State.gs "已知Bug" HIGH RISK 2）只关注非终态
+ *   任务的高频视图（today/tomorrow/thisWeek/thisMonth/upcoming/overdue/
+ *   recurring/priority/pending，以及 getDashboard('today',...)）改读
+ *   ActiveTasks，不再扫描全量 Tasks；searchTasks（既有设计要求搜索全部
+ *   状态）、getCompletedTasks/getCancelledTasks/getArchivedTasksInline
+ *   （终态/归档视图）、getStatistics 和 getDashboard 的 weekly/monthly/
+ *   statistics 类型（需要 AnalyticsEngine 算完成率）维持读全量 Tasks。
+ *   本项目唯一允许直接读 Tasks/ActiveTasks/TaskFilters 这几张
+ *   Sheet 的模块（00_Project_Constitution.gs P6 铁律5）；每次查询只批量读
+ *   一次 Sheet，读出来的任务数组转交给 View/Priority/Search/Dashboard/
+ *   Analytics 五个纯函数 Engine 做内存运算，自己不重复实现过滤逻辑。
+ *   TaskStatistics 不在这个"允许直接读"的列表里——目前没有任何查询路径
+ *   读取它，它只被 11_ProjectionRebuilder.gs 的两个函数写入，见
+ *   00_ADR.gs ADR-2026-07-06-005。
+ * 20_TaskEngine.gs — 【V4 改名+IIFE封装，V4.7 新增 Due Time Support，
+ *   V4.8 转发续期失败信号】原 20_ProductivityModule.gs。
+ *   createTask / updateTask（V4新增） / completeTask / cancelTask /
+ *   createTaskDirect_（原_createTaskDirect_，改为 IIFE 内部方法，只允许
+ *   09_IdempotencyManager 调用）/ deriveFromEvent / deriveTaskState_ /
+ *   materializeTaskRow_（原_materializeTaskRow_）/ rebuildTasksSheet_。
+ *   保留同名全局函数 createTask/completeTask/cancelTask/getPendingTasks 作
+ *   向后兼容 wrapper，Core 项目 04_Main.gs 的既有 Library 调用不用改。
+ *   V4.7 变更：新增私有函数 _computeDueDatetime_（due_date+due_time 派生
+ *   出 due_datetime）；createTaskDirect_ 的 task 对象新增 due_time/
+ *   due_datetime；ProductivityConfig.IDENTITY_AFFECTING_FIELDS /
+ *   UPDATABLE_FIELDS 新增 due_time；updateTask 在 due_date/due_time 变化
+ *   时重算 due_datetime，identity 重算改用
+ *   IdentityEngine.resolveIdentityDueValue(merged)。
+ *   V4.8 变更（ADR-2026-07-15-009）：completeTask 检查
+ *   RecurringEngine.spawnNextIfNeeded 的新返回信号，续期本该发生却失败时
+ *   转发 recurring_spawn_failed:true 给调用方，不再让失败消失在
+ *   next_task:null 里。
+ *
+ * ── Intelligence ────────────────────────────────────────────────────────
+ *
+ * 21_RecurringEngine.gs — 【V4 新增，V4.7 新增 Due Time Support，V4.8
+ *   新增重试与失败可见性】recurring rules（包装
+ *   09_TemporalParser.gs 的重复规则解析）/ next occurrence（
+ *   computeNextDueDate，包装 computeNextDueDateFromLabel）/ recurrence
+ *   lifecycle（spawnNextIfNeeded，原 20_ProductivityModule.gs 的
+ *   _spawnNextRecurrenceIfNeeded_ 搬到这里，20_TaskEngine.completeTask
+ *   改成调用 RecurringEngine.spawnNextIfNeeded）。V4.7 起
+ *   spawnNextIfNeeded 改用 IdentityEngine.resolveIdentityDueValue(task)
+ *   取值喂给 computeNextDueDate，拿到结果后按有没有带时间拆回 next
+ *   due_date/due_time——效果是 recurring 任务如果带具体时间会正确延续
+ *   到下一次实例，不会被重置成没有时间。V4.8 起（ADR-2026-07-15-009）
+ *   spawnNextIfNeeded 对 SYSTEM_BUSY 类错误做有限次数重试，重试仍失败或
+ *   遇到其它错误时返回 {spawn_error:true, message} 而不是裸 null。
+ * 22_PriorityEngine.gs — 【V4 新增】computePriorityScore / computeUrgencyScore /
+ *   suggestPriority。纯函数，输入是 TaskQueryEngine 已经读出的 task 对象，
+ *   不读 Sheet。永不自动改任务（00_Project_Constitution.gs P5）。
+ * 23_SearchEngine.gs — 【V4 新增】search(tasks, queryObj)。纯函数，支持
+ *   title/description/category/priority/status/date/date range/recurring/
+ *   tags/full text。输入来自 TaskQueryEngine.getTasks() + TaskFilters
+ *   Projection 表（预算好的 searchable_text/tags，避免每次查询都重新拼字符串）。
+ * 24_ViewEngine.gs — 【V4 新增，属于 ADR-2026-07-06 定义的第4层 View/
+ *   Presentation Layer】today/tomorrow/thisWeek/thisMonth/upcoming/
+ *   overdue/recurring/highPriority/completed/cancelled/archived 十一种视图
+ *   过滤器，纯函数，输入是 task 数组，只做"整理数据"，不知道"Telegram"
+ *   是什么（见 00_ADR.gs ADR-2026-07-06 引擎职责划分）。
+ * 25_DashboardEngine.gs — 【V4 新增，属于第4层 View/Presentation Layer】
+ *   buildTodayDashboard/buildWeeklyDashboard/buildMonthlyDashboard/
+ *   buildStatisticsDashboard，只做"组合展示"：拼装 ViewEngine + PriorityEngine
+ *   + AnalyticsEngine 的输出成最终展示文案。不额外落盘、不重放 Events、
+ *   不知道"Telegram"是什么（完整论证见 00_ADR.gs ADR-2026-07-06）。
+ * 26_AnalyticsEngine.gs — 【V4 新增】completionRate/overdueRate/
+ *   reminderStatistics/recurringStatistics/workload，computeStatistics()
+ *   只读调用方传入的 task 数组（源头是 Tasks Read Model），从不直接触碰
+ *   TaskStatistics 这张表——TaskStatistics 是独立维护的缓存，不是本
+ *   Engine 的数据来源（V4.6 起两者的关系更明确了，见
+ *   00_ADR.gs ADR-2026-07-06-005）。唯一允许重放 Events 的例外：
+ *   replayCompletionTrend_()（历史趋势，Read Model 当前状态天然不包含时间
+ *   序列，见 00_Project_Constitution.gs P6 铁律4），此函数明确标注仅供
+ *   debug/深度分析场景手动调用，不在任何 Telegram 指令路径上。
+ *
+ * ── Testing/Setup ───────────────────────────────────────────────────────
+ *
+ * 15_Setup.gs — 【V4 扩展，V4.6 新增触发器，V4.7 新增 Due Time
+ *   Support 表头，V4.8 新增 Composition Root】setupSheets 新增建
+ *   TaskStatistics/TaskFilters 两张表；Tasks/ActiveTasks/ArchiveTasks
+ *   表头新增 description/tags 两列（向后兼容追加列），V4.7 起再新增
+ *   due_time/due_datetime 两列（紧跟 due_date 之后，同样是向后兼容
+ *   追加列，已有部署走 11_ProjectionRebuilder.gs 的
+ *   migrateSchemaDueTime()，不需要重跑本文件）；
+ *   createTriggers/repairSheetHeaders/runDiagnostics 同步更新。
+ *   createTriggers() 现在挂两个每日触发器：triggerDailyArchive（凌晨2点，
+ *   13_ActiveTasksEngine.gs）和 triggerDailyStatisticsRecompute（凌晨3点，
+ *   V4.6新增，11_ProjectionRebuilder.gs）。
+ *   V4.8 新增（ADR-2026-07-15-010）：文件最前面新增"0. Composition
+ *   Root"小节，直接在顶层执行
+ *   EventBus.subscribe(ProjectionEngine.dispatch)——本文件其余内容全是
+ *   需要手动调用的函数，这是唯一一处每次执行都会自动跑的顶层语句，见该
+ *   小节注释。
+ * 13_ActiveTasksEngine.gs — 【不再是"逐字未改"】Blueprint 术语里对应
+ *   Archive Engine：archive=runDailyArchive / restore=（暂无，见下方
+ *   "下一步"）/ retention=DEFAULT_ARCHIVE_DAYS。V4.4 起新增归档前的
+ *   ArchiveTasks 排重校验（防重复归档）、V4.5 把排重校验改成有界扫描
+ *   （只读最近 2000 行）、V4.6 修复列数计算的一致性问题（缓存
+ *   archiveColumnCount，加边界防护）。文件名保留 v3 命名，避免无意义的
+ *   改名 churn——Blueprint 分类见 00_Project_Constitution.gs P4 第2层
+ *   已经把它标注为 Archive Engine 的实现。
+ */
+
+// ============================================================
+// 二、模块关系（依赖方向）
+// ============================================================
+
+/**
+ * 全部依赖都在本项目内部，没有一个函数需要跨项目调用。
+ *
+ * 06_TaskIntentParser.gs
+ *   → 09_IdempotencyManager.gs  (createTaskIfNotExists)
+ *   → 20_TaskEngine.gs  (completeTask, cancelTask)
+ *   → 12_TaskQueryEngine.gs  (getTodayTasks, getTasks, getDashboard, ...)
+ *   → 21_RecurringEngine.gs  (通过 _recurrenceRuleToLegacyString_ 间接，
+ *      仅做 legacy 字符串转换，不直接调 RecurringEngine 的续期逻辑)
+ *   → 09_TemporalParser.gs  (extractDateTime)
+ *   → 05_SheetUtils.gs  (_cleanTitle_，纯文本工具，不是 Sheet 读取)
+ *
+ * 09_IdempotencyManager.gs
+ *   → 07_IdentityEngine.gs  (generateTaskIdentity)
+ *   → 08_DeduplicationEngine.gs  (findExistingTask)
+ *   → 20_TaskEngine.gs  (TaskEngine.createTaskDirect_)
+ *   → LockService（GAS内建）
+ *
+ * 08_DeduplicationEngine.gs → 05_SheetUtils.gs (getSheet_, getHeaderMap_)
+ * 07_IdentityEngine.gs ← 零外部依赖
+ *
+ * 10_ProjectionEngine.gs
+ *   → 05_SheetUtils.gs  (upsertRowByKey_, deleteRowByKey_, getSheet_, getHeaderMap_)
+ *   ← 02_EventBus.gs 【V4.8 起改为订阅关系，见 ADR-2026-07-15-010】
+ *     dispatch 不再被 02_EventBus.gs 硬编码调用，而是由 15_Setup.gs 注册
+ *     为 EventBus 的订阅者（EventBus.subscribe(ProjectionEngine.dispatch)）
+ *     ——本文件明确禁止反向调用 02_EventBus.gs（防止调用环，见该文件
+ *     Forbidden Dependencies），所以这条注册边不能画在本文件自己身上。
+ *
+ * 11_ProjectionRebuilder.gs
+ *   → 02_EventBus.gs (getAllEvents)
+ *   → 10_ProjectionEngine.gs (dispatch，仅用于对照，不依赖其内部实现)
+ *   → 05_SheetUtils.gs (getSheet_, getHeaderMap_, upsertRowByKey_,
+ *     batchUpsertRowsByKey_, replaceSheetDataAtomic_【V4.8新增】)
+ *   → 07_IdentityEngine.gs (generateTaskIdentity)
+ *   → 20_TaskEngine.gs (deriveFromEvent)
+ *
+ * 12_TaskQueryEngine.gs
+ *   → 05_SheetUtils.gs (getSheet_, getHeaderMap_)
+ *   → Tasks Sheet（全量历史，见文件头哪些查询用这个）；ActiveTasks
+ *     Sheet【V4.8新增，见 ADR 关联说明】（只关注非终态任务的高频视图，
+ *     见文件头哪些查询用这个）
+ *   → 24_ViewEngine.gs, 22_PriorityEngine.gs, 23_SearchEngine.gs,
+ *     25_DashboardEngine.gs, 26_AnalyticsEngine.gs
+ *   （TaskQueryEngine 是这五个纯函数 Engine 唯一的调用方之一——
+ *    05_DashboardEngine 内部也会调 24/26，但不会自己读 Sheet）
+ *
+ * 13_ActiveTasksEngine.gs → 05_SheetUtils.gs (getSheet_, getHeaderMap_)
+ *
+ * 15_Setup.gs → 13_ActiveTasksEngine.gs (triggerDailyArchive，createTriggers挂载用)
+ * 15_Setup.gs → 02_EventBus.gs + 10_ProjectionEngine.gs 【V4.8新增，
+ *   ADR-2026-07-15-010】Composition Root：顶层直接执行
+ *   EventBus.subscribe(ProjectionEngine.dispatch)，把两个互相之间有
+ *   Forbidden Dependencies 的 Infrastructure 层模块接起来——这条边只有
+ *   Application 层的 15_Setup.gs 能画，两个模块自己都不能画。
+ *
+ * 20_TaskEngine.gs
+ *   → 09_IdempotencyManager.gs (createTaskIfNotExists)
+ *   → 12_TaskQueryEngine.gs (getTask，completeTask取快照用)
+ *   → 21_RecurringEngine.gs (spawnNextIfNeeded)
+ *   → 02_EventBus.gs (publish, getAllEvents)
+ *   → 05_SheetUtils.gs (upsertRowByKey_, deleteRowByKey_, shallowCopy_)
+ *
+ * 21_RecurringEngine.gs
+ *   → 09_TemporalParser.gs (computeNextDueDateFromLabel)
+ *   → 09_IdempotencyManager.gs (createTaskIfNotExists，生成下一次实例用)
+ *   → 07_IdentityEngine.gs (resolveIdentityDueValue，V4.7 新增)
+ *   → Utilities（GAS内建，sleep，V4.8新增，繁忙冲突重试退避用）
+ *
+ * 22_PriorityEngine.gs ← 纯函数，零 Sheet/Event 依赖
+ * 23_SearchEngine.gs   ← 纯函数，零 Sheet/Event 依赖
+ * 24_ViewEngine.gs     ← 纯函数，零 Sheet/Event 依赖
+ *
+ * 25_DashboardEngine.gs
+ *   → 24_ViewEngine.gs (今日/本周/逾期等视图过滤)
+ *   → 26_AnalyticsEngine.gs (统计数字)
+ *
+ * 26_AnalyticsEngine.gs
+ *   → 05_SheetUtils.gs (round1_/round2_，纯计算工具)
+ *   → 02_EventBus.gs (仅 replayCompletionTrend_ 例外调用 getAllEvents，
+ *      见文件头注释)
+ *
+ * ── 架构铁律（V4，见 00_Project_Constitution.gs P6 完整版本）─────────────
+ * 1. 箭头只能往更底层指，禁止循环依赖；本项目不依赖 Core / Reminder OS
+ *    的任何代码
+ * 2. Events 表（共享）里 TASK_ 开头和 REMINDER_SENT 类型的事件只有本项目的
+ *    02_EventBus.publish() 能写
+ * 3. Tasks/ActiveTasks/TaskFilters（Read Model）只有本项目的
+ *    10_ProjectionEngine 能写（materializeTaskRow_ 是安全兜底，属例外）；
+ *    TaskStatistics 只有 11_ProjectionRebuilder 的
+ *    recomputeStatisticsFromTasks_()（每日批量）和
+ *    rebuildStatisticsProjection()（灾难恢复）能写，V4.6 起
+ *    10_ProjectionEngine 不再写它（见 00_ADR.gs ADR-2026-07-06-005）；
+ *    ArchiveTasks 只有 13_ActiveTasksEngine.runDailyArchive() 能写
+ * 4. 所有查询必须经过 12_TaskQueryEngine，禁止直接 derive Events，
+ *    禁止 View/Priority/Search/Dashboard/Analytics 五个纯函数 Engine
+ *    自己读 Sheet
+ * 5. 所有 Create 操作必须经过 09_IdempotencyManager，禁止直接
+ *    EventBus.publish CREATE 事件；Update 操作经由 20_TaskEngine.updateTask
+ *    直接发 TASK_UPDATED（不需要幂等去重，因为不涉及"是否已存在"判断，
+ *    只是改已存在任务的字段）
+ * 6. 只有 26_AnalyticsEngine.gs 明确标注的历史趋势函数可以重放 Events，
+ *    其余任何模块（尤其是 Telegram 指令路径上的一切）禁止重放
+ */
+
+// ============================================================
+// 三、Architecture Layer Map（V4.3 新增）
+// ============================================================
+
+/**
+ * 跟上面「二、模块关系」的区别：「二」画的是"谁调用谁"的具体函数级依赖图，
+ * 本节画的是每个文件在 Clean Architecture 四层里属于哪一层——这是更粗粒度
+ * 的分类，用来配合 00_Project_Constitution.gs「零之四、Dependency Rules」
+ * 检查"有没有箭头往上指"。00_ 开头的治理文档（Constitution/State/
+ * File Map/ADR/Roadmap/Known Limitations/Command Reference/Architecture
+ * Review，共八份）不参与这个分层——它们属于
+ * Blueprint 的 Governance 顶层分类，跟"请求怎么被处理"这件事无关。
+ *
+ * Architecture Layer Map
+ *
+ * Presentation
+ *   06_TaskIntentParser.gs
+ *     ↓
+ * Application
+ *   08_DeduplicationEngine.gs
+ *   09_IdempotencyManager.gs
+ *   11_ProjectionRebuilder.gs
+ *   12_TaskQueryEngine.gs
+ *   15_Setup.gs
+ *   20_TaskEngine.gs
+ *     ↓
+ * Domain
+ *   07_IdentityEngine.gs
+ *   09_TemporalParser.gs
+ *   21_RecurringEngine.gs
+ *   22_PriorityEngine.gs
+ *   23_SearchEngine.gs
+ *   24_ViewEngine.gs
+ *   25_DashboardEngine.gs
+ *   26_AnalyticsEngine.gs
+ *     ↓
+ * Infrastructure
+ *   01_SecureConfig.gs
+ *   02_EventBus.gs
+ *   03_Output.gs
+ *   05_SheetUtils.gs
+ *   10_ProjectionEngine.gs
+ *   13_ActiveTasksEngine.gs
+ *
+ * 共 21 个文件，每个文件恰好出现一次（"所有文件必须归类到唯一 Layer"，
+ * 见需求方 Upgrade 4 原文）。分类理由简述：
+ *
+ *   Presentation（1个）：唯一"知道 Telegram 是什么"的文件——负责把用户
+ *   原始文字变成意图，把 Domain/Application 层返回的数据拼成 Telegram
+ *   看得懂的文案。
+ *
+ *   Application（6个）：这几个文件都是"协调 Domain + Infrastructure 完成
+ *   一个具体用例"，但自己不承载可复用的业务判断规则——09_IdempotencyManager
+ *   协调锁+去重+创建；08_DeduplicationEngine 是"检查 Read Model 里是否已
+ *   存在"这个应用层判断（直接读 Sheet，因此不能算 Domain，Domain 层规定
+ *   不摸 Sheet）；12_TaskQueryEngine 协调"读 Sheet 一次 + 分发给 5 个
+ *   Domain Engine"；20_TaskEngine 协调"发 Event + 调用 Recurring"完成
+ *   create/update/complete/cancel 四个用例；11_ProjectionRebuilder 和
+ *   15_Setup 协调"重放 Events/迁移 Schema"这类管理用例（这两个文件在
+ *   Blueprint 宏观分类里属于 Operations，跟这里的 Application 微观分层
+ *   是两套不同的问题，见 00_Project_Constitution.gs 零之四开头的说明）。
+ *
+ *   Domain（8个）：承载具体、可复用的业务规则，全部不摸 Sheet/Events（
+ *   09_TemporalParser 例外允许调用 Utilities/Session 这类 GAS 内建纯函数
+ *   API，不算 Infrastructure I/O）。22/23/24/25/26 五个是纯函数 Engine
+ *   （Architecture Principles 第2条）；07_IdentityEngine 是纯哈希计算；
+ *   21_RecurringEngine 基本纯函数，唯一的例外依赖见下方「已知例外」。
+ *
+ *   Infrastructure（6个）：直接做 I/O 或提供不含业务判断的机械工具——
+ *   02_EventBus（Events 表读写）、05_SheetUtils（Sheet 读写基础设施）、
+ *   10_ProjectionEngine（Read Model 写入）、01_SecureConfig（配置读取）、
+ *   03_Output（尚未启用的输出工具）、13_ActiveTasksEngine（机械的"按
+ *   retention 天数搬行"，不含打分/排序等业务判断，故不归 Domain）。
+ *
+ * 已知例外（跟 00_Project_Constitution.gs 零之四「已知例外」是同一件事，
+ * 这里只是从"文件归类"这个角度再确认一遍，不是第二个例外）：
+ *   21_RecurringEngine.gs（Domain）→ 09_IdempotencyManager.gs（Application）
+ */
