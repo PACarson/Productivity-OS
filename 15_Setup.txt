@@ -2,6 +2,15 @@
  * 15_Setup.gs
  * Productivity OS v4.7 — 一键初始化
  *
+ * 【2026-07-17 新增，ADR-2026-07-17-009，Carson 批准】setupSheets()/
+ * repairSheetHeaders() 的 Tasks/ActiveTasks/ArchiveTasks 三张表表头新增
+ * reminder_policy（JSON 字符串或 ''）一列，紧跟在 recurring 之后——
+ * Reminder Policy Override，完整设计见
+ * Reminder-Policy-Override_Architecture-Review.md，Carson 2026-07-17
+ * 批准。已有部署走 11_ProjectionRebuilder.gs 新增的
+ * migrateSchemaReminderPolicy()，不需要重跑本文件的 setupSheets()；
+ * 全新建表才会用到这里的改动。
+ *
  * 【V4.7 新增】setupSheets()/repairSheetHeaders() 的 Tasks/ActiveTasks/
  * ArchiveTasks 三张表表头新增 due_time（'HH:mm' 或 ''）、due_datetime
  * （'yyyy-MM-ddTHH:mm:ss' 或 ''，派生字段）两列，紧跟在 due_date 之后
@@ -78,23 +87,23 @@ function setupSheets() {
 
   _ensureSheet_(ss, 'Tasks', [
     'task_id', 'timestamp', 'title', 'category', 'status', 'due_date',
-    'due_time', 'due_datetime', 'recurring', 'priority', 'context', 'budget',
-    'notes', 'description', 'tags', 'chat_id', 'completed_at',
-    'reminder_count', 'identity', 'archived'
+    'due_time', 'due_datetime', 'recurring', 'reminder_policy', 'priority',
+    'context', 'budget', 'notes', 'description', 'tags', 'chat_id',
+    'completed_at', 'reminder_count', 'identity', 'archived'
   ]);
 
   _ensureSheet_(ss, 'ActiveTasks', [
     'task_id', 'timestamp', 'title', 'category', 'status', 'due_date',
-    'due_time', 'due_datetime', 'recurring', 'priority', 'context', 'budget',
-    'notes', 'description', 'tags', 'chat_id', 'completed_at',
-    'reminder_count', 'identity'
+    'due_time', 'due_datetime', 'recurring', 'reminder_policy', 'priority',
+    'context', 'budget', 'notes', 'description', 'tags', 'chat_id',
+    'completed_at', 'reminder_count', 'identity'
   ]);
 
   _ensureSheet_(ss, 'ArchiveTasks', [
     'task_id', 'timestamp', 'title', 'category', 'status', 'due_date',
-    'due_time', 'due_datetime', 'recurring', 'priority', 'context', 'budget',
-    'notes', 'description', 'tags', 'chat_id', 'completed_at',
-    'reminder_count', 'identity', 'archived_at'
+    'due_time', 'due_datetime', 'recurring', 'reminder_policy', 'priority',
+    'context', 'budget', 'notes', 'description', 'tags', 'chat_id',
+    'completed_at', 'reminder_count', 'identity', 'archived_at'
   ]);
 
   // V4 新增：TaskStatistics（每 chat_id 一行的累计计数器，10_ProjectionEngine 增量维护）
@@ -166,21 +175,21 @@ function repairSheetHeaders() {
   ]);
   _repairOneSheetHeader_('Tasks', [
     'task_id', 'timestamp', 'title', 'category', 'status', 'due_date',
-    'due_time', 'due_datetime', 'recurring', 'priority', 'context', 'budget',
-    'notes', 'description', 'tags', 'chat_id', 'completed_at',
-    'reminder_count', 'identity', 'archived'
+    'due_time', 'due_datetime', 'recurring', 'reminder_policy', 'priority',
+    'context', 'budget', 'notes', 'description', 'tags', 'chat_id',
+    'completed_at', 'reminder_count', 'identity', 'archived'
   ]);
   _repairOneSheetHeader_('ActiveTasks', [
     'task_id', 'timestamp', 'title', 'category', 'status', 'due_date',
-    'due_time', 'due_datetime', 'recurring', 'priority', 'context', 'budget',
-    'notes', 'description', 'tags', 'chat_id', 'completed_at',
-    'reminder_count', 'identity'
+    'due_time', 'due_datetime', 'recurring', 'reminder_policy', 'priority',
+    'context', 'budget', 'notes', 'description', 'tags', 'chat_id',
+    'completed_at', 'reminder_count', 'identity'
   ]);
   _repairOneSheetHeader_('ArchiveTasks', [
     'task_id', 'timestamp', 'title', 'category', 'status', 'due_date',
-    'due_time', 'due_datetime', 'recurring', 'priority', 'context', 'budget',
-    'notes', 'description', 'tags', 'chat_id', 'completed_at',
-    'reminder_count', 'identity', 'archived_at'
+    'due_time', 'due_datetime', 'recurring', 'reminder_policy', 'priority',
+    'context', 'budget', 'notes', 'description', 'tags', 'chat_id',
+    'completed_at', 'reminder_count', 'identity', 'archived_at'
   ]);
   _repairOneSheetHeader_('TaskStatistics', [
     'chat_id', 'total_count', 'pending_count', 'done_count', 'cancelled_count',
