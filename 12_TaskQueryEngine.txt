@@ -1,6 +1,45 @@
 /**
  * 12_TaskQueryEngine.gs
- * Productivity OS v4.6 — Task Query Engine（V4 改名+中心化）
+ * Productivity OS v4.8 — Task Query Engine（V4 改名+中心化）
+ *
+ * 【V4.8 修复，第六轮外部审计 HIGH RISK（原文档 2：高频查询全表扫描
+ * 风险）】只关注"非终态任务"的高频视图查询（今天/明天/本周/本月/即将
+ * 到来/逾期/重复/优先级/待办），原来一律经 _readAllTasks_ 扫描全量历史
+ * Tasks 表——Tasks 只增不标记删除（冷归档只打 archived 标记，不物理搬走，
+ * 见 13_ActiveTasksEngine.gs 文件头"架构关系"），随着历史任务积累，这些
+ * 本该很轻量的日常查询会越来越慢，最终逼近 GAS 执行时间/内存上限。
+ *
+ * 本 OS 早就存在一张专门维护、体积远小于 Tasks 的 ActiveTasks 表
+ * （10_ProjectionEngine.gs 实时同步：任务一旦 DONE/CANCELLED 就从
+ * ActiveTasks 物理删除），本模块的架构铁律（见下方）也一直明确允许直接读
+ * 它——只是过去所有查询函数都没有实际用到这个权限。修复：新增
+ * _readActiveTasks_（内部复用 _readAllRows_，只是换一个 sheetName），
+ * 把 24_ViewEngine.gs 里"过滤条件本身就要求非终态"的那些视图函数
+ * （today/tomorrow/thisWeek/thisMonth/upcoming/overdue/recurring，均在
+ * 内部做 _isNonTerminal_ 检查，见该文件）改成读 ActiveTasks；
+ * getPriorityTasks/getPendingTasks 同理。
+ *
+ * 哪些查询*没有*改、为什么：
+ *   - searchTasks：00_Project_State.gs 已有明确设计澄清"/search 故意
+ *     搜索所有任务状态"，不能改成只读 ActiveTasks（会漏掉对已完成/已
+ *     取消任务的搜索，破坏既有产品行为）。
+ *   - getCompletedTasks/getCancelledTasks/getArchivedTasksInline：本身
+ *     要找的就是终态任务，ActiveTasks 里根本不会有这些任务，必须读 Tasks。
+ *   - getStatistics/getDashboard('weekly'/'monthly'/'statistics',...)：
+ *     依赖 AnalyticsEngine.computeStatistics 算完成率等需要看到 DONE
+ *     任务的指标，必须读全量 Tasks；只有 getDashboard('today',...)
+ *     内部用到的都是非终态视图（含 25_DashboardEngine.buildTodayDashboard
+ *     自己的 category 分组逻辑，同样显式排除 DONE/CANCELLED），改成读
+ *     ActiveTasks。
+ *   - getTask/getTasks（通用过滤）：前者要能查到任意状态的单个任务；
+ *     后者的 filters 参数完全通用，调用方可能传任何状态，不能假设"只要
+ *     非终态"，维持读全量 Tasks。
+ *
+ * 一致性说明（诚实面对取舍，不回避）：ActiveTasks 由 10_ProjectionEngine.gs
+ * 同步维护，理论上跟 Tasks 一样存在"Projection dispatch 失败导致短暂
+ * 不一致"的风险——这不是本次改动新引入的风险，Tasks 表本身也依赖同一套
+ * Projection 机制，一致性保障（失败告警 + rebuildAllProjections() 手动
+ * 修复）跟现有架构完全一致，不需要为 ActiveTasks 单独发明一套新的保障。
  *
  * 【V4.6 修复 LOW RISK 1】getTask() 原来调 _readAllRows_ 做全表扫描，
  * 改成"先读 task_id 单列定位行号、再读那一行"的两步查找，减少写事务
@@ -33,8 +72,12 @@
  *   Owns                  : "怎么把 Sheet 行读成 task 对象数组"这件事
  *                           （_readAllRows_/_readAllTasks_），以及"哪个
  *                           查询该调用哪个下游 Engine"的路由表
- *   Reads                 : Tasks Sheet（唯一直接读取方，其余四张只读表
- *                           由对应 Engine 各自的职责覆盖，本身不重复读）
+ *   Reads                 : Tasks Sheet（唯一直接读取方）；V4.8 起也直接
+ *                           读 ActiveTasks（只用于"只关注非终态任务"的
+ *                           高频视图查询，见文件头 V4.8 修复说明——这个
+ *                           权限本来就在架构铁律里，V4.8 只是第一次真正
+ *                           用到它）；其余三张只读表由对应 Engine 各自的
+ *                           职责覆盖，本身不重复读
  *   Writes                : none
  *   Public API            : getTask, getTasks, getPendingTasks,
  *                           getCompletedTasks, getTodayTasks,
@@ -67,8 +110,9 @@
 
 var TaskQueryEngine = (function () {
 
-  var TASKS_SHEET       = 'Tasks';
-  var TASK_STATS_SHEET  = 'TaskStatistics';
+  var TASKS_SHEET        = 'Tasks';
+  var ACTIVE_TASKS_SHEET = 'ActiveTasks'; // V4.8新增，见文件头修复说明
+  var TASK_STATS_SHEET   = 'TaskStatistics';
 
   // ============ 内部：批量读整张 Sheet（本模块唯一的 Sheet I/O 入口） ============
 
@@ -104,6 +148,26 @@ var TaskQueryEngine = (function () {
    */
   function _readAllTasks_(chatId) {
     var rows = _readAllRows_(TASKS_SHEET);
+    if (!chatId) return rows;
+    return rows.filter(function (t) { return String(t.chat_id) === String(chatId); });
+  }
+
+  /**
+   * 【V4.8 新增，见文件头修复说明】只关注非终态任务的高频视图专用——
+   * 读 ActiveTasks（体积远小于 Tasks，10_ProjectionEngine.gs 实时维护，
+   * 只包含 PENDING/IN_PROGRESS/WAITING）而不是全量 Tasks。复用
+   * _readAllRows_，只是换一个 sheetName，两张表的列结构兼容（ActiveTasks
+   * 比 Tasks 少一个 archived 列，本模块下游消费的字段都不需要它）。
+   *
+   * ⚠️ 只应该用于"过滤条件本身就要求非终态"的查询——如果调用方可能需要
+   * 看到 DONE/CANCELLED/archived 任务，必须用 _readAllTasks_，见文件头
+   * "哪些查询没有改"的说明。
+   *
+   * @param {string} [chatId]
+   * @returns {object[]}
+   */
+  function _readActiveTasks_(chatId) {
+    var rows = _readAllRows_(ACTIVE_TASKS_SHEET);
     if (!chatId) return rows;
     return rows.filter(function (t) { return String(t.chat_id) === String(chatId); });
   }
@@ -183,23 +247,37 @@ var TaskQueryEngine = (function () {
     });
   }
 
+  /**
+   * 【V4.8 变更，见文件头修复说明】PENDING 是非终态状态，改读 ActiveTasks——
+   * 不再经过通用的 getTasks()（那个函数假设调用方可能要任意状态，只能读
+   * 全量 Tasks）。
+   */
   function getPendingTasks(chatId) {
-    return getTasks(chatId, { status: 'PENDING' });
+    return _readActiveTasks_(chatId).filter(function (t) {
+      return String(t.status || '').toUpperCase() === 'PENDING';
+    });
   }
 
+  /** DONE 是终态，ActiveTasks 里不会有，维持读全量 Tasks（未变） */
   function getCompletedTasks(chatId) {
     return getTasks(chatId, { status: 'DONE' });
   }
 
   // ============ View Engine 转发 ============
+  // 【V4.8 变更，见文件头修复说明】以下七个视图的过滤条件本身就要求
+  // 非终态（24_ViewEngine.gs 对应函数内部都有 _isNonTerminal_ 检查），
+  // 改读 _readActiveTasks_ 而不是 _readAllTasks_。
 
-  function getTodayTasks(chatId)    { return ViewEngine.today(_readAllTasks_(chatId)); }
-  function getTomorrowTasks(chatId) { return ViewEngine.tomorrow(_readAllTasks_(chatId)); }
-  function getWeekTasks(chatId)     { return ViewEngine.thisWeek(_readAllTasks_(chatId)); }
-  function getMonthTasks(chatId)    { return ViewEngine.thisMonth(_readAllTasks_(chatId)); }
-  function getUpcomingTasks(chatId) { return ViewEngine.upcoming(_readAllTasks_(chatId)); }
-  function getOverdueTasks(chatId)  { return ViewEngine.overdue(_readAllTasks_(chatId)); }
-  function getRecurringTasks(chatId) { return ViewEngine.recurring(_readAllTasks_(chatId)); }
+  function getTodayTasks(chatId)    { return ViewEngine.today(_readActiveTasks_(chatId)); }
+  function getTomorrowTasks(chatId) { return ViewEngine.tomorrow(_readActiveTasks_(chatId)); }
+  function getWeekTasks(chatId)     { return ViewEngine.thisWeek(_readActiveTasks_(chatId)); }
+  function getMonthTasks(chatId)    { return ViewEngine.thisMonth(_readActiveTasks_(chatId)); }
+  function getUpcomingTasks(chatId) { return ViewEngine.upcoming(_readActiveTasks_(chatId)); }
+  function getOverdueTasks(chatId)  { return ViewEngine.overdue(_readActiveTasks_(chatId)); }
+  function getRecurringTasks(chatId) { return ViewEngine.recurring(_readActiveTasks_(chatId)); }
+
+  // 以下两个是终态/归档视图，ActiveTasks 里不会有对应任务，维持读全量
+  // Tasks（未变）。
   function getCancelledTasks(chatId) { return ViewEngine.cancelled(_readAllTasks_(chatId)); }
   function getArchivedTasksInline(chatId) { return ViewEngine.archived(_readAllTasks_(chatId)); }
 
@@ -212,11 +290,18 @@ var TaskQueryEngine = (function () {
 
   /**
    * High Priority 任务，按 Priority Score 降序排列。
+   *
+   * 【V4.8 变更，见文件头修复说明】改读 ActiveTasks——本来就只关心非
+   * 终态任务。ActiveTasks 本身已经不含 DONE/CANCELLED，下面的 filter
+   * 严格来说已经多余，但保留作为防御性兜底（万一 ActiveTasks 因为某次
+   * Projection 失败而短暂出现陈旧的终态行，见文件头"一致性说明"，这里
+   * 不会把它们算进优先级排序），成本可以忽略不计。
+   *
    * @param {string} chatId
    * @returns {object[]}  每个元素附带 _priority_score
    */
   function getPriorityTasks(chatId) {
-    var nonTerminal = _readAllTasks_(chatId).filter(function (t) {
+    var nonTerminal = _readActiveTasks_(chatId).filter(function (t) {
       var s = String(t.status || '').toUpperCase();
       return s !== 'DONE' && s !== 'CANCELLED';
     });
@@ -239,12 +324,23 @@ var TaskQueryEngine = (function () {
   // ============ Dashboard / Statistics 转发 ============
 
   /**
+   * 【V4.8 变更，见文件头修复说明】只有 'today'（含未识别 type 落到的
+   * default 分支——25_DashboardEngine.build 两者都指向
+   * buildTodayDashboard）完全只由非终态视图 + 按 category 分组组成
+   * （25_DashboardEngine.buildTodayDashboard 内部对 category 分组也显式
+   * 排除了 DONE/CANCELLED），改读 ActiveTasks。'weekly'/'monthly'/
+   * 'statistics' 三种都会调用 AnalyticsEngine.computeStatistics 算完成率
+   * 等需要看到 DONE 任务历史的指标，必须维持读全量 Tasks，不能改。
+   *
    * @param {string} type  'today'|'weekly'|'monthly'|'statistics'
    * @param {string} chatId
    * @returns {string}
    */
   function getDashboard(type, chatId) {
-    return DashboardEngine.build(type, _readAllTasks_(chatId)); // 25_DashboardEngine.gs
+    var normalizedType = String(type || '').toLowerCase();
+    var onlyNeedsActiveTasks = (normalizedType === 'today' || normalizedType === '');
+    var tasks = onlyNeedsActiveTasks ? _readActiveTasks_(chatId) : _readAllTasks_(chatId);
+    return DashboardEngine.build(type, tasks); // 25_DashboardEngine.gs
   }
 
   /**
