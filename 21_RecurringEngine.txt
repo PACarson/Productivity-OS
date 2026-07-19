@@ -1,6 +1,32 @@
 /**
  * 21_RecurringEngine.gs
- * Productivity OS v4.7 — Recurring Engine（V4 新增）
+ * Productivity OS v4.8 — Recurring Engine（V4 新增）
+ *
+ * 【V4.8 修复，第六轮外部审计 HIGH RISK 1，正式记录见 00_ADR.gs
+ * ADR-2026-07-15-009】spawnNextIfNeeded 原来用一个宽泛的 try/catch 吞掉
+ * IdempotencyManager 抛出的所有异常（包括 SYSTEM_BUSY 类繁忙冲突），
+ * 静默返回 null——如果同一用户几乎同时完成两个不同的 recurring 任务，
+ * 其中一个的续期会因为拿不到锁而被永久放弃，且没有任何人能看到这件事
+ * 发生过。
+ *
+ * 本次分两部分修复（跟 09_IdempotencyManager.gs 的 ADR-2026-07-15-009
+ * 是同一个发现的两个互补侧面，不是重复修复）：
+ *   1. 09_IdempotencyManager.gs 把 Soft Lock 粒度从 chatId 收紧到
+ *      identity——同一用户的两个*不同*任务不再共用同一把锁，本身就已经
+ *      解决了审计描述的最主要那个场景。
+ *   2. 本文件（spawnNextIfNeeded）作为纵深防御：即使收紧粒度之后仍然
+ *      理论上可能撞见 SYSTEM_BUSY（比如 Gate 本身在极端并发下排不上，
+ *      或者两次调用确实算出了相同 identity），现在会对 SYSTEM_BUSY 类
+ *      错误做有限次数的重试（见下方 spawnNextIfNeeded 注释），重试仍然
+ *      失败或者遇到非繁忙类错误时，不再返回跟"这本来就不是 recurring
+ *      任务"完全无法区分的裸 null，而是返回一个可识别的
+ *      { spawn_error: true, message } 信号。
+ *
+ * 这个信号沿 20_TaskEngine.completeTask → 06_TaskIntentParser.gs 一路
+ * 转发，最终让用户在"完成"回复里看到"续期没成功"的提示（而不是像以前
+ * 那样悄悄消失），同时仍然保证"完成这一次"本身绝不会因为续期失败而受
+ * 影响——只是把"完全静默"改成"用户可见"，没有改变"续期失败不阻断主
+ * 流程"这条既有原则。三个文件的具体改动见各自文件头。
  *
  * 【V4.7 新增，Due Time Support，00_Architecture_Review.gs「七、
  * Review #3」，Carson 2026-07-13 批准】spawnNextIfNeeded 改用
@@ -55,16 +81,22 @@
  *   Projection            : NO
  *   Thread Safety         : 依赖 09_IdempotencyManager 内部的 ScriptLock，
  *                           本模块自身不加锁
- *   Side Effects          : spawnNextIfNeeded 有（间接创建新任务）；其余
+ *   Side Effects          : spawnNextIfNeeded 有（间接创建新任务，V4.8起
+ *                           还可能调用 Utilities.sleep 做重试退避——纯
+ *                           GAS 运行时内置能力，不是跨层依赖）；其余
  *                           三个公开函数无
  *   Notes                 : 本模块是 00_Project_Constitution.gs 零之四
  *                           「已知例外」里唯一记录在案的 Domain→Application
  *                           越层依赖（spawnNextIfNeeded → IdempotencyManager），
  *                           刻意选择复用幂等路径而不是自己重新实现一遍去重。
- *                           spawnNextIfNeeded 内部 try/catch 吞掉所有异常，
- *                           保证"续期失败"不会波及调用方 completeTask 的
- *                           主流程（"完成这一次"必须成功，"生成下一次"是
- *                           锦上添花）。
+ *                           【V4.8 变更】spawnNextIfNeeded 内部 try/catch
+ *                           仍然保证"续期失败不会波及调用方 completeTask
+ *                           的主流程"这条原则不变，但不再对所有异常一律
+ *                           静默吞掉：SYSTEM_BUSY 类错误会先重试几次，
+ *                           重试仍失败或遇到其它错误时返回可识别的
+ *                           { spawn_error: true, message } 而不是裸
+ *                           null，让调用方能够区分"这本来就不适用"和
+ *                           "本该生成但失败了"，见 ADR-2026-07-15-009。
  */
 
 var RecurringEngine = (function () {
@@ -140,13 +172,35 @@ var RecurringEngine = (function () {
    * webhook重试导致completeTask被调两次）算出的nextDueValue完全一样，
    * DeduplicationEngine会把第二次识别成"已存在"直接跳过。
    *
+   * 【V4.8 变更，第六轮外部审计 HIGH RISK 1，见文件头修复说明】返回值
+   * 新增第三种可能：调用 IdempotencyManager 时遇到 SYSTEM_BUSY 类繁忙
+   * 冲突，会先做有限次数的重试（MAX_SPAWN_RETRIES 次，线性退避）——
+   * 09_IdempotencyManager.gs 的 identity 级别 Soft Lock 修复之后，这类
+   * 冲突应该已经很罕见，重试主要是纵深防御。重试仍然失败、或者遇到任何
+   * 非 SYSTEM_BUSY 的错误（不重试，重试对确定性失败没有意义），会返回
+   * { spawn_error: true, message } 而不是裸 null，让 20_TaskEngine.
+   * completeTask 能区分"这本来就不适用"（null）和"本该生成下一次但失败
+   * 了"（spawn_error），继续沿调用链转发给 06_TaskIntentParser.gs 决定
+   * 怎么回复用户——不再是完全静默的失败。
+   *
    * @param {object} task  完成前的task快照（TaskQueryEngine.getTask的返回值）
    * @param {string} chatId
-   * @returns {object|null}
+   * @returns {object|{spawn_error: boolean, message: string}|null}
+   *          null：这本来就不是 recurring 任务 / 没有 due_date / 算不出
+   *                下一次到期日（都是正常情况，不需要用户关心）。
+   *          {spawn_error:true, message}：本该生成下一次实例但失败了，
+   *                调用方应该让用户知道。
+   *          否则：新创建（或已存在，由 IdempotencyManager 的幂等语义
+   *                决定）的下一次任务对象。
    */
   function spawnNextIfNeeded(task, chatId) {
     if (!task || !task.recurring || !task.due_date) return null;
 
+    // 计算下一次到期日本身的失败（比如 due_date 格式解析不出来）是确定性
+    // 的——同样的输入重试多少次结果都一样，不属于"繁忙冲突"，不重试，
+    // 维持原有"当作不适用处理"的静默行为（这一类失败不是本次审计关注的
+    // "本该生成却因为锁冲突丢失"场景，是任务数据本身的问题）。
+    var nextDueDate, nextDueTime;
     try {
       // 【V4.7，Due Time Support】取 due_datetime（若有 due_time）或
       // due_date——09_TemporalParser.computeNextDueDateFromLabel() 本身
@@ -160,31 +214,51 @@ var RecurringEngine = (function () {
       // 'T' 拆回 next due_date / next due_time 两个字段，喂给下面的
       // meta；due_datetime 由 TaskEngine.createTaskDirect_ 内部从这两者
       // 派生，这里不需要单独算。
-      var hasTime    = /T\d{2}:\d{2}:\d{2}/.test(nextDueValue);
-      var nextDueDate = hasTime ? nextDueValue.split('T')[0]            : nextDueValue;
-      var nextDueTime = hasTime ? nextDueValue.split('T')[1].slice(0, 5) : '';
-
-      var result = IdempotencyManager.createTaskIfNotExists(
-        task.title,
-        {
-          due_date:    nextDueDate,
-          due_time:    nextDueTime,
-          recurring:   task.recurring,
-          category:    task.category,
-          priority:    task.priority,
-          context:     task.context,
-          budget:      task.budget,
-          notes:       task.notes,
-          description: task.description,
-          tags:        task.tags
-        },
-        chatId || task.chat_id
-      );
-      return result.task;
-    } catch (e) {
-      Logger.log('[RecurringEngine] spawnNextIfNeeded 失败（不影响本次 completeTask 主流程）: ' + e.message);
+      var hasTime = /T\d{2}:\d{2}:\d{2}/.test(nextDueValue);
+      nextDueDate = hasTime ? nextDueValue.split('T')[0]            : nextDueValue;
+      nextDueTime = hasTime ? nextDueValue.split('T')[1].slice(0, 5) : '';
+    } catch (calcErr) {
+      Logger.log('[RecurringEngine] spawnNextIfNeeded 计算下一次到期日失败' +
+        '（确定性失败，不重试，不影响本次 completeTask 主流程）: ' + calcErr.message);
       return null;
     }
+
+    var meta = {
+      due_date:    nextDueDate,
+      due_time:    nextDueTime,
+      recurring:   task.recurring,
+      category:    task.category,
+      priority:    task.priority,
+      context:     task.context,
+      budget:      task.budget,
+      notes:       task.notes,
+      description: task.description,
+      tags:        task.tags
+    };
+    var targetChatId = chatId || task.chat_id;
+
+    var MAX_SPAWN_RETRIES  = 3;
+    var RETRY_BACKOFF_MS   = 400; // 线性退避：400ms/800ms/1200ms，累计上限约2.4秒
+
+    var lastErr = null;
+    for (var attempt = 0; attempt <= MAX_SPAWN_RETRIES; attempt++) {
+      try {
+        var result = IdempotencyManager.createTaskIfNotExists(task.title, meta, targetChatId);
+        return result.task;
+      } catch (e) {
+        lastErr = e;
+        var isTransientBusy = String(e.message || '').indexOf('SYSTEM_BUSY') === 0; // 覆盖两种前缀
+        if (!isTransientBusy || attempt === MAX_SPAWN_RETRIES) break;
+
+        Logger.log('[RecurringEngine] spawnNextIfNeeded 第 ' + (attempt + 1) + ' 次遇到繁忙冲突，' +
+          (RETRY_BACKOFF_MS * (attempt + 1)) + 'ms 后重试: ' + e.message);
+        Utilities.sleep(RETRY_BACKOFF_MS * (attempt + 1));
+      }
+    }
+
+    Logger.log('[RecurringEngine] spawnNextIfNeeded 最终失败（不影响本次 completeTask 主流程，' +
+      '但下一次实例确实没有生成，已转发给调用方处理用户提示）: ' + (lastErr && lastErr.message));
+    return { spawn_error: true, message: (lastErr && lastErr.message) || '未知错误' };
   }
 
   return {
